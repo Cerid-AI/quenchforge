@@ -146,7 +146,12 @@ brews:
       ggml-on-AMD-Mac correctness — chat, embedding, reranker, Whisper
       transcription. Ollama- and OpenAI-compatible HTTP APIs.
     license: Apache-2.0
-    skip_upload: '{{ if eq .Prerelease "" }}false{{ else }}auto{{ end }}'
+    # Skip the tap formula update when:
+    #   - the release is a prerelease (auto-skip alpha/rc tags), OR
+    #   - HOMEBREW_TAP_GITHUB_TOKEN isn't configured (no PAT, no upload —
+    #     prevents goreleaser from hitting api.github.com with empty creds
+    #     and 401'ing the whole release).
+    skip_upload: '{{ if or (eq .Env.HOMEBREW_TAP_GITHUB_TOKEN "") (ne .Prerelease "") }}true{{ else }}false{{ end }}'
     repository:
       owner: Cerid-AI
       name: homebrew-tap
