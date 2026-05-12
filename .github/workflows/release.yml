@@ -86,7 +86,20 @@ jobs:
           echo "APPLE_NOTARY_API_KEY_PATH=$P8" >> "$GITHUB_ENV"
 
       - name: enable signing flag
-        if: github.event.inputs.snapshot != 'true'
+        # Only flip GORELEASER_SIGNING=on when we actually have credentials
+        # AND we're not in snapshot mode. Without this guard, a tag push to
+        # a repo whose Apple Developer ID secrets haven't been configured
+        # would fail goreleaser at the sign step. This way an unsigned
+        # release-mode build still succeeds — the GitHub release gets
+        # populated with the unsigned tarballs, which is useful as a
+        # bootstrap until secrets land.
+        if: |
+          github.event.inputs.snapshot != 'true' &&
+          env.APPLE_DEVELOPER_ID_CERT_P12_B64 != '' &&
+          env.APPLE_NOTARY_API_KEY_P8_B64 != ''
+        env:
+          APPLE_DEVELOPER_ID_CERT_P12_B64: ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12_B64 }}
+          APPLE_NOTARY_API_KEY_P8_B64: ${{ secrets.APPLE_NOTARY_API_KEY_P8_B64 }}
         run: echo "GORELEASER_SIGNING=on" >> "$GITHUB_ENV"
 
       # ------------------------------------------------------------------
