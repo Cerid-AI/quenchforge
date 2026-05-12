@@ -18,10 +18,10 @@ Quenchforge carries a single load-bearing patch per submodule that gates the bug
 | **Embeddings** (BGE-M3, e5, GTE — *not LLMs*) | `llama.cpp --embedding` | ✅ shipped, gateway routes `/api/embeddings` + `/v1/embeddings` |
 | **Reranking** (BGE-reranker, cross-encoders) | `llama.cpp --reranking` | ✅ shipped, gateway route `/v1/rerank` |
 | **Speech-to-text** | `whisper.cpp` | ✅ shipped, CPU mode default — correct transcription at 12.8× real-time on Xeon W-3245 |
-| **Image generation** | `stable-diffusion.cpp` | 🔜 v0.4 — slot kind reserved, gateway returns 501 with hint |
-| **Text-to-speech** | `bark.cpp` | 🔜 v0.4 — slot kind reserved, gateway returns 501 with hint |
+| **Image generation** | `stable-diffusion.cpp` | ✅ shipped in v0.3.1 — sd-server supervised slot, `/v1/images/generations` proxies through gateway |
+| **Text-to-speech** | `bark.cpp` | ✅ shipped in v0.3.1 — bark server supervised slot, `/v1/audio/speech` → `/tts` path-rewrite |
 
-> **Status:** v0.3 pre-release. Chat + embeddings + reranker + whisper transcription verified live on Mac Pro 2019 + Radeon Pro Vega II (32 GB HBM2). Binary distribution (signed Homebrew tap) is pending Apple Developer ID configuration.
+> **Status:** v0.3.1 pre-release. Chat + embeddings + reranker + whisper transcription verified live on Mac Pro 2019 + Radeon Pro Vega II (32 GB HBM2). Image-gen + TTS slots wired end-to-end; correctness on AMD Mac depends on the same `simdgroup_reduction`/`bfloat` fix landing in each project's vendored ggml. Homebrew tap at [`Cerid-AI/homebrew-tap`](https://github.com/Cerid-AI/homebrew-tap) is live; signed bottles ship once Apple Developer ID secrets land (see [docs/APPLE_DEVELOPER_ID.md](docs/APPLE_DEVELOPER_ID.md)).
 
 ## Hardware compatibility matrix
 

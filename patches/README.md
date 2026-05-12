@@ -1,13 +1,15 @@
 # Patch series
 
-Quenchforge carries **two** patches — one per submodule. They are applied at build time by `scripts/apply-patches.sh`; the submodule SHAs in `.gitmodules` stay clean.
+Quenchforge carries **four** patches — one per submodule. All four fix the same root cause (Apple-Silicon-only Metal kernels incorrectly enabled on AMD Mac), in four independently-vendored copies of ggml-metal. Applied at build time by `scripts/apply-patches.sh`; submodule SHAs in `.gitmodules` stay clean.
 
-| File | Submodule | Upstream issue | Purpose |
+| File | Submodule path | Target file | Upstream |
 |---|---|---|---|
-| `llama.cpp/0001-metal-correctness-on-non-apple-silicon.patch` | `llama.cpp` | [ggml-org/llama.cpp#19563](https://github.com/ggml-org/llama.cpp/issues/19563) | Gate `has_simdgroup_reduction` to `MTLGPUFamilyApple7` only and default `has_bfloat` to `MTLGPUFamilyApple6` only |
-| `whisper.cpp/0001-metal-correctness-on-non-apple-silicon.patch` | `whisper.cpp` | (same root cause; `ggml-metal-device.m` is duplicated across both projects) | Same hunks against whisper.cpp's vendored `ggml-metal-device.m` |
+| `llama.cpp/0001-metal-correctness-on-non-apple-silicon.patch` | `llama.cpp/` | `ggml/src/ggml-metal/ggml-metal-device.m` | [`ggml-org/llama.cpp`](https://github.com/ggml-org/llama.cpp) |
+| `whisper.cpp/0001-metal-correctness-on-non-apple-silicon.patch` | `whisper.cpp/` | `ggml/src/ggml-metal/ggml-metal-device.m` | [`ggml-org/whisper.cpp`](https://github.com/ggml-org/whisper.cpp) |
+| `sd.cpp/0001-metal-correctness-on-non-apple-silicon.patch` | `sd.cpp/` | `ggml/src/ggml-metal/ggml-metal-device.m` (via nested `ggml-org/ggml` submodule) | [`leejet/stable-diffusion.cpp`](https://github.com/leejet/stable-diffusion.cpp) |
+| `bark.cpp/0001-metal-correctness-on-non-apple-silicon.patch` | `bark.cpp/` | `encodec.cpp/ggml/src/ggml-metal.m` (via two-level nested submodules; older single-file `ggml-metal.m` layout, different API: `support_*` not `has_*`) | [`PABannier/bark.cpp`](https://github.com/PABannier/bark.cpp) → [`PABannier/encodec.cpp`](https://github.com/PABannier/encodec.cpp) |
 
-Both patches address the **same bug** (Apple-Silicon-only Metal kernels enabled on AMD Mac via the `|= MTLGPUFamilyMetal3_GGML` line), in **two different copies of ggml-metal** — `llama.cpp` and `whisper.cpp` each vendor their own `ggml/` subtree, so we have to apply the fix to both.
+All four patches address the **same upstream bug** ([ggml-org/llama.cpp#19563](https://github.com/ggml-org/llama.cpp/issues/19563)) — the `|= MTLGPUFamilyMetal3_GGML` line that enables Apple-Silicon-only kernels on AMD Mac. Each consumer of ggml has its own copy of the offending source, so we patch each copy.
 
 ## What the patch does
 

@@ -66,6 +66,8 @@ func TestValidateRejectsBadConfigs(t *testing.T) {
 			EmbedPort:   11501,
 			RerankPort:  11502,
 			WhisperPort: 11503,
+			SDPort:      11504,
+			BarkPort:    11505,
 		}
 	}
 	cases := []struct {
@@ -116,6 +118,8 @@ func TestEnsureDirsCreatesAll(t *testing.T) {
 		EmbedPort:    11501,
 		RerankPort:   11502,
 		WhisperPort:  11503,
+		SDPort:       11504,
+		BarkPort:     11505,
 	}
 	if err := cfg.EnsureDirs(); err != nil {
 		t.Fatalf("EnsureDirs: %v", err)

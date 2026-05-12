@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Quenchforge Contributors <maintainers@cerid-ai.com>
+Date: Tue, 12 May 2026 19:15:39 -0400
+Subject: [PATCH] metal: gate support_simdgroup_reduction to Apple Silicon only
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Same root cause as llama.cpp#19563 in this older single-file
+ggml-metal.m structure. The simdgroup-reduction kernels produce wrong
+arithmetic on non-Apple Metal devices (Intel Mac + AMD discrete).
+Gate to MTLGPUFamilyApple7 only by default; operators can opt back in
+with GGML_METAL_FORCE_SIMDGROUP_REDUCTION=1.
+
+bark.cpp's audio output regresses to noise without this fix on AMD
+Vega II, even though the chain (bark.cpp → encodec.cpp → ggml) is
+buried behind two submodule levels from the bark-server's perspective.
+
+Upstream-Issue: https://github.com/ggml-org/llama.cpp/issues/19563
+EOF
+)
+
+Signed-off-by: Quenchforge Contributors <maintainers@cerid-ai.com>
+---
+ src/ggml-metal.m | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/encodec.cpp/ggml/src/ggml-metal.m b/encodec.cpp/ggml/src/ggml-metal.m
+index 172a0f9..2d5735e 100644
+--- a/encodec.cpp/ggml/src/ggml-metal.m
++++ b/encodec.cpp/ggml/src/ggml-metal.m
+@@ -55,8 +55,16 @@
+     if (ctx->mtl_device == nil) {
+         ctx->mtl_device = MTLCreateSystemDefaultDevice();
+ 
+-        ctx->support_simdgroup_reduction  = [ctx->mtl_device supportsFamily:MTLGPUFamilyApple7];
+-        ctx->support_simdgroup_reduction |= [ctx->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
++        // Quenchforge patch: simdgroup-reduction kernels rely on
++        // Apple-Silicon-specific simdgroup intrinsics. On non-Apple Metal
++        // devices (Intel Mac + AMD discrete, Intel iGPU) they produce wrong
++        // arithmetic. Same root cause as llama.cpp#19563. Older-style
++        // ggml-metal.m here uses `support_simdgroup_reduction` rather than
++        // `has_simdgroup_reduction` but the fix is identical.
++        ctx->support_simdgroup_reduction = [ctx->mtl_device supportsFamily:MTLGPUFamilyApple7];
++        if (getenv("GGML_METAL_FORCE_SIMDGROUP_REDUCTION") != NULL) {
++            ctx->support_simdgroup_reduction |= [ctx->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
++        }
+ 
+         ctx->support_simdgroup_mm = [ctx->mtl_device supportsFamily:MTLGPUFamilyApple7];
+ 
+-- 
+2.50.1 (Apple Git-155)
+

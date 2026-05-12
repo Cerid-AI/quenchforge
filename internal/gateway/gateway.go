@@ -163,13 +163,18 @@ func (g *Gateway) Start(ctx context.Context) error {
 	mux.HandleFunc("/v1/audio/transcriptions", g.proxyHandler(KindWhisper, "/inference"))
 	mux.HandleFunc("/v1/audio/translations", g.proxyHandler(KindWhisper, "/inference"))
 	mux.HandleFunc("/inference", g.proxyHandler(KindWhisper, "")) // whisper-native path
-	// image generation (stable-diffusion.cpp) — slot kind reserved; the
-	// real handler lands in v0.4. Returns 501 with a useful hint today.
-	mux.HandleFunc("/v1/images/generations", g.handleNotYetImplemented(KindImageGen,
-		"image generation is scheduled for v0.4 (stable-diffusion.cpp slot)"))
-	// text-to-speech (bark.cpp) — slot kind reserved, lands in v0.4.
-	mux.HandleFunc("/v1/audio/speech", g.handleNotYetImplemented(KindTTS,
-		"text-to-speech is scheduled for v0.4 (bark.cpp slot)"))
+	// image generation — sd-server speaks OpenAI's /v1/images/generations
+	// natively, so no path rewrite needed.
+	mux.HandleFunc("/v1/images/generations", g.proxyHandler(KindImageGen, ""))
+	// stable-diffusion.cpp also exposes its own SD-API surface; expose
+	// /sdapi/ unchanged for clients that prefer the AUTOMATIC1111-style API.
+	mux.HandleFunc("/sdapi/v1/txt2img", g.proxyHandler(KindImageGen, ""))
+	mux.HandleFunc("/sdapi/v1/img2img", g.proxyHandler(KindImageGen, ""))
+	// text-to-speech (bark.cpp server). Its native route is /tts (returns
+	// audio/wav); OpenAI's /v1/audio/speech POSTs JSON { input, voice, ... }.
+	// We pass-through; client format-translation is a v0.4 concern.
+	mux.HandleFunc("/v1/audio/speech", g.proxyHandler(KindTTS, "/tts"))
+	mux.HandleFunc("/tts", g.proxyHandler(KindTTS, ""))
 	// pull (stub — points users at migrate-from-ollama)
 	mux.HandleFunc("/api/pull", g.handlePull)
 
@@ -309,19 +314,6 @@ func (g *Gateway) proxyHandler(kind SlotKind, rewriteTo string) http.HandlerFunc
 			r = r2
 		}
 		entry.proxy.ServeHTTP(w, r)
-	}
-}
-
-// handleNotYetImplemented returns a 501 with a friendly explanation,
-// keeping the route surface stable across versions so client libraries
-// don't bounce.
-func (g *Gateway) handleNotYetImplemented(kind SlotKind, hint string) http.HandlerFunc {
-	return func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusNotImplemented, map[string]any{
-			"error": fmt.Sprintf("%s slot is reserved but not yet wired", kind),
-			"hint":  hint,
-			"docs":  "https://github.com/cerid-ai/quenchforge",
-		})
 	}
 }
 

@@ -15,7 +15,7 @@ class Quenchforge < Formula
   desc "ggml-on-AMD-Mac correctness — chat, embedding, reranker, Whisper transcription"
   homepage "https://github.com/Cerid-AI/quenchforge"
   license "Apache-2.0"
-  version "0.3.0-dev"
+  version "0.3.1-dev"
 
   # Hardware constraint — Quenchforge is macOS-only by design, and the
   # patches only matter on Intel Mac + AMD discrete or Apple Silicon. We

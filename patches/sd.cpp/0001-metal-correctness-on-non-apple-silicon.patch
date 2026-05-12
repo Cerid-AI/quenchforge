@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Quenchforge Contributors <maintainers@cerid-ai.com>
+Date: Tue, 12 May 2026 18:42:20 -0400
+Subject: [PATCH] metal: gate has_simdgroup_reduction and has_bfloat to Apple
+ Silicon only
+
+Same fix as the llama.cpp companion patch. whisper.cpp's ggml-metal-device.m
+carries the identical Apple-Silicon-only-kernel bug: simdgroup-reduction
+and bfloat ops were `|= MTLGPUFamilyMetal3_GGML`-enabled on any Metal3
+device, including AMD discrete on Intel Mac, where the kernels miscompile
+and produce wrong arithmetic. On whisper this manifests as transcription
+output regressing to noise tokens.
+
+Gate has_simdgroup_reduction to MTLGPUFamilyApple7 only and has_bfloat
+to MTLGPUFamilyApple6 only. Operators can opt back in via:
+  - GGML_METAL_FORCE_SIMDGROUP_REDUCTION=1
+  - GGML_METAL_FORCE_BF16=1
+
+Upstream-Issue: https://github.com/ggml-org/llama.cpp/issues/19563
+Signed-off-by: Quenchforge Contributors <maintainers@cerid-ai.com>
+---
+ ggml/src/ggml-metal/ggml-metal-device.m | 19 +++++++++++++++----
+ 1 file changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index fe90aaf..6f3600e 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -644,14 +644,25 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
+             dev->addr_virt = 0x000000400ULL;
+ 
+             dev->props.device = device;
+-            dev->props.has_simdgroup_reduction  = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
+-            dev->props.has_simdgroup_reduction |= [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
++            // Quenchforge patch: simdgroup-reduction kernels rely on
++            // Apple-Silicon-specific simdgroup intrinsics. On non-Apple Metal
++            // devices (Intel Mac + AMD discrete, Intel iGPU) the kernels
++            // produce wrong arithmetic. Same root cause as llama.cpp#19563.
++            // Gate to Apple7 only by default; opt-in via env to restore.
++            dev->props.has_simdgroup_reduction = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
++            if (getenv("GGML_METAL_FORCE_SIMDGROUP_REDUCTION") != NULL) {
++                dev->props.has_simdgroup_reduction |= [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
++            }
+ 
+             dev->props.has_simdgroup_mm = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
+             dev->props.has_unified_memory = dev->mtl_device.hasUnifiedMemory;
+ 
+-            dev->props.has_bfloat  = [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
+-            dev->props.has_bfloat |= [dev->mtl_device supportsFamily:MTLGPUFamilyApple6];
++            // Quenchforge patch: bfloat ops on AMD Metal also produce wrong
++            // results. Default to disabled on non-Apple-Silicon.
++            dev->props.has_bfloat  = [dev->mtl_device supportsFamily:MTLGPUFamilyApple6];
++            if (getenv("GGML_METAL_FORCE_BF16") != NULL) {
++                dev->props.has_bfloat |= [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
++            }
+             if (getenv("GGML_METAL_BF16_DISABLE") != NULL) {
+                 dev->props.has_bfloat = false;
+             }
+-- 
+2.50.1 (Apple Git-155)
+

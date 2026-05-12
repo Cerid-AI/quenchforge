@@ -9,3 +9,9 @@
 [submodule "whisper.cpp"]
 	path = whisper.cpp
 	url = https://github.com/ggml-org/whisper.cpp.git
+[submodule "sd.cpp"]
+	path = sd.cpp
+	url = https://github.com/leejet/stable-diffusion.cpp.git
+[submodule "bark.cpp"]
+	path = bark.cpp
+	url = https://github.com/PABannier/bark.cpp.git

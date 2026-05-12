@@ -31,7 +31,7 @@ import (
 //
 // goreleaser handles this in CI. Local dev builds carry the zero value.
 var (
-	Version   = "0.3.0-dev"
+	Version   = "0.3.1-dev"
 	Commit    = "unknown"
 	BuildDate = "unknown"
 )
@@ -356,6 +356,75 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 			}
 		}
 
+		// Image-gen slot — opt-in via QUENCHFORGE_SD_MODEL. Uses sd-server
+		// from stable-diffusion.cpp/examples/server/. Speaks OpenAI's
+		// /v1/images/generations natively, so the gateway just proxies.
+		if cfg.SDModel != "" {
+			sdBin, err := resolveSDBin()
+			if err != nil {
+				fmt.Fprintf(stderr,
+					"quenchforge: warning: image-gen slot not started: %v\n"+
+						"  /v1/images/generations will return 503.\n", err)
+			} else {
+				slot := supervisor.NewSlot("imagegen")
+				slot.BinPath = sdBin
+				slot.LogDir = cfg.LogDir
+				slot.PIDDir = cfg.PIDDir
+				slot.Args = []string{
+					"-m", cfg.SDModel,
+					"--listen-ip", "127.0.0.1",
+					"--listen-port", fmt.Sprintf("%d", cfg.SDPort),
+				}
+				slot.Env = []string{fmt.Sprintf("GGML_METAL_N_CB=%d", cfg.MetalNCB)}
+				if err := slot.Start(ctx); err != nil {
+					fmt.Fprintf(stderr,
+						"quenchforge: warning: image-gen slot start failed: %v\n", err)
+				} else {
+					slots[gateway.KindImageGen] = slot
+					fmt.Fprintf(stdout,
+						"quenchforge: image-gen slot pid=%d model=%s port=%d\n",
+						slot.PID(), cfg.SDModel, cfg.SDPort)
+					_ = g.SetUpstream(gateway.KindImageGen,
+						fmt.Sprintf("http://127.0.0.1:%d", cfg.SDPort))
+				}
+			}
+		}
+
+		// TTS slot — opt-in via QUENCHFORGE_BARK_MODEL. Uses the bark.cpp
+		// server example. Its native route is /tts; the gateway rewrites
+		// /v1/audio/speech to /tts on the way through.
+		if cfg.BarkModel != "" {
+			barkBin, err := resolveBarkBin()
+			if err != nil {
+				fmt.Fprintf(stderr,
+					"quenchforge: warning: TTS slot not started: %v\n"+
+						"  /v1/audio/speech will return 503.\n", err)
+			} else {
+				slot := supervisor.NewSlot("tts")
+				slot.BinPath = barkBin
+				slot.LogDir = cfg.LogDir
+				slot.PIDDir = cfg.PIDDir
+				slot.Args = []string{
+					"-m", cfg.BarkModel,
+					"-a", "127.0.0.1",
+					"-p", fmt.Sprintf("%d", cfg.BarkPort),
+					"-t", "8",
+				}
+				slot.Env = []string{fmt.Sprintf("GGML_METAL_N_CB=%d", cfg.MetalNCB)}
+				if err := slot.Start(ctx); err != nil {
+					fmt.Fprintf(stderr,
+						"quenchforge: warning: TTS slot start failed: %v\n", err)
+				} else {
+					slots[gateway.KindTTS] = slot
+					fmt.Fprintf(stdout,
+						"quenchforge: TTS slot pid=%d model=%s port=%d\n",
+						slot.PID(), cfg.BarkModel, cfg.BarkPort)
+					_ = g.SetUpstream(gateway.KindTTS,
+						fmt.Sprintf("http://127.0.0.1:%d", cfg.BarkPort))
+				}
+			}
+		}
+
 		// Whisper slot — opt-in via QUENCHFORGE_WHISPER_MODEL. Uses
 		// whisper-server (a separate binary built from whisper.cpp).
 		// Default to CPU on Mac because whisper's Metal path still has
@@ -562,6 +631,48 @@ func cmdMigrate(args []string, stdout, stderr io.Writer) error {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+// resolveSDBin finds sd-server (stable-diffusion.cpp HTTP example).
+func resolveSDBin() (string, error) {
+	for _, p := range []string{
+		"./sd.cpp/build-arm64/bin/sd-server",
+		"./sd.cpp/build-x86_64/bin/sd-server",
+		"./sd.cpp/build-universal/bin/sd-server",
+		"./sd.cpp/build/bin/sd-server",
+		"/usr/local/bin/sd-server",
+		"/opt/homebrew/bin/sd-server",
+	} {
+		if st, err := os.Stat(p); err == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
+			return p, nil
+		}
+	}
+	if p, err := lookPath("sd-server"); err == nil {
+		return p, nil
+	}
+	return "", fmt.Errorf("sd-server not found — run scripts/build-sd.sh")
+}
+
+// resolveBarkBin finds the bark.cpp server example. Unlike sd-server, the
+// upstream binary doesn't carry a distinctive name — it lives at
+// examples/server/server. We accept both names for flexibility.
+func resolveBarkBin() (string, error) {
+	for _, p := range []string{
+		"./bark.cpp/build-arm64/examples/server/server",
+		"./bark.cpp/build-x86_64/examples/server/server",
+		"./bark.cpp/build-universal/examples/server/server",
+		"./bark.cpp/build/examples/server/server",
+		"/usr/local/bin/bark-server",
+		"/opt/homebrew/bin/bark-server",
+	} {
+		if st, err := os.Stat(p); err == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
+			return p, nil
+		}
+	}
+	if p, err := lookPath("bark-server"); err == nil {
+		return p, nil
+	}
+	return "", fmt.Errorf("bark server not found — run scripts/build-bark.sh")
+}
 
 // resolveWhisperBin finds whisper-server, the patched companion binary
 // from the whisper.cpp submodule. Search order mirrors resolveLlamaBin.

@@ -72,7 +72,13 @@ apply_one() {
         git apply --check "$p"
       else
         echo "==> ${submod}/${name}"
-        git apply --index --whitespace=nowarn "$p"
+        # No --index here: when the patch's target lives in a nested
+        # submodule (e.g. sd.cpp/ggml/..., bark.cpp/encodec.cpp/ggml/...)
+        # the outer submodule's index treats the inner one as a gitlink
+        # and `git apply --index` refuses with
+        # "does not exist in index". Working-tree-only is what the build
+        # actually needs anyway.
+        git apply --whitespace=nowarn "$p"
       fi
     done
   )

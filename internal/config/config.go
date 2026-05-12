@@ -116,6 +116,21 @@ type Config struct {
 	// runs comfortably faster than real-time anyway.
 	WhisperGPU bool
 
+	// SDModel is the path to the stable-diffusion.cpp ggml/safetensors
+	// model. Empty disables the image-gen slot and /v1/images/generations
+	// returns 503.
+	SDModel string
+
+	// SDPort is where the supervised sd-server binds. Default 11504.
+	SDPort int
+
+	// BarkModel is the path to the bark.cpp ggml model. Empty disables the
+	// TTS slot and /v1/audio/speech returns 503.
+	BarkModel string
+
+	// BarkPort is where the supervised bark server binds. Default 11505.
+	BarkPort int
+
 	// MaxContext is the KV-cache token cap exposed to clients.
 	MaxContext int
 
@@ -155,6 +170,10 @@ func Default() (Config, error) {
 		WhisperModel: "", // opt-in
 		WhisperPort:  11503,
 		WhisperGPU:   false, // opt-in; see config docstring
+		SDModel:      "",    // opt-in
+		SDPort:       11504,
+		BarkModel:    "", // opt-in
+		BarkPort:     11505,
 		MaxContext:   8192,
 		MetalNCB:     2,
 	}, nil
@@ -183,6 +202,10 @@ func Load() (Config, error) {
 	cfg.WhisperModel = envOr("QUENCHFORGE_WHISPER_MODEL", cfg.WhisperModel)
 	cfg.WhisperPort = envIntOr("QUENCHFORGE_WHISPER_PORT", cfg.WhisperPort)
 	cfg.WhisperGPU = envBoolOr("QUENCHFORGE_WHISPER_GPU", cfg.WhisperGPU)
+	cfg.SDModel = envOr("QUENCHFORGE_SD_MODEL", cfg.SDModel)
+	cfg.SDPort = envIntOr("QUENCHFORGE_SD_PORT", cfg.SDPort)
+	cfg.BarkModel = envOr("QUENCHFORGE_BARK_MODEL", cfg.BarkModel)
+	cfg.BarkPort = envIntOr("QUENCHFORGE_BARK_PORT", cfg.BarkPort)
 	cfg.MaxContext = envIntOr("QUENCHFORGE_MAX_CONTEXT", cfg.MaxContext)
 	cfg.MetalNCB = envIntOr("QUENCHFORGE_METAL_N_CB", cfg.MetalNCB)
 	cfg.TelemetryEnabled = envBoolOr("QUENCHFORGE_TELEMETRY", false)
@@ -222,6 +245,8 @@ func (c Config) Validate() error {
 	}{
 		{"RerankPort", c.RerankPort},
 		{"WhisperPort", c.WhisperPort},
+		{"SDPort", c.SDPort},
+		{"BarkPort", c.BarkPort},
 	} {
 		if p.v < 1 || p.v > 65535 {
 			return fmt.Errorf("config: %s %d outside valid TCP port range", p.name, p.v)
@@ -233,6 +258,8 @@ func (c Config) Validate() error {
 		"EmbedPort":   c.EmbedPort,
 		"RerankPort":  c.RerankPort,
 		"WhisperPort": c.WhisperPort,
+		"SDPort":      c.SDPort,
+		"BarkPort":    c.BarkPort,
 	}
 	seen := map[int]string{}
 	for name, p := range ports {
