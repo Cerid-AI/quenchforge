@@ -119,3 +119,33 @@ jobs:
             /tmp/quenchforge-${{ matrix.goarch }}
             /tmp/quenchforge-preflight-${{ matrix.goarch }}
           retention-days: 7
+
+  # ------------------------------------------------------------------
+  # AMD-GPU integration tests — runs on the self-hosted runner labelled
+  # `amd-gpu`. Spawns the patched llama-server against a real Vega II,
+  # exercises /v1/chat/completions through the gateway, asserts the
+  # output isn't garbage tokens. See docs/SELF_HOSTED_RUNNER.md.
+  #
+  # `continue-on-error` is true today because the runner is opt-in: if
+  # it's offline, we don't want CI to block the maintainer's other
+  # work. The rebase-upstream workflow has its own hard gate against
+  # this same test path.
+  # ------------------------------------------------------------------
+  amd-gpu-integration:
+    runs-on: [self-hosted, amd-gpu]
+    continue-on-error: true
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: build patched llama-server (if missing)
+        run: |
+          if [ ! -x llama.cpp/build-x86_64/bin/llama-server ] && [ ! -x llama.cpp/build-arm64/bin/llama-server ]; then
+            bash scripts/apply-patches.sh
+            bash scripts/build-llama.sh
+          fi
+
+      - name: integration test (amd_gpu tag)
+        run: go test -tags=amd_gpu -timeout 5m -count=1 ./tests/integration/...

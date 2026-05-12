@@ -188,8 +188,28 @@ func TestChatProxyReturns503WithoutUpstream(t *testing.T) {
 		t.Errorf("status = %d, want 503", resp.StatusCode)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	if !strings.Contains(string(body), "upstream not configured") {
-		t.Errorf("body %q does not mention upstream", body)
+	if !strings.Contains(string(body), "no chat slot configured") {
+		t.Errorf("body %q does not mention chat slot", body)
+	}
+}
+
+func TestEmbedProxyReturns503WithoutUpstream(t *testing.T) {
+	cfg := newTestConfig(t)
+	cfg.ListenAddr = pickListenAddr(t)
+	newRunningGateway(t, cfg)
+
+	resp, err := http.Post("http://"+cfg.ListenAddr+"/api/embeddings",
+		"application/json", strings.NewReader(`{"model":"x","input":"hi"}`))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "no embed slot configured") {
+		t.Errorf("body %q does not mention embed slot", body)
 	}
 }
 
@@ -208,7 +228,7 @@ func TestChatProxiesToUpstreamWhenSet(t *testing.T) {
 	cfg := newTestConfig(t)
 	cfg.ListenAddr = pickListenAddr(t)
 	g := newRunningGateway(t, cfg)
-	if err := g.SetUpstream(upstream.URL); err != nil {
+	if err := g.SetUpstream(KindChat, upstream.URL); err != nil {
 		t.Fatalf("SetUpstream: %v", err)
 	}
 
@@ -226,6 +246,110 @@ func TestChatProxiesToUpstreamWhenSet(t *testing.T) {
 	}
 	if !strings.Contains(string(gotBody), "hi") {
 		t.Errorf("upstream got body = %q, want 'hi'", gotBody)
+	}
+}
+
+// TestSlotKindRouting confirms each route reaches the correct upstream and
+// that the chat/embed upstreams are independent.
+func TestSlotKindRouting(t *testing.T) {
+	var chatHits, embedHits int
+	chatUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		chatHits++
+		_, _ = w.Write([]byte(`{"kind":"chat"}`))
+	}))
+	defer chatUpstream.Close()
+	embedUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		embedHits++
+		_, _ = w.Write([]byte(`{"kind":"embed"}`))
+	}))
+	defer embedUpstream.Close()
+
+	cfg := newTestConfig(t)
+	cfg.ListenAddr = pickListenAddr(t)
+	g := newRunningGateway(t, cfg)
+	if err := g.SetUpstream(KindChat, chatUpstream.URL); err != nil {
+		t.Fatalf("set chat: %v", err)
+	}
+	if err := g.SetUpstream(KindEmbed, embedUpstream.URL); err != nil {
+		t.Fatalf("set embed: %v", err)
+	}
+
+	cases := []struct {
+		method, path string
+		wantChat     int
+		wantEmbed    int
+	}{
+		{"POST", "/api/chat", 1, 0},
+		{"POST", "/api/generate", 1, 0},
+		{"POST", "/v1/chat/completions", 1, 0},
+		{"POST", "/api/embeddings", 0, 1},
+		{"POST", "/api/embed", 0, 1},
+		{"POST", "/v1/embeddings", 0, 1},
+	}
+	for _, tc := range cases {
+		chatHits, embedHits = 0, 0
+		req, _ := http.NewRequest(tc.method, "http://"+cfg.ListenAddr+tc.path,
+			strings.NewReader(`{"model":"x"}`))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Errorf("%s %s: %v", tc.method, tc.path, err)
+			continue
+		}
+		_ = resp.Body.Close()
+		if chatHits != tc.wantChat || embedHits != tc.wantEmbed {
+			t.Errorf("%s %s: chat=%d embed=%d (want chat=%d embed=%d)",
+				tc.method, tc.path, chatHits, embedHits, tc.wantChat, tc.wantEmbed)
+		}
+	}
+}
+
+// TestPullReturns501 — Quenchforge's MVP doesn't pull from a registry.
+func TestPullReturns501(t *testing.T) {
+	cfg := newTestConfig(t)
+	cfg.ListenAddr = pickListenAddr(t)
+	newRunningGateway(t, cfg)
+	resp, err := http.Post("http://"+cfg.ListenAddr+"/api/pull",
+		"application/json", strings.NewReader(`{"name":"llama3:latest"}`))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Errorf("status = %d, want 501", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "migrate-from-ollama") {
+		t.Errorf("body %q does not point at migrate-from-ollama", body)
+	}
+}
+
+// TestRootReportsKnownSlots — / surfaces all known slot kinds with
+// their configured status.
+func TestRootReportsKnownSlots(t *testing.T) {
+	cfg := newTestConfig(t)
+	cfg.ListenAddr = pickListenAddr(t)
+	g := newRunningGateway(t, cfg)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer upstream.Close()
+	if err := g.SetUpstream(KindChat, upstream.URL); err != nil {
+		t.Fatalf("set chat: %v", err)
+	}
+
+	resp, err := http.Get("http://" + cfg.ListenAddr + "/")
+	if err != nil {
+		t.Fatalf("GET /: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	for _, kind := range []string{"chat", "embed", "rerank"} {
+		if !strings.Contains(string(body), `"`+kind+`"`) {
+			t.Errorf("/ body missing %q in slots: %s", kind, body)
+		}
+	}
+	// Chat should report configured=true; embed/rerank should report false.
+	if !strings.Contains(string(body), `"chat":{"configured":true`) {
+		t.Errorf("/ body should show chat as configured=true: %s", body)
 	}
 }
 
@@ -294,11 +418,14 @@ func TestEnumerateModelsHandlesNestedDirs(t *testing.T) {
 // TestSetUpstreamRejectsBadURL keeps the error path tested.
 func TestSetUpstreamRejectsBadURL(t *testing.T) {
 	g := New(newTestConfig(t))
-	if err := g.SetUpstream("://not a url"); err == nil {
+	if err := g.SetUpstream(KindChat, "://not a url"); err == nil {
 		t.Error("SetUpstream: nil error on bad URL")
 	}
-	if err := g.SetUpstream(""); err != nil {
-		t.Errorf("SetUpstream(''): %v, want nil clear", err)
+	if err := g.SetUpstream(KindChat, ""); err != nil {
+		t.Errorf("SetUpstream(chat, ''): %v, want nil clear", err)
+	}
+	if err := g.SetUpstream(KindEmbed, ""); err != nil {
+		t.Errorf("SetUpstream(embed, ''): %v, want nil clear", err)
 	}
 }
 

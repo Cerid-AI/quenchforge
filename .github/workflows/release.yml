@@ -1,0 +1,117 @@
+name: release
+
+# Fires on a vX.Y.Z tag push. Goreleaser builds, signs, notarizes, publishes
+# the GitHub release artifacts, and updates the Homebrew formula in
+# cerid-ai/homebrew-tap.
+#
+# Required repository secrets (set before pushing a real tag):
+#   APPLE_DEVELOPER_ID_CERT_P12_B64   base64 of a Developer-ID-Application .p12
+#   APPLE_DEVELOPER_ID_CERT_PASSWORD  .p12 passphrase
+#   APPLE_NOTARY_API_KEY_ID           App Store Connect API Key ID
+#   APPLE_NOTARY_API_KEY_ISSUER       App Store Connect API Key Issuer ID
+#   APPLE_NOTARY_API_KEY_P8_B64       base64 of the App Store Connect .p8
+#   HOMEBREW_TAP_GITHUB_TOKEN         PAT with `repo` scope on Cerid-AI/homebrew-tap
+#
+# Until those secrets land, snapshot releases work via:
+#   gh workflow run release.yml -f snapshot=true
+# (the snapshot path skips sign/notarize/publish).
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      snapshot:
+        description: 'Snapshot build (skip signing + publish)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    env:
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+
+      # ------------------------------------------------------------------
+      # Sign-related setup. Skipped under snapshot mode AND skipped when
+      # the relevant secrets aren't configured (so the first tag push
+      # without secrets still produces an unsigned dry-run instead of
+      # failing hard).
+      # ------------------------------------------------------------------
+      - name: import code-signing cert
+        if: github.event.inputs.snapshot != 'true' && env.APPLE_DEVELOPER_ID_CERT_P12_B64 != ''
+        env:
+          APPLE_DEVELOPER_ID_CERT_P12_B64: ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12_B64 }}
+        run: |
+          set -euo pipefail
+          KC=$(mktemp -d)/quenchforge.keychain
+          KC_PASS=$(openssl rand -base64 18)
+          security create-keychain -p "$KC_PASS" "$KC"
+          security set-keychain-settings -t 3600 -l "$KC"
+          security unlock-keychain -p "$KC_PASS" "$KC"
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+
+          CERT_PATH=$(mktemp).p12
+          echo "$APPLE_DEVELOPER_ID_CERT_P12_B64" | base64 -d > "$CERT_PATH"
+          security import "$CERT_PATH" \
+            -k "$KC" \
+            -P "${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$KC_PASS" "$KC"
+          echo "APPLE_DEVELOPER_ID_CERT_PATH=$CERT_PATH" >> "$GITHUB_ENV"
+
+      - name: stage notarization API key
+        if: github.event.inputs.snapshot != 'true' && env.APPLE_NOTARY_API_KEY_P8_B64 != ''
+        env:
+          APPLE_NOTARY_API_KEY_P8_B64: ${{ secrets.APPLE_NOTARY_API_KEY_P8_B64 }}
+        run: |
+          P8=$(mktemp).p8
+          echo "$APPLE_NOTARY_API_KEY_P8_B64" | base64 -d > "$P8"
+          echo "APPLE_NOTARY_API_KEY_PATH=$P8" >> "$GITHUB_ENV"
+
+      - name: enable signing flag
+        if: github.event.inputs.snapshot != 'true'
+        run: echo "GORELEASER_SIGNING=on" >> "$GITHUB_ENV"
+
+      # ------------------------------------------------------------------
+      # Actually run goreleaser.
+      # ------------------------------------------------------------------
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: '~> v2'
+          args: >-
+            release
+            ${{ github.event.inputs.snapshot == 'true' && '--snapshot --skip=sign,publish,notarize' || '--clean' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+          APPLE_DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}
+          APPLE_NOTARY_API_KEY_ID: ${{ secrets.APPLE_NOTARY_API_KEY_ID }}
+          APPLE_NOTARY_API_KEY_ISSUER: ${{ secrets.APPLE_NOTARY_API_KEY_ISSUER }}
+
+      - name: upload snapshot artifacts
+        if: github.event.inputs.snapshot == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: quenchforge-snapshot
+          path: |
+            dist/**/quenchforge_*
+            dist/**/checksums.txt
+          retention-days: 14

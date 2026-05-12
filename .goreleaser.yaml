@@ -1,0 +1,206 @@
+# Quenchforge release configuration.
+#
+# Build matrix produces:
+#   - per-arch macOS binaries (darwin/amd64 + darwin/arm64)
+#   - a universal macOS binary (lipo of the two) for direct download
+#   - per-arch Homebrew bottles + a single auto-generated formula update
+#     in the homebrew tap repo
+#
+# Signing + notarization is gated behind the GORELEASER_SIGNING=on env
+# var so dry-run snapshots (`goreleaser release --snapshot --clean`) don't
+# fail when running outside CI without the Apple Developer ID artifacts.
+# In the release.yml workflow the env-var is set and the API key materializes
+# from `secrets.APPLE_NOTARY_API_KEY` via GitHub's secrets.
+#
+# Test locally with:
+#     goreleaser release --snapshot --clean --skip=sign,publish,notarize
+
+version: 2
+
+project_name: quenchforge
+
+before:
+  hooks:
+    # Apply the llama.cpp patch series and stage llama-server before we
+    # build the Go binaries. goreleaser doesn't compile llama.cpp itself —
+    # the Homebrew formula pulls llama.cpp as a dependency, and direct
+    # downloaders are expected to run scripts/build-llama.sh themselves.
+    # Keeping the hook here documents the workflow; remove or replace when
+    # the release artifact bundles a prebuilt llama-server.
+    - bash scripts/apply-patches.sh --check
+
+builds:
+  - id: quenchforge
+    main: ./cmd/quenchforge
+    binary: quenchforge
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.Version={{.Version}}
+      - -X main.Commit={{.Commit}}
+      - -X main.BuildDate={{.Date}}
+    mod_timestamp: '{{ .CommitTimestamp }}'
+
+  - id: quenchforge-preflight
+    main: ./cmd/quenchforge-preflight
+    binary: quenchforge-preflight
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+    mod_timestamp: '{{ .CommitTimestamp }}'
+
+universal_binaries:
+  - id: quenchforge-universal
+    name_template: quenchforge
+    ids: [quenchforge]
+    replace: false # keep per-arch builds available for the Homebrew bottle
+  - id: quenchforge-preflight-universal
+    name_template: quenchforge-preflight
+    ids: [quenchforge-preflight]
+    replace: false
+
+archives:
+  - id: tarball
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - LICENSE
+      - NOTICE
+      - README.md
+      - SECURITY.md
+      - patches/**/*
+
+checksum:
+  name_template: 'checksums.txt'
+  algorithm: sha256
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore\(deps\):'
+      - '^Merge'
+  groups:
+    - title: New features
+      regexp: '^.*?feat(\(.+\))??!?:.+$'
+      order: 0
+    - title: Bug fixes
+      regexp: '^.*?fix(\(.+\))??!?:.+$'
+      order: 1
+    - title: Patches
+      regexp: '^.*?patch(\(.+\))??!?:.+$'
+      order: 2
+
+# ---------------------------------------------------------------------------
+# Code signing — gated on $GORELEASER_SIGNING=on
+# ---------------------------------------------------------------------------
+#
+# Requires GitHub repository secrets:
+#   APPLE_DEVELOPER_ID_CERT_P12_B64  base64-encoded .p12 (developer-ID-app cert)
+#   APPLE_DEVELOPER_ID_CERT_PASSWORD passphrase for the .p12
+#   APPLE_NOTARY_API_KEY_ID          App Store Connect API Key ID
+#   APPLE_NOTARY_API_KEY_ISSUER      App Store Connect API Key Issuer ID
+#   APPLE_NOTARY_API_KEY_P8_B64      base64-encoded .p8 from App Store Connect
+#
+# The release workflow imports the cert + p8 into a temporary keychain
+# before invoking `goreleaser release`. See .github/workflows/release.yml.
+
+notarize:
+  macos:
+    - enabled: '{{ isEnvSet "GORELEASER_SIGNING" }}'
+      sign:
+        certificate: '{{ .Env.APPLE_DEVELOPER_ID_CERT_PATH }}'
+        password: '{{ .Env.APPLE_DEVELOPER_ID_CERT_PASSWORD }}'
+      notarize:
+        issuer_id: '{{ .Env.APPLE_NOTARY_API_KEY_ISSUER }}'
+        key_id: '{{ .Env.APPLE_NOTARY_API_KEY_ID }}'
+        key: '{{ .Env.APPLE_NOTARY_API_KEY_PATH }}'
+        wait: true
+        timeout: 10m
+      ids:
+        - quenchforge
+        - quenchforge-preflight
+
+# ---------------------------------------------------------------------------
+# Homebrew tap — auto-update Formula/quenchforge.rb in cerid-ai/homebrew-tap
+# ---------------------------------------------------------------------------
+
+brews:
+  - name: quenchforge
+    homepage: https://github.com/Cerid-AI/quenchforge
+    description: >-
+      Local LLM, embedding, reranker, and Whisper inference for Mac + AMD
+      discrete GPU. Ollama- and OpenAI-compatible HTTP APIs.
+    license: Apache-2.0
+    skip_upload: '{{ if eq .Prerelease "" }}false{{ else }}auto{{ end }}'
+    repository:
+      owner: Cerid-AI
+      name: homebrew-tap
+      branch: main
+      token: '{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}'
+    commit_author:
+      name: quenchforge-release-bot
+      email: maintainers@cerid-ai.com
+    commit_msg_template: 'chore(formula): bump quenchforge to {{ .Tag }}'
+    directory: Formula
+    install: |
+      bin.install "quenchforge"
+      bin.install "quenchforge-preflight"
+    test: |
+      output = shell_output("#{bin}/quenchforge version")
+      assert_match "quenchforge", output
+      assert_match "darwin", output
+      preflight_out = shell_output("#{bin}/quenchforge-preflight", 0)
+      assert_match "status=", preflight_out
+    service: |
+      run [opt_bin/"quenchforge", "serve"]
+      keep_alive true
+      log_path "#{var}/log/quenchforge/serve.log"
+      error_log_path "#{var}/log/quenchforge/serve.err.log"
+      working_dir var
+      environment_variables QUENCHFORGE_LOG_DIR: "#{var}/log/quenchforge"
+    extra_install: |
+      (var/"log/quenchforge").mkpath
+
+# ---------------------------------------------------------------------------
+# Release publication
+# ---------------------------------------------------------------------------
+
+release:
+  github:
+    owner: Cerid-AI
+    name: quenchforge
+  name_template: '{{.Tag}}'
+  draft: false
+  prerelease: auto
+  header: |
+    ## Quenchforge {{ .Tag }}
+
+    Local inference for **Mac + AMD discrete GPU**, behind Ollama- and OpenAI-compatible HTTP APIs.
+    See [README](https://github.com/Cerid-AI/quenchforge#readme) for the hardware compatibility matrix.
+  footer: |
+    **Install via Homebrew tap (recommended):**
+    ```sh
+    brew install cerid-ai/tap/quenchforge
+    brew services start quenchforge
+    ```
+    **Verify before installing:**
+    ```sh
+    curl -fsSL https://github.com/Cerid-AI/quenchforge/releases/download/{{ .Tag }}/quenchforge-preflight_{{ .Version }}_darwin_universal.tar.gz \
+      | tar -xz -O quenchforge-preflight | sh
+    ```

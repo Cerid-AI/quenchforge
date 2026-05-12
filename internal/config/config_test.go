@@ -54,20 +54,38 @@ func TestLoadAppliesEnvOverrides(t *testing.T) {
 }
 
 func TestValidateRejectsBadConfigs(t *testing.T) {
+	// Helper to build a config that's valid in every field except one — so
+	// each case isolates the field under test.
+	base := func() Config {
+		return Config{
+			ListenAddr: "127.0.0.1:11434",
+			ModelsDir:  "/tmp/m",
+			MaxContext: 8192,
+			MetalNCB:   2,
+			ChatPort:   11500,
+			EmbedPort:  11501,
+		}
+	}
 	cases := []struct {
 		name    string
-		cfg     Config
+		mutate  func(*Config)
 		wantSub string
 	}{
-		{"no port", Config{ListenAddr: "127.0.0.1", ModelsDir: "/tmp/m", MaxContext: 8192, MetalNCB: 2}, "must include a port"},
-		{"empty addr", Config{ModelsDir: "/tmp/m", MaxContext: 8192, MetalNCB: 2}, "ListenAddr is empty"},
-		{"empty models", Config{ListenAddr: "127.0.0.1:11434", MaxContext: 8192, MetalNCB: 2}, "ModelsDir is empty"},
-		{"low ctx", Config{ListenAddr: "127.0.0.1:11434", ModelsDir: "/tmp/m", MaxContext: 100, MetalNCB: 2}, "below the 512"},
-		{"low ncb", Config{ListenAddr: "127.0.0.1:11434", ModelsDir: "/tmp/m", MaxContext: 8192, MetalNCB: 0}, "MetalNCB"},
+		{"no port", func(c *Config) { c.ListenAddr = "127.0.0.1" }, "must include a port"},
+		{"empty addr", func(c *Config) { c.ListenAddr = "" }, "ListenAddr is empty"},
+		{"empty models", func(c *Config) { c.ModelsDir = "" }, "ModelsDir is empty"},
+		{"low ctx", func(c *Config) { c.MaxContext = 100 }, "below the 512"},
+		{"low ncb", func(c *Config) { c.MetalNCB = 0 }, "MetalNCB"},
+		{"chat port 0", func(c *Config) { c.ChatPort = 0 }, "ChatPort"},
+		{"chat port out of range", func(c *Config) { c.ChatPort = 70000 }, "ChatPort"},
+		{"embed port 0", func(c *Config) { c.EmbedPort = 0 }, "EmbedPort"},
+		{"same chat embed port", func(c *Config) { c.EmbedPort = c.ChatPort }, "must differ"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := tc.cfg.Validate()
+			cfg := base()
+			tc.mutate(&cfg)
+			err := cfg.Validate()
 			if err == nil {
 				t.Fatal("Validate succeeded, want error")
 			}
@@ -88,6 +106,8 @@ func TestEnsureDirsCreatesAll(t *testing.T) {
 		DefaultModel: "x",
 		MaxContext:   8192,
 		MetalNCB:     2,
+		ChatPort:     11500,
+		EmbedPort:    11501,
 	}
 	if err := cfg.EnsureDirs(); err != nil {
 		t.Fatalf("EnsureDirs: %v", err)

@@ -7,16 +7,19 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/cerid-ai/quenchforge/internal/config"
+	"github.com/cerid-ai/quenchforge/internal/discovery"
 	"github.com/cerid-ai/quenchforge/internal/gateway"
 	"github.com/cerid-ai/quenchforge/internal/hardware"
 	"github.com/cerid-ai/quenchforge/internal/supervisor"
@@ -189,9 +192,11 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	listen := fs.String("listen", "", "override listen address (env: QUENCHFORGE_LISTEN_ADDR)")
-	noSlot := fs.Bool("no-slot", false, "start the gateway only; don't supervise a llama-server slot")
+	noSlot := fs.Bool("no-slot", false, "start the gateway only; don't supervise any llama-server slots")
 	model := fs.String("model", "", "GGUF model name (under models dir) to load in the chat slot; "+
 		"empty = read from QUENCHFORGE_DEFAULT_MODEL")
+	embedModel := fs.String("embed-model", "", "GGUF model name to load in the embedding slot; "+
+		"empty = read from QUENCHFORGE_EMBED_MODEL (no embed slot when both are empty)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -202,6 +207,9 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 	}
 	if *listen != "" {
 		cfg.ListenAddr = *listen
+	}
+	if *embedModel != "" {
+		cfg.EmbedModel = *embedModel
 	}
 	if err := cfg.EnsureDirs(); err != nil {
 		return err
@@ -233,26 +241,89 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 	}
 	fmt.Fprintf(stdout, "quenchforge: gateway listening on http://%s\n", cfg.ListenAddr)
 
-	// Optional supervised slot
-	var slot *supervisor.Slot
+	// mDNS advertisement (opt-in via QUENCHFORGE_ADVERTISE_MDNS). The
+	// gateway's listen port is what gets advertised — so peers see the
+	// HTTP surface, not the raw llama-server slots.
+	var mdnsAdv discovery.Advertiser
+	if cfg.AdvertiseMDNS {
+		port, parseErr := portFromListenAddr(cfg.ListenAddr)
+		if parseErr != nil {
+			fmt.Fprintf(stderr, "quenchforge: warning: mDNS skipped: %v\n", parseErr)
+		} else {
+			adv, err := discovery.Start(ctx, discovery.Service{
+				Port: port,
+				TXTRecords: []string{
+					"version=" + Version,
+					"api=ollama,openai",
+				},
+			})
+			if err != nil {
+				fmt.Fprintf(stderr,
+					"quenchforge: warning: mDNS advertisement failed: %v\n"+
+						"  Gateway still works; peers just won't auto-discover it.\n", err)
+			} else {
+				mdnsAdv = adv
+				fmt.Fprintln(stdout,
+					"quenchforge: advertised on Bonjour as `_quenchforge._tcp.local.`")
+				fmt.Fprintln(stdout,
+					"  (Sonoma+: first launch may show a 'find devices on your local network' prompt)")
+			}
+		}
+	}
+
+	// Slots are tracked in a small map so the shutdown path handles them
+	// uniformly. The map key matches the gateway SlotKind so logs and
+	// the `quenchforge doctor` report stay readable.
+	slots := map[gateway.SlotKind]*supervisor.Slot{}
 	if !*noSlot {
+		// Chat slot — always-on unless the operator disables it via --no-slot.
 		modelName := *model
 		if modelName == "" {
 			modelName = cfg.DefaultModel
 		}
-		var err error
-		slot, err = startChatSlot(ctx, cfg, modelName, stderr)
+		s, err := startSlot(ctx, cfg, slotSpec{
+			Kind:      gateway.KindChat,
+			Name:      "chat",
+			Model:     modelName,
+			Port:      cfg.ChatPort,
+			ExtraArgs: nil,
+		}, stderr)
 		if err != nil {
 			fmt.Fprintf(stderr,
 				"quenchforge: warning: chat slot not started: %v\n"+
 					"  Gateway is up but /api/chat will return 503.\n"+
 					"  Run `quenchforge doctor` for the binary path and model registry.\n", err)
 		} else {
-			fmt.Fprintf(stdout, "quenchforge: chat slot pid=%d model=%s\n",
-				slot.PID(), modelName)
-			// Point the gateway at the slot's local URL. v0.1 hard-codes the
-			// slot port; v0.2 reads the actual bind from llama-server's stderr.
-			_ = g.SetUpstream("http://127.0.0.1:11500")
+			slots[gateway.KindChat] = s
+			fmt.Fprintf(stdout, "quenchforge: chat slot pid=%d model=%s port=%d\n",
+				s.PID(), modelName, cfg.ChatPort)
+			_ = g.SetUpstream(gateway.KindChat,
+				fmt.Sprintf("http://127.0.0.1:%d", cfg.ChatPort))
+		}
+
+		// Embed slot — opt-in via QUENCHFORGE_EMBED_MODEL or --embed-model.
+		if cfg.EmbedModel != "" {
+			s, err := startSlot(ctx, cfg, slotSpec{
+				Kind:  gateway.KindEmbed,
+				Name:  "embed",
+				Model: cfg.EmbedModel,
+				Port:  cfg.EmbedPort,
+				// --embedding flips llama-server into pooled-embedding mode.
+				// --pooling cls is the standard for most BERT-style embedders;
+				// callers using mean-pooling models can override via config.
+				ExtraArgs: []string{"--embedding", "--pooling", "cls"},
+			}, stderr)
+			if err != nil {
+				fmt.Fprintf(stderr,
+					"quenchforge: warning: embed slot not started: %v\n"+
+						"  /api/embeddings will return 503.\n", err)
+			} else {
+				slots[gateway.KindEmbed] = s
+				fmt.Fprintf(stdout, "quenchforge: embed slot pid=%d model=%s port=%d\n",
+					s.PID(), cfg.EmbedModel, cfg.EmbedPort)
+				_ = g.SetUpstream(gateway.KindEmbed,
+					fmt.Sprintf("http://127.0.0.1:%d", cfg.EmbedPort))
+			}
 		}
 	}
 
@@ -260,11 +331,15 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 	<-ctx.Done()
 	fmt.Fprintln(stdout, "quenchforge: shutdown signal received")
 
-	// Tear down: slot first, then gateway, with grace timeouts so a hung
-	// llama-server can't block our exit indefinitely.
-	if slot != nil {
+	// Tear down: mDNS first (withdraws the advertisement before peers see
+	// us go offline), then slots, then gateway. Grace timeouts on each so
+	// a hung child can't block our exit indefinitely.
+	if mdnsAdv != nil {
+		_ = mdnsAdv.Stop()
+	}
+	for kind, slot := range slots {
 		if err := slot.Stop(5 * time.Second); err != nil {
-			fmt.Fprintf(stderr, "quenchforge: slot stop: %v\n", err)
+			fmt.Fprintf(stderr, "quenchforge: %s slot stop: %v\n", kind, err)
 		}
 	}
 	if err := g.Stop(2 * time.Second); err != nil {
@@ -273,38 +348,62 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 	return nil
 }
 
-// startChatSlot launches llama-server with the configured model and Metal
-// defaults. The slot binds to 127.0.0.1:11500 (one above 11434 so the
-// gateway port is never in conflict with its child).
-func startChatSlot(ctx context.Context, cfg config.Config, modelName string, stderr io.Writer) (*supervisor.Slot, error) {
+// portFromListenAddr pulls the port from a "host:port" listen address.
+func portFromListenAddr(addr string) (int, error) {
+	_, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return 0, fmt.Errorf("parse listen addr %q: %w", addr, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return 0, fmt.Errorf("parse port %q: %w", portStr, err)
+	}
+	return port, nil
+}
+
+// slotSpec describes one llama-server instance to launch.
+type slotSpec struct {
+	Kind      gateway.SlotKind
+	Name      string // pidfile/log filename
+	Model     string // model name under cfg.ModelsDir
+	Port      int    // 127.0.0.1:Port
+	ExtraArgs []string
+}
+
+// startSlot launches one llama-server with the configured model + Metal
+// defaults. Used for both chat and embed slots; the spec controls the
+// differences (model, port, mode flags).
+func startSlot(ctx context.Context, cfg config.Config, spec slotSpec, stderr io.Writer) (*supervisor.Slot, error) {
 	bin, err := resolveLlamaBin(cfg.LlamaBin)
 	if err != nil {
 		return nil, err
 	}
-	modelPath, err := resolveModelPath(cfg.ModelsDir, modelName)
+	modelPath, err := resolveModelPath(cfg.ModelsDir, spec.Model)
 	if err != nil {
 		return nil, err
 	}
 
-	slot := supervisor.NewSlot("chat")
+	args := []string{
+		"--model", modelPath,
+		"--host", "127.0.0.1",
+		"--port", fmt.Sprintf("%d", spec.Port),
+		"--ctx-size", fmt.Sprintf("%d", cfg.MaxContext),
+	}
+	args = append(args, spec.ExtraArgs...)
+
+	slot := supervisor.NewSlot(spec.Name)
 	slot.BinPath = bin
 	slot.LogDir = cfg.LogDir
 	slot.PIDDir = cfg.PIDDir
-	slot.Args = []string{
-		"--model", modelPath,
-		"--host", "127.0.0.1",
-		"--port", "11500",
-		"--ctx-size", fmt.Sprintf("%d", cfg.MaxContext),
-	}
+	slot.Args = args
 	slot.Env = []string{
 		fmt.Sprintf("GGML_METAL_N_CB=%d", cfg.MetalNCB),
-		"GGML_METAL_FORCE_PRIVATE=1", // honored by patch 0001 once applied
 	}
 	if err := slot.Start(ctx); err != nil {
 		return nil, err
 	}
-	fmt.Fprintf(stderr, "quenchforge: spawned %s pid=%d log=%s\n",
-		bin, slot.PID(), filepath.Join(cfg.LogDir, "chat.log"))
+	fmt.Fprintf(stderr, "quenchforge: spawned %s [%s] pid=%d log=%s\n",
+		bin, spec.Kind, slot.PID(), filepath.Join(cfg.LogDir, spec.Name+".log"))
 	return slot, nil
 }
 

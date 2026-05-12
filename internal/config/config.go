@@ -24,11 +24,19 @@
 //	                            ~/.config/quenchforge/pids.
 //	QUENCHFORGE_DEFAULT_MODEL — fallback model when a request omits the field.
 //	                            Default qwen2.5:7b-instruct-q4_k_m.
+//	QUENCHFORGE_CHAT_PORT    — supervised chat-slot port. Default 11500.
+//	QUENCHFORGE_EMBED_MODEL  — GGUF model for the embedding slot. Empty = no
+//	                            embed slot is started; /api/embeddings 503s.
+//	QUENCHFORGE_EMBED_PORT   — supervised embed-slot port. Default 11501.
 //	QUENCHFORGE_MAX_CONTEXT  — max KV-cache context in tokens. Default 8192.
 //	QUENCHFORGE_METAL_N_CB   — Metal command-buffer count. Default 2 — set as
 //	                            a launch env var on llama-server (issue surface
 //	                            of the would-be third patch).
 //	QUENCHFORGE_TELEMETRY    — opt-in: "on" or "off". Default "off".
+//	QUENCHFORGE_ADVERTISE_MDNS — opt-in: advertise `_quenchforge._tcp.local.`
+//	                            via the system mDNSResponder. Default "off".
+//	                            First-launch triggers the documented Sonoma+
+//	                            "find devices on your local network" TCC prompt.
 package config
 
 import (
@@ -57,9 +65,21 @@ type Config struct {
 	// PIDDir holds per-slot pidfiles for the orphan reaper.
 	PIDDir string
 
-	// DefaultModel is what the gateway falls back to when a request omits
-	// the `model` field. Should be a name resolvable under ModelsDir.
+	// DefaultModel is what the chat slot loads when a request omits the
+	// `model` field. Should be a name resolvable under ModelsDir.
 	DefaultModel string
+
+	// ChatPort is where the supervised chat slot binds (127.0.0.1:ChatPort).
+	// Default 11500. One above 11434 (default ListenAddr port) so the slot
+	// is never a conflict with the gateway itself.
+	ChatPort int
+
+	// EmbedModel is the GGUF the embedding slot loads. Empty means the embed
+	// slot is not started and /api/embeddings returns 503.
+	EmbedModel string
+
+	// EmbedPort is where the supervised embed slot binds. Default 11501.
+	EmbedPort int
 
 	// MaxContext is the KV-cache token cap exposed to clients.
 	MaxContext int
@@ -71,6 +91,11 @@ type Config struct {
 
 	// TelemetryEnabled is opt-in. Wired in v0.2 once the consent screen ships.
 	TelemetryEnabled bool
+
+	// AdvertiseMDNS controls Bonjour advertisement of `_quenchforge._tcp.local.`
+	// via the system mDNSResponder. Off by default — flipping to true triggers
+	// the documented Sonoma+ TCC prompt for local-network access.
+	AdvertiseMDNS bool
 }
 
 // Default returns a Config populated with defaults that don't require any
@@ -87,6 +112,9 @@ func Default() (Config, error) {
 		LogDir:       filepath.Join(home, "Library", "Logs", "quenchforge"),
 		PIDDir:       filepath.Join(home, ".config", "quenchforge", "pids"),
 		DefaultModel: "qwen2.5:7b-instruct-q4_k_m",
+		ChatPort:     11500,
+		EmbedModel:   "", // opt-in
+		EmbedPort:    11501,
 		MaxContext:   8192,
 		MetalNCB:     2,
 	}, nil
@@ -107,9 +135,13 @@ func Load() (Config, error) {
 	cfg.LogDir = envOr("QUENCHFORGE_LOG_DIR", cfg.LogDir)
 	cfg.PIDDir = envOr("QUENCHFORGE_PID_DIR", cfg.PIDDir)
 	cfg.DefaultModel = envOr("QUENCHFORGE_DEFAULT_MODEL", cfg.DefaultModel)
+	cfg.ChatPort = envIntOr("QUENCHFORGE_CHAT_PORT", cfg.ChatPort)
+	cfg.EmbedModel = envOr("QUENCHFORGE_EMBED_MODEL", cfg.EmbedModel)
+	cfg.EmbedPort = envIntOr("QUENCHFORGE_EMBED_PORT", cfg.EmbedPort)
 	cfg.MaxContext = envIntOr("QUENCHFORGE_MAX_CONTEXT", cfg.MaxContext)
 	cfg.MetalNCB = envIntOr("QUENCHFORGE_METAL_N_CB", cfg.MetalNCB)
 	cfg.TelemetryEnabled = envBoolOr("QUENCHFORGE_TELEMETRY", false)
+	cfg.AdvertiseMDNS = envBoolOr("QUENCHFORGE_ADVERTISE_MDNS", false)
 
 	return cfg, cfg.Validate()
 }
@@ -132,6 +164,15 @@ func (c Config) Validate() error {
 	}
 	if c.MetalNCB < 1 {
 		return fmt.Errorf("config: MetalNCB %d must be >= 1", c.MetalNCB)
+	}
+	if c.ChatPort < 1 || c.ChatPort > 65535 {
+		return fmt.Errorf("config: ChatPort %d outside valid TCP port range", c.ChatPort)
+	}
+	if c.EmbedPort < 1 || c.EmbedPort > 65535 {
+		return fmt.Errorf("config: EmbedPort %d outside valid TCP port range", c.EmbedPort)
+	}
+	if c.ChatPort == c.EmbedPort {
+		return fmt.Errorf("config: ChatPort and EmbedPort both set to %d — must differ", c.ChatPort)
 	}
 	return nil
 }

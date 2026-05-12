@@ -3,23 +3,27 @@
 
 // Package gateway is Quenchforge's HTTP front door.
 //
-// Routes (MVP):
+// Routes:
 //
-//	GET  /api/tags                 — Ollama: list locally available models
-//	POST /api/chat                 — Ollama: chat completion (streams NDJSON)
-//	POST /api/generate             — Ollama: text completion (streams NDJSON)
-//	POST /v1/chat/completions      — OpenAI-compatible chat (streams SSE)
+//	GET  /                         — landing JSON {service, version, slots, routes}
 //	GET  /health                   — liveness probe (always 200 if reachable)
-//	GET  /                         — landing JSON {service, version, slots}
+//	GET  /api/tags                 — Ollama: list locally available models
+//	POST /api/chat                 — Ollama: chat completion       → KindChat
+//	POST /api/generate             — Ollama: text completion       → KindChat
+//	POST /v1/chat/completions      — OpenAI: chat (streams SSE)    → KindChat
+//	POST /api/embeddings           — Ollama: embeddings            → KindEmbed
+//	POST /v1/embeddings            — OpenAI: embeddings            → KindEmbed
+//	POST /api/pull                 — Ollama: model pull (stub 501 in MVP)
 //
-// The MVP wires /api/chat, /api/generate, and /v1/chat/completions to
-// reverse-proxy the supervised llama-server slot. /api/tags reads the
-// model registry (GGUF files under config.ModelsDir) directly so it works
-// without a running slot.
+// Upstream resolution is keyed by SlotKind. The supervisor calls
+// `gateway.SetUpstream(KindChat, "http://127.0.0.1:11500")` once the chat
+// slot is ready; the same call for KindEmbed when the embedding slot lands.
+// /api/chat against an unconfigured chat slot returns 503; same for embed.
+// /api/tags reads the model registry directly so it works without any slot.
 //
-// v0.2 swaps this for the vendored Olla gateway in internal/gateway/olla/
-// — at that point the package keeps its public surface but the routing
-// logic is delegated. Pinned SHA for the future vendoring:
+// v0.2 swaps the routing layer for the vendored Olla gateway in
+// internal/gateway/olla/ — the public surface here is designed to be the
+// shim Olla feeds into. Pinned SHA for the future vendoring:
 // thushan/olla @ b11b81868504d07603e3815c6e38ddda068f862c.
 package gateway
 
@@ -30,7 +34,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -44,27 +47,43 @@ import (
 	"github.com/cerid-ai/quenchforge/internal/config"
 )
 
+// SlotKind enumerates the slot types the gateway can route to. New kinds
+// (rerank, whisper) land here when v0.2 wires them up.
+type SlotKind string
+
+const (
+	KindChat   SlotKind = "chat"
+	KindEmbed  SlotKind = "embed"
+	KindRerank SlotKind = "rerank"
+)
+
+// String implements fmt.Stringer.
+func (k SlotKind) String() string { return string(k) }
+
+// upstreamEntry holds the URL + ready-to-use proxy for one slot kind.
+type upstreamEntry struct {
+	url   *url.URL
+	proxy *httputil.ReverseProxy
+}
+
 // Gateway is the HTTP server. Construct via New.
 type Gateway struct {
 	cfg config.Config
 
-	// upstreamURL is the URL where the supervised llama-server (or the
-	// future multi-slot router) is reachable. Empty means slot is not yet
-	// available — chat/generate routes will return 503.
-	upstreamURL *url.URL
-
-	mu     sync.RWMutex
-	server *http.Server
-	proxy  *httputil.ReverseProxy
-
-	// version is the binary version surfaced by /. Set via SetVersion.
-	version string
+	mu        sync.RWMutex
+	server    *http.Server
+	upstreams map[SlotKind]upstreamEntry
+	version   string
 }
 
 // New returns a Gateway bound to cfg. The server is not yet listening;
 // call Start to bind and serve.
 func New(cfg config.Config) *Gateway {
-	return &Gateway{cfg: cfg, version: "0.0.0-dev"}
+	return &Gateway{
+		cfg:       cfg,
+		version:   "0.0.0-dev",
+		upstreams: make(map[SlotKind]upstreamEntry),
+	}
 }
 
 // SetVersion updates the version string surfaced by the landing route.
@@ -75,28 +94,28 @@ func (g *Gateway) SetVersion(v string) {
 	g.version = v
 }
 
-// SetUpstream points the proxy at the llama-server slot's local URL
-// (e.g. "http://127.0.0.1:11500"). Called by the supervisor once the
-// slot is ready.
-func (g *Gateway) SetUpstream(raw string) error {
+// SetUpstream points the proxy for the given slot kind at a URL. Passing an
+// empty raw URL clears the entry (chat/embed/rerank routes for that kind
+// will go back to returning 503). The compatibility-friendly variant for
+// the original single-slot call style is in compat.go.
+func (g *Gateway) SetUpstream(kind SlotKind, raw string) error {
 	if raw == "" {
 		g.mu.Lock()
-		g.upstreamURL = nil
-		g.proxy = nil
+		delete(g.upstreams, kind)
 		g.mu.Unlock()
 		return nil
 	}
 	u, err := url.Parse(raw)
 	if err != nil {
-		return fmt.Errorf("gateway: parse upstream %q: %w", raw, err)
+		return fmt.Errorf("gateway: parse %s upstream %q: %w", kind, raw, err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(u)
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		writeJSONError(w, http.StatusBadGateway,
+			fmt.Sprintf("%s upstream %s unreachable: %v", kind, u.Host, err))
 	}
 	g.mu.Lock()
-	g.upstreamURL = u
-	g.proxy = httputil.NewSingleHostReverseProxy(u)
-	g.proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		writeJSONError(w, http.StatusBadGateway,
-			fmt.Sprintf("upstream %s unreachable: %v", u.Host, err))
-	}
+	g.upstreams[kind] = upstreamEntry{url: u, proxy: proxy}
 	g.mu.Unlock()
 	return nil
 }
@@ -121,9 +140,16 @@ func (g *Gateway) Start(ctx context.Context) error {
 	mux.HandleFunc("/", g.handleRoot)
 	mux.HandleFunc("/health", g.handleHealth)
 	mux.HandleFunc("/api/tags", g.handleTags)
-	mux.HandleFunc("/api/chat", g.handleProxy)
-	mux.HandleFunc("/api/generate", g.handleProxy)
-	mux.HandleFunc("/v1/chat/completions", g.handleProxy)
+	// chat (Ollama + OpenAI surfaces)
+	mux.HandleFunc("/api/chat", g.proxyHandler(KindChat))
+	mux.HandleFunc("/api/generate", g.proxyHandler(KindChat))
+	mux.HandleFunc("/v1/chat/completions", g.proxyHandler(KindChat))
+	// embeddings (Ollama + OpenAI surfaces)
+	mux.HandleFunc("/api/embeddings", g.proxyHandler(KindEmbed))
+	mux.HandleFunc("/api/embed", g.proxyHandler(KindEmbed)) // Ollama alias
+	mux.HandleFunc("/v1/embeddings", g.proxyHandler(KindEmbed))
+	// pull (stub for now — points users at migrate-from-ollama)
+	mux.HandleFunc("/api/pull", g.handlePull)
 
 	g.mu.Lock()
 	g.server = &http.Server{
@@ -156,13 +182,10 @@ func (g *Gateway) Stop(grace time.Duration) error {
 	return srv.Shutdown(ctx)
 }
 
-// ListenAddr returns the bound address (useful when ListenAddr was ":0").
+// ListenAddr returns the configured bind address.
 func (g *Gateway) ListenAddr() string {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	if g.server == nil {
-		return g.cfg.ListenAddr
-	}
 	return g.cfg.ListenAddr
 }
 
@@ -176,22 +199,34 @@ func (g *Gateway) handleRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	g.mu.RLock()
+	slots := make(map[string]any, len(g.upstreams))
+	for k, v := range g.upstreams {
+		slots[string(k)] = map[string]any{
+			"configured": true,
+			"url":        v.url.String(),
+		}
+	}
+	// Always include known kinds in the report so consumers can see which
+	// ones aren't configured.
+	for _, k := range []SlotKind{KindChat, KindEmbed, KindRerank} {
+		if _, ok := slots[string(k)]; !ok {
+			slots[string(k)] = map[string]any{"configured": false}
+		}
+	}
 	resp := map[string]any{
 		"service": "quenchforge",
 		"version": g.version,
-		"upstream": map[string]any{
-			"configured": g.upstreamURL != nil,
-		},
+		"slots":   slots,
 		"routes": []string{
 			"GET /health",
 			"GET /api/tags",
 			"POST /api/chat",
 			"POST /api/generate",
 			"POST /v1/chat/completions",
+			"POST /api/embeddings",
+			"POST /v1/embeddings",
+			"POST /api/pull (stub)",
 		},
-	}
-	if g.upstreamURL != nil {
-		resp["upstream"].(map[string]any)["url"] = g.upstreamURL.String()
 	}
 	g.mu.RUnlock()
 	writeJSON(w, http.StatusOK, resp)
@@ -221,18 +256,34 @@ func (g *Gateway) handleTags(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"models": out})
 }
 
-func (g *Gateway) handleProxy(w http.ResponseWriter, r *http.Request) {
-	g.mu.RLock()
-	proxy := g.proxy
-	upstream := g.upstreamURL
-	g.mu.RUnlock()
-	if proxy == nil || upstream == nil {
-		writeJSONError(w, http.StatusServiceUnavailable,
-			"upstream not configured — no llama-server slot is ready. "+
-				"Check `quenchforge doctor` for status.")
-		return
+// proxyHandler returns an http.HandlerFunc that reverse-proxies to the
+// upstream registered for kind. Returns 503 when the kind has no upstream
+// — common during startup when the slot hasn't finished loading the model.
+func (g *Gateway) proxyHandler(kind SlotKind) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		g.mu.RLock()
+		entry, ok := g.upstreams[kind]
+		g.mu.RUnlock()
+		if !ok || entry.proxy == nil {
+			writeJSONError(w, http.StatusServiceUnavailable,
+				fmt.Sprintf("no %s slot configured. Check `quenchforge doctor` for status.", kind))
+			return
+		}
+		entry.proxy.ServeHTTP(w, r)
 	}
-	proxy.ServeHTTP(w, r)
+}
+
+// handlePull is a deliberate stub. Ollama's /api/pull downloads a model
+// from a registry; Quenchforge's v0.1 path is `quenchforge migrate-from-ollama`
+// or manually placing a GGUF in the models dir. Returning 501 with a
+// pointer is the right honest answer.
+func (g *Gateway) handlePull(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusNotImplemented, map[string]any{
+		"error": "model pull is not implemented in this version",
+		"hint": "place a GGUF under " + g.cfg.ModelsDir + " or run " +
+			"`quenchforge migrate-from-ollama` to symlink existing Ollama models",
+		"docs": "https://github.com/cerid-ai/quenchforge#models",
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -318,14 +369,3 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 func writeJSONError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
-
-// drainAndClose is a tiny helper for the test that bodies are fully read.
-// Returns the body bytes for assertions and closes the reader.
-func drainAndClose(r io.ReadCloser) []byte {
-	defer r.Close()
-	b, _ := io.ReadAll(r)
-	return b
-}
-
-// ensure drainAndClose is referenced so go vet doesn't whine.
-var _ = drainAndClose
