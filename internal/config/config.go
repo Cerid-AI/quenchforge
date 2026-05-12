@@ -28,6 +28,20 @@
 //	QUENCHFORGE_EMBED_MODEL  — GGUF model for the embedding slot. Empty = no
 //	                            embed slot is started; /api/embeddings 503s.
 //	QUENCHFORGE_EMBED_PORT   — supervised embed-slot port. Default 11501.
+//	QUENCHFORGE_RERANK_MODEL — GGUF reranker model (BGE-reranker etc.).
+//	                            Empty = no rerank slot; /v1/rerank 503s.
+//	QUENCHFORGE_RERANK_PORT  — supervised rerank-slot port. Default 11502.
+//	QUENCHFORGE_WHISPER_MODEL — whisper.cpp ggml model path. Empty = no
+//	                            whisper slot; /v1/audio/transcriptions 503s.
+//	QUENCHFORGE_WHISPER_PORT — supervised whisper-server port. Default 11503.
+//	QUENCHFORGE_WHISPER_GPU  — opt-in: try Metal on whisper.cpp. Default
+//	                            "off" — whisper's Metal path has additional
+//	                            AMD-Mac bugs beyond what our patch fixes
+//	                            (transcription regresses to garbage tokens
+//	                            even with the patch applied; root cause is
+//	                            in whisper-specific Metal kernels). CPU
+//	                            mode on a multi-core Xeon runs comfortably
+//	                            faster than real-time anyway.
 //	QUENCHFORGE_MAX_CONTEXT  — max KV-cache context in tokens. Default 8192.
 //	QUENCHFORGE_METAL_N_CB   — Metal command-buffer count. Default 2 — set as
 //	                            a launch env var on llama-server (issue surface
@@ -81,6 +95,27 @@ type Config struct {
 	// EmbedPort is where the supervised embed slot binds. Default 11501.
 	EmbedPort int
 
+	// RerankModel is the GGUF reranker model. Empty disables /v1/rerank.
+	RerankModel string
+
+	// RerankPort is where the supervised rerank slot binds. Default 11502.
+	RerankPort int
+
+	// WhisperModel is the whisper.cpp ggml model path (NOT a name under
+	// ModelsDir — whisper models use a different filename convention and
+	// don't all live in the same directory). Empty disables the whisper
+	// slot and /v1/audio/transcriptions returns 503.
+	WhisperModel string
+
+	// WhisperPort is where the supervised whisper-server binds. Default 11503.
+	WhisperPort int
+
+	// WhisperGPU controls whether whisper-server attempts Metal acceleration.
+	// Default false on darwin because whisper.cpp's Metal path has
+	// additional AMD-Mac bugs beyond what the patch fixes. CPU on a Xeon
+	// runs comfortably faster than real-time anyway.
+	WhisperGPU bool
+
 	// MaxContext is the KV-cache token cap exposed to clients.
 	MaxContext int
 
@@ -115,6 +150,11 @@ func Default() (Config, error) {
 		ChatPort:     11500,
 		EmbedModel:   "", // opt-in
 		EmbedPort:    11501,
+		RerankModel:  "", // opt-in
+		RerankPort:   11502,
+		WhisperModel: "", // opt-in
+		WhisperPort:  11503,
+		WhisperGPU:   false, // opt-in; see config docstring
 		MaxContext:   8192,
 		MetalNCB:     2,
 	}, nil
@@ -138,6 +178,11 @@ func Load() (Config, error) {
 	cfg.ChatPort = envIntOr("QUENCHFORGE_CHAT_PORT", cfg.ChatPort)
 	cfg.EmbedModel = envOr("QUENCHFORGE_EMBED_MODEL", cfg.EmbedModel)
 	cfg.EmbedPort = envIntOr("QUENCHFORGE_EMBED_PORT", cfg.EmbedPort)
+	cfg.RerankModel = envOr("QUENCHFORGE_RERANK_MODEL", cfg.RerankModel)
+	cfg.RerankPort = envIntOr("QUENCHFORGE_RERANK_PORT", cfg.RerankPort)
+	cfg.WhisperModel = envOr("QUENCHFORGE_WHISPER_MODEL", cfg.WhisperModel)
+	cfg.WhisperPort = envIntOr("QUENCHFORGE_WHISPER_PORT", cfg.WhisperPort)
+	cfg.WhisperGPU = envBoolOr("QUENCHFORGE_WHISPER_GPU", cfg.WhisperGPU)
 	cfg.MaxContext = envIntOr("QUENCHFORGE_MAX_CONTEXT", cfg.MaxContext)
 	cfg.MetalNCB = envIntOr("QUENCHFORGE_METAL_N_CB", cfg.MetalNCB)
 	cfg.TelemetryEnabled = envBoolOr("QUENCHFORGE_TELEMETRY", false)
@@ -171,8 +216,30 @@ func (c Config) Validate() error {
 	if c.EmbedPort < 1 || c.EmbedPort > 65535 {
 		return fmt.Errorf("config: EmbedPort %d outside valid TCP port range", c.EmbedPort)
 	}
-	if c.ChatPort == c.EmbedPort {
-		return fmt.Errorf("config: ChatPort and EmbedPort both set to %d — must differ", c.ChatPort)
+	for _, p := range []struct {
+		name string
+		v    int
+	}{
+		{"RerankPort", c.RerankPort},
+		{"WhisperPort", c.WhisperPort},
+	} {
+		if p.v < 1 || p.v > 65535 {
+			return fmt.Errorf("config: %s %d outside valid TCP port range", p.name, p.v)
+		}
+	}
+	// No two slot ports can collide.
+	ports := map[string]int{
+		"ChatPort":    c.ChatPort,
+		"EmbedPort":   c.EmbedPort,
+		"RerankPort":  c.RerankPort,
+		"WhisperPort": c.WhisperPort,
+	}
+	seen := map[int]string{}
+	for name, p := range ports {
+		if other, ok := seen[p]; ok {
+			return fmt.Errorf("config: %s and %s both set to %d — must differ", other, name, p)
+		}
+		seen[p] = name
 	}
 	return nil
 }

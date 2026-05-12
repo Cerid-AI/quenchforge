@@ -31,7 +31,7 @@ import (
 //
 // goreleaser handles this in CI. Local dev builds carry the zero value.
 var (
-	Version   = "0.0.0-dev"
+	Version   = "0.3.0-dev"
 	Commit    = "unknown"
 	BuildDate = "unknown"
 )
@@ -274,9 +274,14 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 	// Slots are tracked in a small map so the shutdown path handles them
 	// uniformly. The map key matches the gateway SlotKind so logs and
 	// the `quenchforge doctor` report stay readable.
+	//
+	// The `--no-slot` flag suppresses the chat slot only. Embed / rerank /
+	// whisper are opt-in via their model env vars, so they evaluate
+	// independently — handy for headless transcription deployments that
+	// don't want a chat slot eating VRAM.
 	slots := map[gateway.SlotKind]*supervisor.Slot{}
 	if !*noSlot {
-		// Chat slot — always-on unless the operator disables it via --no-slot.
+		// Chat slot — always-on unless suppressed.
 		modelName := *model
 		if modelName == "" {
 			modelName = cfg.DefaultModel
@@ -300,6 +305,8 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 			_ = g.SetUpstream(gateway.KindChat,
 				fmt.Sprintf("http://127.0.0.1:%d", cfg.ChatPort))
 		}
+	}
+	{ // embed/rerank/whisper evaluate independently of --no-slot
 
 		// Embed slot — opt-in via QUENCHFORGE_EMBED_MODEL or --embed-model.
 		if cfg.EmbedModel != "" {
@@ -323,6 +330,71 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 					s.PID(), cfg.EmbedModel, cfg.EmbedPort)
 				_ = g.SetUpstream(gateway.KindEmbed,
 					fmt.Sprintf("http://127.0.0.1:%d", cfg.EmbedPort))
+			}
+		}
+
+		// Rerank slot — opt-in via QUENCHFORGE_RERANK_MODEL. Same
+		// llama-server binary as chat/embed, just --reranking mode.
+		if cfg.RerankModel != "" {
+			s, err := startSlot(ctx, cfg, slotSpec{
+				Kind:      gateway.KindRerank,
+				Name:      "rerank",
+				Model:     cfg.RerankModel,
+				Port:      cfg.RerankPort,
+				ExtraArgs: []string{"--reranking"},
+			}, stderr)
+			if err != nil {
+				fmt.Fprintf(stderr,
+					"quenchforge: warning: rerank slot not started: %v\n"+
+						"  /v1/rerank will return 503.\n", err)
+			} else {
+				slots[gateway.KindRerank] = s
+				fmt.Fprintf(stdout, "quenchforge: rerank slot pid=%d model=%s port=%d\n",
+					s.PID(), cfg.RerankModel, cfg.RerankPort)
+				_ = g.SetUpstream(gateway.KindRerank,
+					fmt.Sprintf("http://127.0.0.1:%d", cfg.RerankPort))
+			}
+		}
+
+		// Whisper slot — opt-in via QUENCHFORGE_WHISPER_MODEL. Uses
+		// whisper-server (a separate binary built from whisper.cpp).
+		// Default to CPU on Mac because whisper's Metal path still has
+		// AMD-specific bugs even with our patch applied — operators
+		// can flip QUENCHFORGE_WHISPER_GPU=true to opt in if they're
+		// on a hardware path where it works.
+		if cfg.WhisperModel != "" {
+			whisperBin, err := resolveWhisperBin()
+			if err != nil {
+				fmt.Fprintf(stderr,
+					"quenchforge: warning: whisper slot not started: %v\n"+
+						"  /v1/audio/transcriptions will return 503.\n", err)
+			} else {
+				args := []string{
+					"--model", cfg.WhisperModel,
+					"--host", "127.0.0.1",
+					"--port", fmt.Sprintf("%d", cfg.WhisperPort),
+					"--threads", "8",
+				}
+				if !cfg.WhisperGPU {
+					args = append(args, "--no-gpu")
+				}
+				slot := supervisor.NewSlot("whisper")
+				slot.BinPath = whisperBin
+				slot.LogDir = cfg.LogDir
+				slot.PIDDir = cfg.PIDDir
+				slot.Args = args
+				slot.Env = []string{fmt.Sprintf("GGML_METAL_N_CB=%d", cfg.MetalNCB)}
+				if err := slot.Start(ctx); err != nil {
+					fmt.Fprintf(stderr,
+						"quenchforge: warning: whisper slot start failed: %v\n", err)
+				} else {
+					slots[gateway.KindWhisper] = slot
+					fmt.Fprintf(stdout,
+						"quenchforge: whisper slot pid=%d model=%s port=%d gpu=%v\n",
+						slot.PID(), cfg.WhisperModel, cfg.WhisperPort, cfg.WhisperGPU)
+					_ = g.SetUpstream(gateway.KindWhisper,
+						fmt.Sprintf("http://127.0.0.1:%d", cfg.WhisperPort))
+				}
 			}
 		}
 	}
@@ -490,6 +562,36 @@ func cmdMigrate(args []string, stdout, stderr io.Writer) error {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+// resolveWhisperBin finds whisper-server, the patched companion binary
+// from the whisper.cpp submodule. Search order mirrors resolveLlamaBin.
+func resolveWhisperBin() (string, error) {
+	tried := []string{}
+	check := func(p string) (string, bool) {
+		tried = append(tried, p)
+		if st, err := os.Stat(p); err == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
+			return p, true
+		}
+		return "", false
+	}
+	for _, p := range []string{
+		"./whisper.cpp/build-arm64/bin/whisper-server",
+		"./whisper.cpp/build-x86_64/bin/whisper-server",
+		"./whisper.cpp/build-universal/bin/whisper-server",
+		"./whisper.cpp/build/bin/whisper-server",
+		"/usr/local/bin/whisper-server",
+		"/opt/homebrew/bin/whisper-server",
+	} {
+		if r, ok := check(p); ok {
+			return r, nil
+		}
+	}
+	if p, err := lookPath("whisper-server"); err == nil {
+		return p, nil
+	}
+	return "", fmt.Errorf("whisper-server not found (tried: %s) — run scripts/build-whisper.sh",
+		strings.Join(tried, ", "))
+}
 
 // resolveLlamaBin finds the llama-server executable. Search order:
 //

@@ -12,10 +12,10 @@
 # --skip=publish` for what gets rendered.
 
 class Quenchforge < Formula
-  desc "Local LLM, embedding, reranker, and Whisper inference for Mac + AMD discrete GPU"
+  desc "ggml-on-AMD-Mac correctness — chat, embedding, reranker, Whisper transcription"
   homepage "https://github.com/Cerid-AI/quenchforge"
   license "Apache-2.0"
-  version "0.0.0-dev"
+  version "0.3.0-dev"
 
   # Hardware constraint — Quenchforge is macOS-only by design, and the
   # patches only matter on Intel Mac + AMD discrete or Apple Silicon. We

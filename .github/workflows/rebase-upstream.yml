@@ -23,12 +23,19 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: fetch upstream llama.cpp master
+      - name: fetch upstream master for each submodule
         run: |
-          cd llama.cpp
-          git remote get-url upstream >/dev/null 2>&1 || \
-            git remote add upstream https://github.com/ggml-org/llama.cpp.git
-          git fetch upstream master --tags --prune
+          for submod in llama.cpp whisper.cpp; do
+            if [ ! -d "${submod}/.git" ] && [ ! -f "${submod}/.git" ]; then
+              echo "skipping ${submod} — submodule not initialized"
+              continue
+            fi
+            ( cd "${submod}"
+              git remote get-url upstream >/dev/null 2>&1 || \
+                git remote add upstream "https://github.com/ggml-org/${submod}.git"
+              git fetch upstream master --tags --prune
+            )
+          done
 
       - name: replay patch series via scripts/rebase-upstream.sh
         id: rebase

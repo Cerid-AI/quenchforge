@@ -58,12 +58,14 @@ func TestValidateRejectsBadConfigs(t *testing.T) {
 	// each case isolates the field under test.
 	base := func() Config {
 		return Config{
-			ListenAddr: "127.0.0.1:11434",
-			ModelsDir:  "/tmp/m",
-			MaxContext: 8192,
-			MetalNCB:   2,
-			ChatPort:   11500,
-			EmbedPort:  11501,
+			ListenAddr:  "127.0.0.1:11434",
+			ModelsDir:   "/tmp/m",
+			MaxContext:  8192,
+			MetalNCB:    2,
+			ChatPort:    11500,
+			EmbedPort:   11501,
+			RerankPort:  11502,
+			WhisperPort: 11503,
 		}
 	}
 	cases := []struct {
@@ -79,7 +81,11 @@ func TestValidateRejectsBadConfigs(t *testing.T) {
 		{"chat port 0", func(c *Config) { c.ChatPort = 0 }, "ChatPort"},
 		{"chat port out of range", func(c *Config) { c.ChatPort = 70000 }, "ChatPort"},
 		{"embed port 0", func(c *Config) { c.EmbedPort = 0 }, "EmbedPort"},
+		{"rerank port 0", func(c *Config) { c.RerankPort = 0 }, "RerankPort"},
+		{"whisper port 0", func(c *Config) { c.WhisperPort = 0 }, "WhisperPort"},
 		{"same chat embed port", func(c *Config) { c.EmbedPort = c.ChatPort }, "must differ"},
+		{"same chat rerank port", func(c *Config) { c.RerankPort = c.ChatPort }, "must differ"},
+		{"same embed whisper port", func(c *Config) { c.WhisperPort = c.EmbedPort }, "must differ"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -108,6 +114,8 @@ func TestEnsureDirsCreatesAll(t *testing.T) {
 		MetalNCB:     2,
 		ChatPort:     11500,
 		EmbedPort:    11501,
+		RerankPort:   11502,
+		WhisperPort:  11503,
 	}
 	if err := cfg.EnsureDirs(); err != nil {
 		t.Fatalf("EnsureDirs: %v", err)

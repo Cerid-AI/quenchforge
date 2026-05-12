@@ -1,76 +1,98 @@
 #!/usr/bin/env bash
-# apply-patches.sh — apply Quenchforge's patch series onto the llama.cpp submodule.
+# apply-patches.sh — apply Quenchforge's patch series to the vendored submodules.
+#
+# Layout:
+#   patches/<submodule-name>/NNNN-*.patch
+#
+# Walks each subdirectory of patches/ matching an existing submodule and
+# applies the .patch files in lexicographic order. Currently:
+#   patches/llama.cpp/    -> llama.cpp/
+#   patches/whisper.cpp/  -> whisper.cpp/
 #
 # Usage:
-#   scripts/apply-patches.sh                # apply onto the pinned llama.cpp/ submodule
+#   scripts/apply-patches.sh                # apply all submodules
 #   scripts/apply-patches.sh --check        # dry-run, exit non-zero on conflicts
-#   scripts/apply-patches.sh --reset        # reset llama.cpp/ to its pinned SHA first
-#
-# Patch series lives in patches/00xx-*.patch and is produced by
-#   git -C llama.cpp format-patch --zero-commit -N -o ../patches <base>..HEAD
-# from a working integration branch. Apply order is lexicographic.
-#
-# Rebasing on upstream: see scripts/rebase-upstream.sh — it does the three-way
-# `git am -3` flow that survives upstream renames like ggml-metal.m -> ggml-metal/.
+#   scripts/apply-patches.sh --reset        # reset submodules to their pinned SHAs first
+#   scripts/apply-patches.sh --only llama.cpp   # only one submodule
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LLAMA_DIR="${REPO_ROOT}/llama.cpp"
 PATCH_DIR="${REPO_ROOT}/patches"
 
 MODE="apply"
+ONLY=""
 for arg in "$@"; do
   case "$arg" in
     --check) MODE="check" ;;
     --reset) MODE="reset" ;;
+    --only) shift; ONLY="${1:-}"; shift ;;
+    --only=*) ONLY="${arg#--only=}" ;;
     -h|--help)
-      sed -n '2,16p' "${BASH_SOURCE[0]}"
+      sed -n '2,17p' "${BASH_SOURCE[0]}"
       exit 0
       ;;
     *)
-      echo "unknown flag: $arg" >&2
-      exit 2
       ;;
   esac
 done
 
-if [[ ! -d "${LLAMA_DIR}/.git" && ! -f "${LLAMA_DIR}/.git" ]]; then
-  echo "error: llama.cpp submodule not initialized. Run:" >&2
-  echo "  git submodule update --init --recursive" >&2
-  exit 1
-fi
+apply_one() {
+  local submod="$1"
+  local sub_patch_dir="${PATCH_DIR}/${submod}"
+  local submod_dir="${REPO_ROOT}/${submod}"
 
+  if [[ ! -d "${submod_dir}/.git" && ! -f "${submod_dir}/.git" ]]; then
+    echo "    [skip] ${submod} submodule not initialized (run: git submodule update --init --recursive)" >&2
+    return 0
+  fi
+
+  shopt -s nullglob
+  local patches=( "${sub_patch_dir}"/*.patch )
+  shopt -u nullglob
+  if (( ${#patches[@]} == 0 )); then
+    echo "    [skip] no patches in ${sub_patch_dir}/"
+    return 0
+  fi
+
+  if [[ "${MODE}" == "reset" ]]; then
+    echo "==> resetting ${submod} to pinned SHA"
+    git submodule update --force --checkout -- "${submod}"
+  fi
+
+  ( cd "${submod_dir}"
+    for p in "${patches[@]}"; do
+      local name="$(basename "$p")"
+      if git apply --reverse --check "$p" >/dev/null 2>&1; then
+        echo "    [skip] ${submod}/${name} (already applied)"
+        continue
+      fi
+      if [[ "${MODE}" == "check" ]]; then
+        echo "==> ${submod}/${name} (dry-run)"
+        git apply --check "$p"
+      else
+        echo "==> ${submod}/${name}"
+        git apply --index --whitespace=nowarn "$p"
+      fi
+    done
+  )
+}
+
+# Discover patch subdirectories — each one whose name matches a submodule path.
 shopt -s nullglob
-patches=( "${PATCH_DIR}"/*.patch )
+submod_dirs=( "${PATCH_DIR}"/*/ )
 shopt -u nullglob
-
-if (( ${#patches[@]} == 0 )); then
-  echo "no patches found in ${PATCH_DIR}/ — nothing to do" >&2
+if (( ${#submod_dirs[@]} == 0 )); then
+  echo "no patch subdirectories under ${PATCH_DIR}/" >&2
   exit 0
 fi
 
-if [[ "${MODE}" == "reset" ]]; then
-  echo "==> resetting llama.cpp/ to pinned submodule SHA"
-  git submodule update --force --checkout -- llama.cpp
-fi
-
-cd "${LLAMA_DIR}"
-
-# Detect already-applied patches so re-runs are idempotent.
-for p in "${patches[@]}"; do
-  name="$(basename "$p")"
-  if git apply --reverse --check "$p" >/dev/null 2>&1; then
-    echo "    [skip] ${name} (already applied)"
+for d in "${submod_dirs[@]}"; do
+  submod="$(basename "$d")"
+  if [[ -n "${ONLY}" && "${ONLY}" != "${submod}" ]]; then
     continue
   fi
-  if [[ "${MODE}" == "check" ]]; then
-    echo "==> ${name} (dry-run)"
-    git apply --check "$p"
-  else
-    echo "==> ${name}"
-    git apply --index --whitespace=nowarn "$p"
-  fi
+  apply_one "${submod}"
 done
 
 echo "done."

@@ -21,12 +21,11 @@ project_name: quenchforge
 
 before:
   hooks:
-    # Apply the llama.cpp patch series and stage llama-server before we
-    # build the Go binaries. goreleaser doesn't compile llama.cpp itself —
-    # the Homebrew formula pulls llama.cpp as a dependency, and direct
-    # downloaders are expected to run scripts/build-llama.sh themselves.
-    # Keeping the hook here documents the workflow; remove or replace when
-    # the release artifact bundles a prebuilt llama-server.
+    # Apply the patch series for all submodules before the Go build runs.
+    # goreleaser doesn't compile llama.cpp / whisper.cpp itself — direct
+    # downloaders run scripts/build-llama.sh and scripts/build-whisper.sh
+    # themselves. The hook here keeps the patch series at the correct
+    # SHA the .gitmodules file pins.
     - bash scripts/apply-patches.sh --check
 
 builds:
@@ -144,8 +143,8 @@ brews:
   - name: quenchforge
     homepage: https://github.com/Cerid-AI/quenchforge
     description: >-
-      Local LLM, embedding, reranker, and Whisper inference for Mac + AMD
-      discrete GPU. Ollama- and OpenAI-compatible HTTP APIs.
+      ggml-on-AMD-Mac correctness — chat, embedding, reranker, Whisper
+      transcription. Ollama- and OpenAI-compatible HTTP APIs.
     license: Apache-2.0
     skip_upload: '{{ if eq .Prerelease "" }}false{{ else }}auto{{ end }}'
     repository:

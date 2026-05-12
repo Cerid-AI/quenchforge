@@ -47,14 +47,18 @@ import (
 	"github.com/cerid-ai/quenchforge/internal/config"
 )
 
-// SlotKind enumerates the slot types the gateway can route to. New kinds
-// (rerank, whisper) land here when v0.2 wires them up.
+// SlotKind enumerates the slot types the gateway can route to. Adding a
+// new kind requires a Slot wiring in cmd/quenchforge/serve and a gateway
+// route registration in Start.
 type SlotKind string
 
 const (
-	KindChat   SlotKind = "chat"
-	KindEmbed  SlotKind = "embed"
-	KindRerank SlotKind = "rerank"
+	KindChat     SlotKind = "chat"
+	KindEmbed    SlotKind = "embed"
+	KindRerank   SlotKind = "rerank"
+	KindWhisper  SlotKind = "whisper"
+	KindImageGen SlotKind = "imagegen"
+	KindTTS      SlotKind = "tts"
 )
 
 // String implements fmt.Stringer.
@@ -141,14 +145,32 @@ func (g *Gateway) Start(ctx context.Context) error {
 	mux.HandleFunc("/health", g.handleHealth)
 	mux.HandleFunc("/api/tags", g.handleTags)
 	// chat (Ollama + OpenAI surfaces)
-	mux.HandleFunc("/api/chat", g.proxyHandler(KindChat))
-	mux.HandleFunc("/api/generate", g.proxyHandler(KindChat))
-	mux.HandleFunc("/v1/chat/completions", g.proxyHandler(KindChat))
+	mux.HandleFunc("/api/chat", g.proxyHandler(KindChat, ""))
+	mux.HandleFunc("/api/generate", g.proxyHandler(KindChat, ""))
+	mux.HandleFunc("/v1/chat/completions", g.proxyHandler(KindChat, ""))
 	// embeddings (Ollama + OpenAI surfaces)
-	mux.HandleFunc("/api/embeddings", g.proxyHandler(KindEmbed))
-	mux.HandleFunc("/api/embed", g.proxyHandler(KindEmbed)) // Ollama alias
-	mux.HandleFunc("/v1/embeddings", g.proxyHandler(KindEmbed))
-	// pull (stub for now — points users at migrate-from-ollama)
+	mux.HandleFunc("/api/embeddings", g.proxyHandler(KindEmbed, ""))
+	mux.HandleFunc("/api/embed", g.proxyHandler(KindEmbed, "")) // Ollama alias
+	mux.HandleFunc("/v1/embeddings", g.proxyHandler(KindEmbed, ""))
+	// rerank (OpenAI-style /v1/rerank; llama-server speaks its own /rerank
+	// when launched with --reranking; we route both to the same slot).
+	mux.HandleFunc("/v1/rerank", g.proxyHandler(KindRerank, "/rerank"))
+	mux.HandleFunc("/rerank", g.proxyHandler(KindRerank, ""))
+	// whisper audio transcription. OpenAI's /v1/audio/transcriptions and
+	// whisper.cpp's /inference take the same multipart shape but on
+	// different paths — rewrite the OpenAI path to /inference on the way
+	// through. /v1/audio/translations same surface (English-only output).
+	mux.HandleFunc("/v1/audio/transcriptions", g.proxyHandler(KindWhisper, "/inference"))
+	mux.HandleFunc("/v1/audio/translations", g.proxyHandler(KindWhisper, "/inference"))
+	mux.HandleFunc("/inference", g.proxyHandler(KindWhisper, "")) // whisper-native path
+	// image generation (stable-diffusion.cpp) — slot kind reserved; the
+	// real handler lands in v0.4. Returns 501 with a useful hint today.
+	mux.HandleFunc("/v1/images/generations", g.handleNotYetImplemented(KindImageGen,
+		"image generation is scheduled for v0.4 (stable-diffusion.cpp slot)"))
+	// text-to-speech (bark.cpp) — slot kind reserved, lands in v0.4.
+	mux.HandleFunc("/v1/audio/speech", g.handleNotYetImplemented(KindTTS,
+		"text-to-speech is scheduled for v0.4 (bark.cpp slot)"))
+	// pull (stub — points users at migrate-from-ollama)
 	mux.HandleFunc("/api/pull", g.handlePull)
 
 	g.mu.Lock()
@@ -208,7 +230,7 @@ func (g *Gateway) handleRoot(w http.ResponseWriter, r *http.Request) {
 	}
 	// Always include known kinds in the report so consumers can see which
 	// ones aren't configured.
-	for _, k := range []SlotKind{KindChat, KindEmbed, KindRerank} {
+	for _, k := range []SlotKind{KindChat, KindEmbed, KindRerank, KindWhisper, KindImageGen, KindTTS} {
 		if _, ok := slots[string(k)]; !ok {
 			slots[string(k)] = map[string]any{"configured": false}
 		}
@@ -225,6 +247,11 @@ func (g *Gateway) handleRoot(w http.ResponseWriter, r *http.Request) {
 			"POST /v1/chat/completions",
 			"POST /api/embeddings",
 			"POST /v1/embeddings",
+			"POST /v1/rerank",
+			"POST /v1/audio/transcriptions",
+			"POST /v1/audio/translations",
+			"POST /v1/images/generations (501 reserved)",
+			"POST /v1/audio/speech (501 reserved)",
 			"POST /api/pull (stub)",
 		},
 	}
@@ -259,7 +286,12 @@ func (g *Gateway) handleTags(w http.ResponseWriter, _ *http.Request) {
 // proxyHandler returns an http.HandlerFunc that reverse-proxies to the
 // upstream registered for kind. Returns 503 when the kind has no upstream
 // — common during startup when the slot hasn't finished loading the model.
-func (g *Gateway) proxyHandler(kind SlotKind) http.HandlerFunc {
+//
+// When rewriteTo is non-empty, the upstream request URL.Path is rewritten
+// to that value before being forwarded. Used to translate OpenAI-shaped
+// paths (e.g. /v1/audio/transcriptions, /v1/rerank) onto whisper-server's
+// /inference and llama-server's /rerank natives.
+func (g *Gateway) proxyHandler(kind SlotKind, rewriteTo string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		g.mu.RLock()
 		entry, ok := g.upstreams[kind]
@@ -269,7 +301,27 @@ func (g *Gateway) proxyHandler(kind SlotKind) http.HandlerFunc {
 				fmt.Sprintf("no %s slot configured. Check `quenchforge doctor` for status.", kind))
 			return
 		}
+		if rewriteTo != "" {
+			// Clone the request so concurrent handlers don't see our rewrite.
+			r2 := r.Clone(r.Context())
+			r2.URL.Path = rewriteTo
+			r2.URL.RawPath = ""
+			r = r2
+		}
 		entry.proxy.ServeHTTP(w, r)
+	}
+}
+
+// handleNotYetImplemented returns a 501 with a friendly explanation,
+// keeping the route surface stable across versions so client libraries
+// don't bounce.
+func (g *Gateway) handleNotYetImplemented(kind SlotKind, hint string) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusNotImplemented, map[string]any{
+			"error": fmt.Sprintf("%s slot is reserved but not yet wired", kind),
+			"hint":  hint,
+			"docs":  "https://github.com/cerid-ai/quenchforge",
+		})
 	}
 }
 
