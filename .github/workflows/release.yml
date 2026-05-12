@@ -89,17 +89,37 @@ jobs:
           # Unknown format in import." which doesn't tell you whether
           # the secret was empty, wrapped, or corrupt.
           echo "decoded P12 size: $(wc -c <"$CERT_PATH") bytes"
+
+          # Step 1: structural check (does it look like a PKCS#12 at all).
+          # `openssl pkcs12 -info -nokeys -noout` reads the outer SEQUENCE
+          # but doesn't validate the password. So it catches truncation
+          # and "wrong file in secret" but not "wrong passphrase".
           if ! openssl pkcs12 -info -in "$CERT_PATH" \
+                 -passin "pass:bogus-not-the-real-one" \
+                 -nokeys -noout >/dev/null 2>&1 && \
+             [ "$(head -c2 "$CERT_PATH" | xxd -p)" != "3082" ]; then
+            echo "::error::APPLE_DEVELOPER_ID_CERT_P12_B64 didn't decode to a PKCS#12 at all."
+            echo "Decoded $(wc -c <"$CERT_PATH") bytes; first 4 bytes: $(head -c4 "$CERT_PATH" | xxd -p)"
+            echo "Expected first 2 bytes to be 3082 (DER SEQUENCE)."
+            echo "Re-encode the .p12 with: base64 -i <p12> | tr -d '\\n' | pbcopy"
+            exit 1
+          fi
+
+          # Step 2: passphrase check. `openssl pkcs12 -noout` (no -info,
+          # no -nokeys) DOES try to decrypt the bag and triggers MAC
+          # verification — so a wrong passphrase fails here with a clear
+          # signal long before security import gives us its cryptic
+          # message.
+          if ! openssl pkcs12 -in "$CERT_PATH" \
                  -passin "pass:$APPLE_DEVELOPER_ID_CERT_PASSWORD" \
-                 -nokeys -noout >/dev/null 2>&1; then
-            echo "::error::APPLE_DEVELOPER_ID_CERT_P12_B64 did not decode to a valid PKCS#12."
-            echo "Common causes:"
-            echo "  1. Wrong passphrase in APPLE_DEVELOPER_ID_CERT_PASSWORD."
-            echo "  2. Base64 corrupted in transit — re-encode locally with:"
-            echo "       base64 -i <p12> | tr -d '\\n' | pbcopy"
-            echo "     and re-paste into the secret."
-            echo "  3. The .p12 file itself is malformed — re-run the openssl"
-            echo "     pkcs12 -export step in docs/APPLE_DEVELOPER_ID.md."
+                 -noout 2>/tmp/pkcs12-err.log; then
+            echo "::error::APPLE_DEVELOPER_ID_CERT_PASSWORD does not match the .p12's passphrase."
+            head -3 /tmp/pkcs12-err.log
+            echo
+            echo "To verify your passphrase locally before re-setting the secret:"
+            echo "  openssl pkcs12 -in ~/quenchforge-signing/quenchforge-developer-id.p12 \\"
+            echo "    -passin \"pass:WHAT_YOU_THINK_IT_IS\" -noout"
+            echo "Returns 0 = passphrase matches; 1 with 'Mac verify error' = no match."
             exit 1
           fi
 
