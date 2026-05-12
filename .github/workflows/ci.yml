@@ -1,0 +1,119 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same branch (saves CI minutes when several
+# pushes land back-to-back).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ------------------------------------------------------------------
+  # Lint — go vet + gofmt + go mod tidy drift gate
+  # ------------------------------------------------------------------
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache: true
+
+      - name: gofmt -l (fail on unformatted files)
+        run: |
+          unformatted=$(gofmt -l cmd internal)
+          if [ -n "$unformatted" ]; then
+            echo "::error::Unformatted Go files found:"
+            echo "$unformatted"
+            echo
+            gofmt -d cmd internal
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go mod tidy is up to date
+        run: |
+          go mod tidy
+          if ! git diff --exit-code go.mod go.sum 2>/dev/null; then
+            echo "::error::go.mod / go.sum drifted — run 'go mod tidy' locally"
+            exit 1
+          fi
+
+  # ------------------------------------------------------------------
+  # Test — go test ./... on Linux (CPU-stub paths, no GPU work).
+  # ------------------------------------------------------------------
+  test-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache: true
+      - run: go test ./... -race -timeout 5m -count=1
+
+  # ------------------------------------------------------------------
+  # Test — go test ./... on macOS arm64. Validates the darwin build
+  # tags compile clean and the macOS-only paths exercise their stubs.
+  # ------------------------------------------------------------------
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache: true
+      - run: go test ./... -race -timeout 5m -count=1
+
+  # ------------------------------------------------------------------
+  # Build matrix — make sure both target triples produce a binary.
+  # We don't run them, just verify they link.
+  # ------------------------------------------------------------------
+  build-matrix:
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache: true
+      - name: build (darwin/${{ matrix.goarch }})
+        env:
+          GOOS: darwin
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          go build -o /tmp/quenchforge-${{ matrix.goarch }} ./cmd/quenchforge
+          go build -o /tmp/quenchforge-preflight-${{ matrix.goarch }} ./cmd/quenchforge-preflight
+          file /tmp/quenchforge-${{ matrix.goarch }}
+          file /tmp/quenchforge-preflight-${{ matrix.goarch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-darwin-${{ matrix.goarch }}
+          path: |
+            /tmp/quenchforge-${{ matrix.goarch }}
+            /tmp/quenchforge-preflight-${{ matrix.goarch }}
+          retention-days: 7

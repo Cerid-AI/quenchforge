@@ -1,0 +1,8 @@
+[submodule "llama.cpp"]
+	path = llama.cpp
+	url = https://github.com/ggml-org/llama.cpp.git
+	# Shallow clone — the rebase-upstream action deepens the clone on demand
+	# when it needs to format-patch against historical refs. Operators who
+	# need the full history can run: git submodule update --init --recursive
+	#   --depth=0 -- llama.cpp
+	shallow = true

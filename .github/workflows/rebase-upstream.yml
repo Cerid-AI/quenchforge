@@ -1,0 +1,69 @@
+name: rebase-upstream
+
+# Weekly + on-demand: pull the latest llama.cpp master, replay the patch
+# series, and open a PR. Real hardware validation happens on the self-hosted
+# [amd-gpu] runner (added in a follow-up PR) — until that runner is online
+# the workflow opens the PR and tags it `needs-hw-verify`.
+
+on:
+  schedule:
+    - cron: '0 8 * * 1' # Monday 08:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  rebase:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: fetch upstream llama.cpp master
+        run: |
+          cd llama.cpp
+          git remote get-url upstream >/dev/null 2>&1 || \
+            git remote add upstream https://github.com/ggml-org/llama.cpp.git
+          git fetch upstream master --tags --prune
+
+      - name: replay patch series via scripts/rebase-upstream.sh
+        id: rebase
+        run: |
+          set +e
+          bash scripts/rebase-upstream.sh
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      - name: open PR with rebased patches
+        if: steps.rebase.outputs.exit_code == '0'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: 'chore(deps): rebase llama.cpp patches onto upstream master'
+          branch: 'auto/rebase-llama-cpp'
+          title: 'chore(deps): rebase llama.cpp patches'
+          body: |
+            Automated weekly rebase of the patch series onto `ggml-org/llama.cpp` master.
+
+            Resolved cleanly with `git am -3`. The self-hosted `[amd-gpu]` runner
+            should validate this PR before merge.
+          labels: |
+            deps
+            needs-hw-verify
+
+      - name: open conflict PR
+        if: steps.rebase.outputs.exit_code != '0'
+        uses: peter-evans/create-pull-request@v6
+        with:
+          commit-message: 'chore(deps): WIP — llama.cpp rebase conflict'
+          branch: 'auto/rebase-conflict'
+          title: 'WIP: llama.cpp rebase conflict — manual resolution needed'
+          body: |
+            `scripts/rebase-upstream.sh` exited non-zero. Manual hunk
+            resolution required. See the `llama.cpp/` working tree for
+            unmerged paths.
+          labels: |
+            deps
+            rebase-conflict
