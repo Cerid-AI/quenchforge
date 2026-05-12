@@ -1,0 +1,100 @@
+name: Bug report
+description: Something is broken. Crashes, wrong output, performance regressions.
+title: "bug: <one-line summary>"
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug. Quenchforge runs on hardware most
+        of us don't have copies of — the `quenchforge doctor` paste below is what
+        makes triage actually possible, so please don't skip it.
+
+        Before submitting, search [existing issues](https://github.com/cerid-ai/quenchforge/issues?q=is%3Aissue)
+        to avoid duplicates.
+
+  - type: input
+    id: version
+    attributes:
+      label: Quenchforge version
+      description: Output of `quenchforge --version`
+      placeholder: "0.1.0 (abc1234)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: quenchforge doctor (required)
+      description: |
+        Paste the full output of `quenchforge doctor`. This is a hard requirement
+        for triage — issues without it will be closed and asked to reopen with the
+        paste included. The doctor output is redacted: no prompts, no document
+        content, no API keys.
+      render: text
+      placeholder: |
+        $ quenchforge doctor
+        ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: |
+        Minimum steps to reproduce. If a model is involved, give the exact name
+        (e.g. `qwen2.5:7b-instruct-q4_k_m`). If a request triggers it, give the
+        `curl` invocation.
+      placeholder: |
+        1. brew install cerid-ai/tap/quenchforge
+        2. brew services start quenchforge
+        3. curl -s localhost:11434/api/generate -d '{"model":"...","prompt":"hi"}'
+        4. Observe: ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: What you thought would happen.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include exact error text, stack traces, or perf numbers.
+      placeholder: What actually happened.
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        Relevant lines from `~/Library/Logs/quenchforge/`. If the bug touches
+        Metal device enumeration or kernel dispatch, also include the Metal
+        subsystem capture:
+
+            log show --predicate 'subsystem == "com.apple.Metal"' --last 5m > metal.log
+
+        Redact anything sensitive before pasting.
+      render: text
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirmations
+      options:
+        - label: I included `quenchforge doctor` output above.
+          required: true
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I am running on a supported macOS version (Sonoma 14.0 or newer).
+          required: true

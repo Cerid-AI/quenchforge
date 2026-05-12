@@ -1,0 +1,49 @@
+# Build output
+/bin/
+/dist/
+/build/
+*.test
+*.out
+coverage.out
+coverage.html
+
+# Stray binaries from `go build ./...` at repo root
+/quenchforge
+/quenchforge-bench
+/quenchforge-preflight
+
+# Local environment
+.env
+.env.local
+*.local
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Model cache (per-developer; never committed)
+models/
+*.gguf
+*.safetensors
+
+# Patched llama.cpp build artifacts
+llama.cpp/build/
+llama.cpp/build-*/
+whisper.cpp/build/
+
+# Notarization / signing artifacts
+*.zip
+*.dmg
+*.p8
+*.cer
+AuthKey_*.p8
+
+# goreleaser
+/dist-snapshot/

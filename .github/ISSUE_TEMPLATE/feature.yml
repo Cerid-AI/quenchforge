@@ -1,0 +1,72 @@
+name: Feature request
+description: Propose a new capability or behavior change.
+title: "feat: <one-line summary>"
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Quenchforge has a deliberately narrow scope: **Mac + AMD discrete GPU**,
+        Ollama-compatible + OpenAI-compatible HTTP, Metal-only acceleration.
+        Before filing, check that your idea fits — `README.md`'s "Anti-plan"
+        section lists what we won't accept.
+
+        For very large proposals, consider opening a Discussion first to
+        gauge interest before writing a full RFC here.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem are you trying to solve?
+      description: Lead with the user-visible pain, not the proposed implementation.
+      placeholder: |
+        Today, when I do X, Y happens, and I want Z because ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: |
+        Rough sketch is fine. If you have a strong opinion on the surface
+        (CLI flag name, config key, HTTP route shape), say so.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Why not just <existing workaround>?
+    validations:
+      required: false
+
+  - type: dropdown
+    id: scope_check
+    attributes:
+      label: Scope check
+      description: Which best describes the proposal?
+      options:
+        - Tunes existing Mac + AMD inference path (in scope)
+        - Improves Ollama or OpenAI API compatibility (in scope)
+        - Adds Apple Silicon optimization that doesn't degrade AMD path (in scope)
+        - Adds Whisper / ASR capability (in scope, v0.2+)
+        - Adds Linux or Windows support (OUT OF SCOPE — fork)
+        - Adds CUDA / ROCm / Vulkan (OUT OF SCOPE — Metal-only is the moat)
+        - Adds model training or fine-tuning (OUT OF SCOPE)
+        - Adds proprietary model format support (OUT OF SCOPE)
+        - I'm not sure — please tell me
+    validations:
+      required: true
+
+  - type: textarea
+    id: hardware_context
+    attributes:
+      label: Hardware context (optional)
+      description: |
+        If the feature is hardware-specific, paste `quenchforge doctor` output
+        so we know which profile(s) it would target.
+      render: text
+    validations:
+      required: false

@@ -1,0 +1,32 @@
+Quenchforge
+Copyright 2026 Cerid AI and the Quenchforge Contributors
+
+Licensed under the Apache License, Version 2.0. See LICENSE for details.
+
+----
+
+This product includes software developed in third-party projects. The
+following notices are required by the licenses of those projects; the
+full license texts are aggregated in third_party/LICENSES.md.
+
+llama.cpp
+  Copyright (c) 2023-2026 The ggml authors
+  Licensed under the MIT License.
+  Vendored as a git submodule. Source: https://github.com/ggml-org/llama.cpp
+  Modifications: a small patch series in patches/ is applied at build time
+  to enable private-VRAM allocation on discrete AMD GPUs and to disable
+  the simdgroup-matrix-multiply codepath on non-Apple-Silicon Metal devices.
+  Patches are linked to the upstream issues #15228 and #19563 and are
+  re-derived from the public bug-report descriptions; no copyrighted patch
+  text from third-party gists is incorporated.
+
+whisper.cpp
+  Copyright (c) 2023-2026 The ggml authors
+  Licensed under the MIT License.
+  Vendored as a git submodule (v0.2+). Source: https://github.com/ggml-org/whisper.cpp
+
+Olla — HTTP gateway / Ollama+OpenAI+Anthropic API translation
+  Copyright (c) 2024-2026 Olla Contributors
+  Licensed under the Apache License, Version 2.0.
+  Vendored at a pinned commit into internal/gateway/. Source:
+  https://github.com/thushan/olla

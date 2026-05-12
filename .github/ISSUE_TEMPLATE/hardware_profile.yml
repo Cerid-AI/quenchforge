@@ -1,0 +1,93 @@
+name: Hardware profile report
+description: Tell us how Quenchforge performs on your Mac. Used to tune defaults.
+title: "hardware: <Mac model> + <GPU>"
+labels: ["hardware-profile"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Quenchforge tunes kernel parameters per hardware profile. The static
+        VRAM/layer table in `internal/tuning/` starts out as educated guesses
+        and gets refined from reports like this one.
+
+        If your hardware isn't represented in the profile table yet, we'll add
+        a named profile (e.g. `w6800x`, `rdna2-6700m`) and your numbers become
+        the initial defaults.
+
+        **No SLA.** This is community-driven calibration, not paid support.
+
+  - type: input
+    id: mac_model
+    attributes:
+      label: Mac model
+      description: Output of `system_profiler SPHardwareDataType | grep "Model Identifier"`
+      placeholder: "MacPro7,1"
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: GPU
+      description: Exact name and VRAM size. Multi-GPU? List all.
+      placeholder: "AMD Radeon Pro Vega II Duo (2x 32 GB HBM2)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: quenchforge doctor output
+      description: Required. Same paste rules as the bug template.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: bench
+    attributes:
+      label: quenchforge-bench output
+      description: |
+        Run `quenchforge-bench --profile <auto-detected>` and paste the full
+        output. If you have time, also run it against:
+          - Qwen2.5-7B-Instruct-Q4_K_M
+          - Llama-3.1-8B-Instruct-Q4_K_M
+          - Mistral-7B-Instruct-Q4_K_M
+        and include all three.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: comparison
+    attributes:
+      label: Before/after vs. stock Ollama (optional but very useful)
+      description: |
+        If you have throughput numbers from Ollama on the same hardware and
+        same model, paste them here. This is how we substantiate the "X× faster
+        than Ollama on AMD-Mac" claims in the README.
+      placeholder: |
+        Ollama (CPU fallback): ~3.2 tok/s on Qwen2.5-7B-Q4_K_M
+        Quenchforge: ~22.5 tok/s on same model
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything weird?
+      description: |
+        Did anything stand out — fan noise, thermal throttling after N minutes,
+        VRAM spillover, kernel panics, eGPU unplug behavior, etc.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: telemetry_consent
+    attributes:
+      label: Telemetry
+      description: |
+        If you also opted in to anonymous benchmark telemetry, your numbers may
+        already be on `bench.quenchforge.dev`. This issue is the slower but
+        higher-signal path — we read every one.
+      options:
+        - label: I'm okay with the maintainers using these numbers in release notes and the public benchmark dashboard. Attribution by GitHub handle unless you ask otherwise.
+          required: true
