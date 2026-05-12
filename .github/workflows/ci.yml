@@ -126,12 +126,18 @@ jobs:
   # exercises /v1/chat/completions through the gateway, asserts the
   # output isn't garbage tokens. See docs/SELF_HOSTED_RUNNER.md.
   #
-  # `continue-on-error` is true today because the runner is opt-in: if
-  # it's offline, we don't want CI to block the maintainer's other
-  # work. The rebase-upstream workflow has its own hard gate against
-  # this same test path.
+  # Gated behind `workflow_dispatch` (and pushes to specific branches)
+  # until the self-hosted runner is registered. Without that condition
+  # the job would queue forever waiting for a runner that doesn't
+  # exist — GitHub doesn't auto-skip "no available runner" jobs.
+  #
+  # When the runner comes online, flip the `if:` to `always()` (or
+  # remove it) and this job runs on every push/PR as the merge gate.
   # ------------------------------------------------------------------
   amd-gpu-integration:
+    # NOTE: flip to `if: always()` once the [amd-gpu] runner is registered.
+    # Track in docs/SELF_HOSTED_RUNNER.md "What runs on this runner".
+    if: github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, amd-gpu]
     continue-on-error: true
     timeout-minutes: 15
