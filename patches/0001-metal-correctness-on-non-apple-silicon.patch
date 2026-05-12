@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Quenchforge Contributors <maintainers@cerid-ai.com>
+Date: Tue, 12 May 2026 17:29:43 -0400
+Subject: [PATCH] metal: gate has_simdgroup_reduction and has_bfloat to Apple
+ Silicon only
+
+On non-Apple Metal devices (Intel Mac + AMD discrete, Intel iGPU) the
+simdgroup-reduction kernels and bfloat ops produce wrong arithmetic and
+the model emits garbage tokens (observed live on AMD Radeon Pro Vega II
+running llama3.2:3b-Q4_K_M: pre-patch generated "Key key key key..."
+endlessly; post-patch generates coherent text at 3.4 tok/s).
+
+The original |= with MTLGPUFamilyMetal3_GGML for both flags enabled the
+buggy path on AMD Vega II / W6800X / RDNA1+2 / Intel Iris, all of which
+advertise Metal3 support. Gate to MTLGPUFamilyApple7 (simdgroup_reduction)
+and MTLGPUFamilyApple6 (bfloat) only by default.
+
+Operators can opt back in to the previous behaviour via:
+  - GGML_METAL_FORCE_SIMDGROUP_REDUCTION=1
+  - GGML_METAL_FORCE_BF16=1
+
+Upstream-Issue: https://github.com/ggml-org/llama.cpp/issues/19563
+Signed-off-by: Quenchforge Contributors <maintainers@cerid-ai.com>
+---
+ ggml/src/ggml-metal/ggml-metal-device.m | 24 ++++++++++++++++++++----
+ 1 file changed, 20 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index fab7891..851c240 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -645,14 +645,30 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
+             dev->addr_virt = 0x000000400ULL;
+ 
+             dev->props.device = device;
+-            dev->props.has_simdgroup_reduction  = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
+-            dev->props.has_simdgroup_reduction |= [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
++            // Quenchforge patch 0002: simdgroup-reduction kernels rely on
++            // Apple-Silicon-specific simdgroup intrinsics. On non-Apple Metal
++            // devices (Intel Mac + AMD discrete, Intel iGPU) the kernels
++            // produce wrong arithmetic and the model emits garbage tokens.
++            // The original upstream `|=` with MTLGPUFamilyMetal3_GGML enabled
++            // the buggy path on AMD Vega II / W6800X / RDNA1+2 / Intel Iris,
++            // all of which advertise Metal3 support.
++            // Gate to Apple7 only by default; allow opt-in for testing.
++            // See: https://github.com/ggml-org/llama.cpp/issues/19563
++            dev->props.has_simdgroup_reduction = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
++            if (getenv("GGML_METAL_FORCE_SIMDGROUP_REDUCTION") != NULL) {
++                dev->props.has_simdgroup_reduction |= [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
++            }
+ 
+             dev->props.has_simdgroup_mm = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
+             dev->props.has_unified_memory = dev->mtl_device.hasUnifiedMemory;
+ 
+-            dev->props.has_bfloat  = [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
+-            dev->props.has_bfloat |= [dev->mtl_device supportsFamily:MTLGPUFamilyApple6];
++            // Quenchforge patch 0002 (related): bfloat ops on AMD Metal also
++            // produce incorrect results in our testing on Vega II. Default to
++            // disabled on non-Apple-Silicon; operators can override.
++            dev->props.has_bfloat  = [dev->mtl_device supportsFamily:MTLGPUFamilyApple6];
++            if (getenv("GGML_METAL_FORCE_BF16") != NULL) {
++                dev->props.has_bfloat |= [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
++            }
+             if (getenv("GGML_METAL_BF16_DISABLE") != NULL) {
+                 dev->props.has_bfloat = false;
+             }
+-- 
+2.50.1 (Apple Git-155)
+

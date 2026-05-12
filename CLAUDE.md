@@ -27,10 +27,13 @@ become a generic inference framework.
 2. **macOS-only.** No CUDA, no ROCm, no Vulkan, no Linux-specific code paths.
    Apple Silicon and Intel Mac are the only targets. If a PR adds non-Darwin
    code, the answer is no.
-3. **Two patches, not three.** The llama.cpp patch series is exactly the two
-   load-bearing patches in `patches/`. `GGML_METAL_N_CB` is set via env, not
-   a code patch. Adding a third patch requires a written rationale in
-   `patches/README.md` and review.
+3. **One patch — minimise the patch surface.** The llama.cpp patch series is
+   exactly the load-bearing change(s) in `patches/`. As of 2026-05-12 that's
+   a single patch (`0001-metal-correctness-on-non-apple-silicon.patch`); the
+   originally-planned VRAM and simdgroup-mm patches turned out to be obsolete
+   against the current upstream. `GGML_METAL_N_CB` is set via env, not a
+   code patch. Adding a second patch requires a written rationale in
+   `patches/README.md`, a public upstream issue link, and review.
 4. **No `quenchforge doctor` paste = no bug-report triage.** The
    `.github/ISSUE_TEMPLATE/bug.yml` form makes this a hard requirement. Maintainer
    replies to triage-incomplete issues with the doctor-paste request and
@@ -57,8 +60,7 @@ internal/
 llama.cpp/    — git submodule
 whisper.cpp/  — git submodule (v0.2)
 patches/
-  0001-private-vram-force.patch
-  0002-disable-simdgroup-mm-non-apple-silicon.patch
+  0001-metal-correctness-on-non-apple-silicon.patch
 scripts/
   apply-patches.sh       — idempotent: git am --reject each patch
   build-llama.sh         — CMake invocation per target triple
@@ -99,20 +101,27 @@ tests/integration/       — gated on [amd-gpu] self-hosted runner
 
 ## Patch maintenance
 
-The two patches in `patches/` are re-derived from the public llama.cpp issues
-[#15228](https://github.com/ggml-org/llama.cpp/issues/15228) and
-[#19563](https://github.com/ggml-org/llama.cpp/issues/19563). No third-party
-gist text is copied verbatim — both patches are original re-implementations
-that cite the issue threads in their commit messages.
+The single patch in `patches/` addresses bug
+[#19563](https://github.com/ggml-org/llama.cpp/issues/19563) — Apple-Silicon-only
+Metal kernels (simdgroup-reduction + bfloat) miscompile on AMD discrete /
+Intel iGPU and produce garbage tokens. The patch is re-derived from live
+debugging on the Mac Pro 2019 + Radeon Pro Vega II; no third-party gist text
+is copied. Provenance, the live-verified reproducer, and the opt-in env vars
+(`GGML_METAL_FORCE_SIMDGROUP_REDUCTION=1`, `GGML_METAL_FORCE_BF16=1`) are
+documented in [`patches/README.md`](patches/README.md).
+
+The originally-planned VRAM-force and disable-simdgroup_mm patches were
+verified obsolete against the current upstream — see `patches/README.md`
+"Why only one" for the diagnostic detail.
 
 Weekly the `rebase-upstream.yml` action fetches `ggml-org/llama.cpp` master,
 runs `git am -3` against the patch series, and opens a PR with conflict
 hunks if anything fails to apply. The PR is blocked from merge unless both
 the arm64 unit-test job AND the `[amd-gpu]` integration-test job are green.
 
-If a patch starts to bit-rot beyond a manageable conflict surface, file the
-patch as a draft PR upstream first — `#15228` was previously closed
-"not planned", but new maintainer review or new evidence can flip that.
+If the patch starts to bit-rot beyond a manageable conflict surface, file
+it as a draft PR upstream — new maintainer review or new evidence can flip
+a previously-closed-not-planned decision.
 
 ## Telemetry policy
 

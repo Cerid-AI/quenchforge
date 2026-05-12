@@ -2,9 +2,11 @@
 
 Open-standards LLM, embedding, reranker, and Whisper inference for **Intel Mac + AMD discrete GPU**, behind Ollama-compatible and OpenAI-compatible HTTP APIs.
 
-Stock Ollama on a 2019 Mac Pro with an AMD Radeon Pro Vega II GPU does not accelerate on the GPU — it silently falls back to CPU ([ollama/ollama#1016](https://github.com/ollama/ollama/issues/1016), open since 2023). Quenchforge carries a small patch series on top of `llama.cpp` that fixes private-VRAM buffer allocation on discrete AMD Metal devices and disables the Apple-Silicon-tuned simdgroup matrix-multiply codepath on non-Apple-Silicon GPUs. Same single Go binary, same Ollama HTTP wire format, drop-in for any client that already speaks Ollama or OpenAI.
+Stock Ollama on a 2019 Mac Pro with an AMD Radeon Pro Vega II GPU does not accelerate on the GPU — it silently falls back to CPU ([ollama/ollama#1016](https://github.com/ollama/ollama/issues/1016), open since 2023). Building stock `llama.cpp` against Metal on the same hardware *does* enumerate the GPU and load a model, but the simdgroup-reduction and bfloat kernels miscompile on non-Apple Metal devices and the sampler emits garbage tokens forever ([ggml-org/llama.cpp#19563](https://github.com/ggml-org/llama.cpp/issues/19563)).
 
-> **Status:** pre-release. MVP targets `quenchforge serve` with a single chat slot on Mac Pro 2019 + Vega II. See [docs/ROADMAP.md](docs/ROADMAP.md) once it exists.
+Quenchforge carries one small patch on top of `llama.cpp` that gates those kernels to Apple-Silicon-only, restoring **correct output on AMD Mac Metal**. Same Ollama HTTP wire format, same single Go binary supervisor — drop-in for any client that already speaks Ollama or OpenAI.
+
+> **Status:** v0.0 pre-release. End-to-end inference verified live on Mac Pro 2019 + Radeon Pro Vega II (32 GB HBM2) with llama3.2:3b-Q4_K_M: **72.6 tok/s prompt, 4.1 tok/s generate**, coherent output. Binary distribution (signed Homebrew tap) is pending.
 
 ## Hardware compatibility matrix
 
@@ -28,13 +30,38 @@ Stock Ollama on a 2019 Mac Pro with an AMD Radeon Pro Vega II GPU does not accel
 
 ## Quickstart
 
-> **Not yet available.** Coming with v0.1 once the brew tap is signed and notarized.
+### Building from source (today)
+
+```bash
+git clone --recursive https://github.com/Cerid-AI/quenchforge
+cd quenchforge
+
+# Apply the llama.cpp patch + build the patched llama-server
+bash scripts/apply-patches.sh
+bash scripts/build-llama.sh
+
+# Build the quenchforge supervisor + CLI
+go build -o /usr/local/bin/quenchforge ./cmd/quenchforge
+go build -o /usr/local/bin/quenchforge-preflight ./cmd/quenchforge-preflight
+
+# Sanity check
+quenchforge-preflight                 # should print status=ok on a supported Mac
+quenchforge doctor                    # hardware profile, llama-server lookup, model registry
+quenchforge migrate-from-ollama       # symlink existing Ollama GGUFs (optional)
+quenchforge serve                     # gateway on 127.0.0.1:11434 + supervised chat slot
+```
+
+The supervisor automatically finds `llama-server` under `./llama.cpp/build-*/bin/` after a `build-llama.sh` run, or at `/usr/local/bin/llama-server` if you installed it system-wide.
+
+### Homebrew tap (coming with v0.1)
 
 ```bash
 # brew install cerid-ai/homebrew-tap/quenchforge
 # brew services start quenchforge
 # quenchforge doctor
 ```
+
+Signed + notarized bottles are pending Apple Developer ID configuration.
 
 ## First-launch prompts to expect
 
