@@ -66,6 +66,7 @@ jobs:
         if: github.event.inputs.snapshot != 'true' && env.APPLE_DEVELOPER_ID_CERT_P12_B64 != ''
         env:
           APPLE_DEVELOPER_ID_CERT_P12_B64: ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12_B64 }}
+          APPLE_DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}
         run: |
           set -euo pipefail
           KC=$(mktemp -d)/quenchforge.keychain
@@ -76,10 +77,35 @@ jobs:
           security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
 
           CERT_PATH=$(mktemp).p12
-          echo "$APPLE_DEVELOPER_ID_CERT_P12_B64" | base64 -d > "$CERT_PATH"
+          # Strip all whitespace from the base64 (pbcopy on macOS produces
+          # line-wrapped output at 76 chars; some operators paste with
+          # trailing newlines). Both BSD and GNU base64 handle wrapped
+          # input but tr -d makes the decode unambiguous.
+          printf '%s' "$APPLE_DEVELOPER_ID_CERT_P12_B64" | tr -d ' \n\r\t' | base64 -d > "$CERT_PATH"
+
+          # Diagnostics before security import — fail fast with a useful
+          # message if the secret was malformed. The previous version of
+          # this step failed with the cryptic "SecKeychainItemImport:
+          # Unknown format in import." which doesn't tell you whether
+          # the secret was empty, wrapped, or corrupt.
+          echo "decoded P12 size: $(wc -c <"$CERT_PATH") bytes"
+          if ! openssl pkcs12 -info -in "$CERT_PATH" \
+                 -passin "pass:$APPLE_DEVELOPER_ID_CERT_PASSWORD" \
+                 -nokeys -noout >/dev/null 2>&1; then
+            echo "::error::APPLE_DEVELOPER_ID_CERT_P12_B64 did not decode to a valid PKCS#12."
+            echo "Common causes:"
+            echo "  1. Wrong passphrase in APPLE_DEVELOPER_ID_CERT_PASSWORD."
+            echo "  2. Base64 corrupted in transit — re-encode locally with:"
+            echo "       base64 -i <p12> | tr -d '\\n' | pbcopy"
+            echo "     and re-paste into the secret."
+            echo "  3. The .p12 file itself is malformed — re-run the openssl"
+            echo "     pkcs12 -export step in docs/APPLE_DEVELOPER_ID.md."
+            exit 1
+          fi
+
           security import "$CERT_PATH" \
             -k "$KC" \
-            -P "${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}" \
+            -P "$APPLE_DEVELOPER_ID_CERT_PASSWORD" \
             -T /usr/bin/codesign
           security set-key-partition-list \
             -S apple-tool:,apple:,codesign: \
@@ -91,8 +117,16 @@ jobs:
         env:
           APPLE_NOTARY_API_KEY_P8_B64: ${{ secrets.APPLE_NOTARY_API_KEY_P8_B64 }}
         run: |
+          set -euo pipefail
           P8=$(mktemp).p8
-          echo "$APPLE_NOTARY_API_KEY_P8_B64" | base64 -d > "$P8"
+          printf '%s' "$APPLE_NOTARY_API_KEY_P8_B64" | tr -d ' \n\r\t' | base64 -d > "$P8"
+          # The .p8 starts with `-----BEGIN PRIVATE KEY-----` — verify.
+          if ! head -1 "$P8" | grep -q "BEGIN PRIVATE KEY"; then
+            echo "::error::APPLE_NOTARY_API_KEY_P8_B64 did not decode to a PEM private key."
+            echo "Decoded $(wc -c <"$P8") bytes; first line: $(head -1 "$P8" | head -c 40)"
+            echo "Re-encode locally with: base64 -i AuthKey_*.p8 | tr -d '\\n' | pbcopy"
+            exit 1
+          fi
           echo "APPLE_NOTARY_API_KEY_PATH=$P8" >> "$GITHUB_ENV"
 
       - name: enable signing flag
