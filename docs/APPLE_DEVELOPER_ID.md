@@ -46,7 +46,7 @@ The CSR is already generated at
 This step keeps the signing material entirely outside the macOS keychain —
 ideal for CI because there's no "unlock the keychain" dance:
 
-```sh
+```zsh
 mv ~/Downloads/developerID_application.cer ~/quenchforge-signing/
 cd ~/quenchforge-signing
 
@@ -54,7 +54,11 @@ cd ~/quenchforge-signing
 openssl x509 -inform DER -in developerID_application.cer -out developerID_application.pem
 
 # Pick a strong passphrase — you'll paste it into a GitHub Secret in step 4.
-read -s -p "P12 passphrase: " P12_PASS; echo
+# (NOTE: zsh's `read -p` means "read from coprocess" — different from bash.
+#  Using printf + read -s keeps this portable across bash and zsh on macOS.)
+printf "Pick a strong P12 passphrase: " >&2
+read -s P12_PASS
+echo
 openssl pkcs12 -export \
   -inkey quenchforge-developer-id.key \
   -in developerID_application.pem \
@@ -67,10 +71,19 @@ openssl pkcs12 -info -in quenchforge-developer-id.p12 -password "pass:${P12_PASS
 
 # Base64-encode for the GitHub Secret:
 base64 -i quenchforge-developer-id.p12 | pbcopy
-echo "P12 base64 now on clipboard. Save the passphrase securely too:"
-echo "  passphrase: ${P12_PASS}"
+echo "P12 base64 now on clipboard. Keep the passphrase in your password manager."
 unset P12_PASS
 ```
+
+> **Don't put your passphrase in the `read -p` prompt argument.** It will
+> show up in `~/.zsh_history` (or `~/.bash_history`). If you accidentally
+> do, scrub it with:
+>
+> ```zsh
+> sed -i '' '/read -s -p .*P12_PASS/d' ~/.zsh_history
+> ```
+>
+> and pick a different passphrase before re-running.
 
 ## 3. Create an App Store Connect API key for notarization
 
