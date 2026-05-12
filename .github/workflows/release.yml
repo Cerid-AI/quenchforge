@@ -39,7 +39,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          # Submodules deliberately NOT checked out. The Go release binaries
+          # (quenchforge, quenchforge-preflight) are pure stdlib and don't
+          # depend on llama.cpp / whisper.cpp / sd.cpp / bark.cpp content.
+          # The patch series checks in `before:hooks` are not load-bearing
+          # for the binary and were also causing CI to detect a "dirty" tree
+          # when nested submodules (bark.cpp → encodec.cpp → ggml) didn't
+          # round-trip cleanly through `submodules: recursive`. The release
+          # builds the supervisor + CLI; downstream consumers build
+          # llama-server / whisper-server / sd-server / bark-server
+          # themselves via the build-*.sh scripts.
+          submodules: false
           fetch-depth: 0
 
       - uses: actions/setup-go@v5

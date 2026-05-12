@@ -21,12 +21,12 @@ project_name: quenchforge
 
 before:
   hooks:
-    # Apply the patch series for all submodules before the Go build runs.
-    # goreleaser doesn't compile llama.cpp / whisper.cpp itself — direct
-    # downloaders run scripts/build-llama.sh and scripts/build-whisper.sh
-    # themselves. The hook here keeps the patch series at the correct
-    # SHA the .gitmodules file pins.
-    - bash scripts/apply-patches.sh --check
+    # The patch series is validated in the ci.yml workflow (which DOES
+    # check out submodules). The release workflow intentionally skips
+    # submodule checkout — the Go release binaries are pure stdlib and
+    # don't depend on submodule content — so we can't run the patch
+    # check here without dirtying the tree.
+    - go mod download
 
 builds:
   - id: quenchforge
