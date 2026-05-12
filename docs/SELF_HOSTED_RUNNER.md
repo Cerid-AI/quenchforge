@@ -84,7 +84,7 @@ user-owned keychain.
 
 | Job | Workflow | What it does |
 |---|---|---|
-| `amd-gpu-integration` | `ci.yml` | `go test -tags=amd_gpu ./tests/integration/...`. Reproduces the patch's "coherent output" assertion against the live Vega II. Currently `if: github.event_name == 'workflow_dispatch'` — manual-trigger only until the runner is online. **After registering the runner, flip that `if:` to `always()` (or remove it) so the job runs on every push/PR as the merge gate.** |
+| `amd-gpu-integration` | `ci.yml` | `go test -tags=amd_gpu ./tests/integration/...` on every push to main and every PR. Reproduces the patch's "coherent output" assertion against the live Vega II. `continue-on-error: true` so a runner outage doesn't block the rest of CI. |
 | `rebase-upstream` (gate stage) | `rebase-upstream.yml` | After the weekly rebase action picks the latest `ggml-org/llama.cpp` master and applies our patches, this runner builds + runs the regression test on the rebased patch. PR labelled `needs-hw-verify` gets removed when the test passes. |
 
 The `release.yml` workflow does NOT use this runner — it runs on

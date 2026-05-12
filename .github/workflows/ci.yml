@@ -122,22 +122,17 @@ jobs:
 
   # ------------------------------------------------------------------
   # AMD-GPU integration tests — runs on the self-hosted runner labelled
-  # `amd-gpu`. Spawns the patched llama-server against a real Vega II,
-  # exercises /v1/chat/completions through the gateway, asserts the
-  # output isn't garbage tokens. See docs/SELF_HOSTED_RUNNER.md.
+  # `amd-gpu` (currently mac-pro-2019-vega-ii). Spawns the patched
+  # llama-server against the real Vega II, exercises
+  # /v1/chat/completions through the gateway, asserts the output isn't
+  # garbage tokens. See docs/SELF_HOSTED_RUNNER.md.
   #
-  # Gated behind `workflow_dispatch` (and pushes to specific branches)
-  # until the self-hosted runner is registered. Without that condition
-  # the job would queue forever waiting for a runner that doesn't
-  # exist — GitHub doesn't auto-skip "no available runner" jobs.
-  #
-  # When the runner comes online, flip the `if:` to `always()` (or
-  # remove it) and this job runs on every push/PR as the merge gate.
+  # `continue-on-error: true` because the runner is a single machine;
+  # if it's offline (maintenance, OS update, hardware fault) the rest
+  # of CI shouldn't block. The rebase-upstream workflow has its own
+  # hard gate against this same test path.
   # ------------------------------------------------------------------
   amd-gpu-integration:
-    # NOTE: flip to `if: always()` once the [amd-gpu] runner is registered.
-    # Track in docs/SELF_HOSTED_RUNNER.md "What runs on this runner".
-    if: github.event_name == 'workflow_dispatch'
     runs-on: [self-hosted, amd-gpu]
     continue-on-error: true
     timeout-minutes: 15
