@@ -5,77 +5,71 @@ ships unsigned binaries today because the repo doesn't have Apple
 Developer ID credentials yet. This doc walks through the **exact steps**
 to flip signed + notarized releases on.
 
-You'll need:
+## Status for this maintainer
 
-- An Apple Developer Program membership ($99/year) — sign up at
-  <https://developer.apple.com/programs/enroll/> if you don't have one.
+| Item | Status |
+|---|---|
+| Apple ID | `sunrunnerfire@mac.com` — confirmed configured |
+| Apple Developer Team ID | **`4A5VDRMRB8`** |
+| Xcode + `notarytool` | installed at `/Applications/Xcode.app/...` |
+| CSR | generated at `~/quenchforge-signing/quenchforge-developer-id.csr` |
+| Private key | at `~/quenchforge-signing/quenchforge-developer-id.key` (mode 0600) |
+| Developer ID Application certificate | **not yet minted** — see step 1 below |
+| App Store Connect API key | **not yet created** — see step 3 below |
+| GitHub repo secrets | **not yet set** — see step 4 below |
+| Homebrew tap PAT | **not yet set** — see step 5 below |
+
+You'll still need:
+
 - Admin access to the repo's GitHub Settings → Secrets and variables → Actions.
-- A Mac (any Mac) to generate the certificate request and export the `.p12`.
-  Most steps work from Terminal; a couple need Keychain Access.app.
-
-Total time: about 30 minutes the first time. Each subsequent year's
-renewal is ~5 minutes.
+- ~10 minutes of focused browser time across developer.apple.com,
+  appstoreconnect.apple.com, and github.com.
 
 ---
 
-## 1. Create a Developer ID Application certificate
+## 1. Mint the Developer ID Application certificate
 
-1. Open **Keychain Access.app** → top menu → **Certificate Assistant** →
-   **Request a Certificate From a Certificate Authority…**
-2. Fill in:
-   - **User Email Address**: your Apple Developer Program email
-   - **Common Name**: anything memorable, e.g. `Quenchforge Release Signing`
-   - **CA Email Address**: leave blank
-   - **Request is**: select **Saved to disk**
-3. Save the resulting `.certSigningRequest` (CSR) file somewhere temporary.
+The CSR is already generated at
+`~/quenchforge-signing/quenchforge-developer-id.csr`. Upload it to Apple:
 
-4. Browse to <https://developer.apple.com/account/resources/certificates/add>
-   - Choose **Developer ID Application** (NOT "Mac App Distribution"; the
-     standalone tarball/Homebrew bottle distribution path needs Developer ID).
-   - Upload the CSR file from step 3.
-   - Download the resulting `developerID_application.cer`.
+1. Browse to <https://developer.apple.com/account/resources/certificates/add>
+2. Make sure your team selector (top-right) shows **`4A5VDRMRB8`**.
+3. Choose **Developer ID Application** (NOT "Mac App Distribution"; the
+   standalone tarball + Homebrew bottle distribution path needs Developer ID).
+4. **Profile Type**: **G2 Sub-CA (Xcode 11.4.1 or later)**.
+5. Upload `~/quenchforge-signing/quenchforge-developer-id.csr`.
+6. Download the resulting `developerID_application.cer` (it usually lands
+   in `~/Downloads/`).
 
-5. Double-click `developerID_application.cer` to install it into your
-   keychain. You should now see a private key + certificate pair under
-   the **My Certificates** category in Keychain Access.
+## 2. Combine the cert + key into a `.p12`
 
-### Verify locally
+This step keeps the signing material entirely outside the macOS keychain —
+ideal for CI because there's no "unlock the keychain" dance:
 
 ```sh
-security find-identity -v -p codesigning | grep "Developer ID Application"
-```
+mv ~/Downloads/developerID_application.cer ~/quenchforge-signing/
+cd ~/quenchforge-signing
 
-Should show one line ending in your team ID and name. If it shows
-`0 valid identities found`, repeat step 5.
+# Convert the DER cert Apple gave us to PEM, then bundle with our key:
+openssl x509 -inform DER -in developerID_application.cer -out developerID_application.pem
 
-## 2. Export the cert as a `.p12`
+# Pick a strong passphrase — you'll paste it into a GitHub Secret in step 4.
+read -s -p "P12 passphrase: " P12_PASS; echo
+openssl pkcs12 -export \
+  -inkey quenchforge-developer-id.key \
+  -in developerID_application.pem \
+  -name "Quenchforge Developer ID" \
+  -password "pass:${P12_PASS}" \
+  -out quenchforge-developer-id.p12
 
-```sh
-# In Keychain Access:
-# - Right-click your "Developer ID Application: ..." cert
-# - Export
-# - Format: Personal Information Exchange (.p12)
-# - Save as: ~/quenchforge-developer-id.p12
-# - Pick a strong passphrase you can paste into GitHub Secrets
-```
+# Verify it parses:
+openssl pkcs12 -info -in quenchforge-developer-id.p12 -password "pass:${P12_PASS}" -nokeys | head -10
 
-Or via CLI (also needs a passphrase):
-
-```sh
-security export \
-  -k login.keychain \
-  -t identities \
-  -f pkcs12 \
-  -P 'PICK-A-STRONG-PASSPHRASE' \
-  -o ~/quenchforge-developer-id.p12 \
-  "Developer ID Application: Your Team Name (TEAMID)"
-```
-
-Base64-encode it for the secret:
-
-```sh
-base64 -i ~/quenchforge-developer-id.p12 | pbcopy
-# Now paste into the APPLE_DEVELOPER_ID_CERT_P12_B64 secret below.
+# Base64-encode for the GitHub Secret:
+base64 -i quenchforge-developer-id.p12 | pbcopy
+echo "P12 base64 now on clipboard. Save the passphrase securely too:"
+echo "  passphrase: ${P12_PASS}"
+unset P12_PASS
 ```
 
 ## 3. Create an App Store Connect API key for notarization
