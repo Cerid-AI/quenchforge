@@ -129,15 +129,28 @@ notarize:
         issuer_id: '{{ .Env.APPLE_NOTARY_API_KEY_ISSUER }}'
         key_id: '{{ .Env.APPLE_NOTARY_API_KEY_ID }}'
         key: '{{ .Env.APPLE_NOTARY_API_KEY_PATH }}'
-        wait: true
-        # Apple's notary queue is bursty — submissions usually complete in
-        # 1–5 minutes but can take 20+ during outages or peak load. With 4
-        # binaries (quenchforge + quenchforge-preflight × amd64 + arm64)
-        # processed serially, the original 10m floor was too tight: v0.3.2
-        # attempt 4 timed out at 10m on the first binary while Apple's
-        # queue was warm. 30m per binary gives sufficient headroom without
-        # making a true Apple outage hang the workflow forever (the GitHub
-        # Actions job-level timeout — 6h default — is the ultimate ceiling).
+        # wait: false — submit-and-go. Goreleaser fires each binary at
+        # Apple's notary service and exits the step without polling for
+        # the result. The submission ID is logged; acceptance is verified
+        # post-release via `xcrun notarytool history --key ... --key-id
+        # ... --issuer ...` from the maintainer's workstation.
+        #
+        # Why: with wait: true + 4 binaries (quenchforge +
+        # quenchforge-preflight × amd64 + arm64), goreleaser polls Apple
+        # every ~50s during the wait, which trips Apple's per-API-key
+        # hourly rate limit (HTTP 429 RATE_LIMIT). v0.3.2 attempt 4 hit
+        # the 10m deadline; attempt 5 with 30m timeout hit the 429
+        # instead.
+        #
+        # Stapling is not applicable here — Apple only allows stapling
+        # of .app / .dmg / .pkg, not raw Mach-O binaries. The cloud-based
+        # Gatekeeper check at install time uses the binary's hash, so
+        # whether goreleaser polled or not is immaterial to end-user
+        # experience as long as Apple accepts the submission (which it
+        # has — confirmed via submission ID 9fcec6a6-... from attempt 4).
+        wait: false
+        # timeout is moot when wait: false, but goreleaser may still use
+        # it for the initial submit upload. Keep at 30m for headroom.
         timeout: 30m
       ids:
         - quenchforge
