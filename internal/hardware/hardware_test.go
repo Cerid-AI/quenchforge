@@ -77,3 +77,34 @@ func TestNonDarwinStubProducesCPUProfile(t *testing.T) {
 		t.Errorf("non-darwin Detect: HasMetal=true, want false")
 	}
 }
+
+func TestIsAMDDiscrete(t *testing.T) {
+	// The four AMD discrete profiles must all return true — they share
+	// the Metal-correctness liability that the chat-slot flags address.
+	amdProfiles := []Profile{
+		ProfileVegaPro,
+		ProfileW6800X,
+		ProfileRDNA1,
+		ProfileRDNA2,
+	}
+	for _, p := range amdProfiles {
+		info := Info{Profile: p}
+		if !info.IsAMDDiscrete() {
+			t.Errorf("Profile %q: IsAMDDiscrete = false, want true", p)
+		}
+	}
+	// Everything else must return false. Apple Silicon, iGPU, CPU, and
+	// the unknown fallback all use the upstream llama-server defaults.
+	nonAMDProfiles := []Profile{
+		ProfileAppleSilicon,
+		ProfileIGPU,
+		ProfileCPU,
+		ProfileUnknown,
+	}
+	for _, p := range nonAMDProfiles {
+		info := Info{Profile: p}
+		if info.IsAMDDiscrete() {
+			t.Errorf("Profile %q: IsAMDDiscrete = true, want false", p)
+		}
+	}
+}

@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Quenchforge LaunchAgent — for operators who built from source.
+  Operators on Homebrew get this automatically via `brew services start
+  quenchforge`; that path is preferred. This template is for the
+  source-build case (or anyone who wants per-user supervision without
+  a Homebrew install).
+
+  Install:
+    install -m 0644 packaging/macos/com.cerid.quenchforge.plist \
+        ~/Library/LaunchAgents/com.cerid.quenchforge.plist
+
+  Edit ~/Library/LaunchAgents/com.cerid.quenchforge.plist to set the
+  default model env vars to GGUF filenames that exist under
+  ~/.quenchforge/models/ — see `quenchforge doctor` for the registry.
+
+  Load:
+    launchctl unload ~/Library/LaunchAgents/com.cerid.quenchforge.plist 2>/dev/null || true
+    launchctl load -w ~/Library/LaunchAgents/com.cerid.quenchforge.plist
+
+  Check:
+    launchctl list | grep com.cerid.quenchforge
+    curl http://127.0.0.1:11434/health
+
+  Logs:
+    tail -F ~/Library/Logs/quenchforge/quenchforge.out.log
+
+  KeepAlive=true means launchd auto-restarts the daemon if it dies
+  (Vega II prompt-cache crash, kill -9, OS upgrade, etc). When the
+  operator wants to stop it on purpose, `launchctl unload` removes
+  the job from supervision so KeepAlive doesn't fight them.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.cerid.quenchforge</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/quenchforge</string>
+        <string>serve</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin</string>
+
+        <!--
+          Replace these three values with GGUF filenames that exist
+          under ~/.quenchforge/models/. Leave a value empty to skip
+          that slot (e.g. embed-only deployments).
+
+          The chat-slot default is the smallest commonly-pre-loaded
+          quant; bump to qwen2.5:7b-instruct-q4_k_m or qwen2.5:14b for
+          a more capable model.
+        -->
+        <key>QUENCHFORGE_DEFAULT_MODEL</key>
+        <string>qwen2.5:7b-instruct-q4_k_m</string>
+
+        <key>QUENCHFORGE_EMBED_MODEL</key>
+        <string>nomic-embed-text-v1.5</string>
+
+        <key>QUENCHFORGE_RERANK_MODEL</key>
+        <string>bge-reranker-v2-m3</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!--
+      Unconditional restart. The supervisor itself manages its slots;
+      a clean exit usually means the operator unloaded the job, which
+      removes it from launchd's supervision before KeepAlive fires.
+    -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Don't thrash if the binary crash-loops; back off 10s between starts. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/Users/REPLACE_ME/Library/Logs/quenchforge/quenchforge.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/REPLACE_ME/Library/Logs/quenchforge/quenchforge.err.log</string>
+
+    <!-- Working dir is your home so the daemon resolves ~/.quenchforge/ correctly. -->
+    <key>WorkingDirectory</key>
+    <string>/Users/REPLACE_ME</string>
+
+    <!--
+      "Interactive" lets the daemon use the GPU via Metal (background
+      tier is restricted). This matches the user-experience tier of
+      `ollama serve` running in the foreground.
+    -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+</dict>
+</plist>

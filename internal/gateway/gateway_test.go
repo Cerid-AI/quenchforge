@@ -214,14 +214,18 @@ func TestEmbedProxyReturns503WithoutUpstream(t *testing.T) {
 }
 
 func TestChatProxiesToUpstreamWhenSet(t *testing.T) {
-	// Stand up a fake upstream that records what it received.
+	// /api/chat is now translated server-side: the gateway rewrites the
+	// path to /v1/chat/completions and converts the Ollama-shape body
+	// into an OpenAI-shape body before forwarding. The non-streaming
+	// upstream response is then translated back into Ollama JSON shape
+	// for the caller.
 	var gotPath string
 	var gotBody []byte
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
 		gotBody, _ = io.ReadAll(r.Body)
-		w.Header().Set("Content-Type", "application/x-ndjson")
-		_, _ = w.Write([]byte(`{"done":true,"model":"x"}` + "\n"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"x","model":"x","choices":[{"index":0,"message":{"role":"assistant","content":"hi back"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`))
 	}))
 	defer upstream.Close()
 
@@ -233,7 +237,7 @@ func TestChatProxiesToUpstreamWhenSet(t *testing.T) {
 	}
 
 	resp, err := http.Post("http://"+cfg.ListenAddr+"/api/chat",
-		"application/json", strings.NewReader(`{"model":"x","messages":[{"role":"user","content":"hi"}]}`))
+		"application/json", strings.NewReader(`{"model":"x","stream":false,"messages":[{"role":"user","content":"hi"}]}`))
 	if err != nil {
 		t.Fatalf("POST: %v", err)
 	}
@@ -241,26 +245,52 @@ func TestChatProxiesToUpstreamWhenSet(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	if gotPath != "/api/chat" {
-		t.Errorf("upstream got path = %q, want /api/chat", gotPath)
+	// Path translation
+	if gotPath != "/v1/chat/completions" {
+		t.Errorf("upstream got path = %q, want /v1/chat/completions", gotPath)
 	}
-	if !strings.Contains(string(gotBody), "hi") {
-		t.Errorf("upstream got body = %q, want 'hi'", gotBody)
+	// Body translation: Ollama wire {messages, options} → OpenAI wire
+	// {messages, max_tokens, ...}. We can confirm the messages survived
+	// the translation and the body is now OpenAI-shaped (no `options` field).
+	if !strings.Contains(string(gotBody), `"content":"hi"`) {
+		t.Errorf("upstream got body = %q, want it to carry the user message", gotBody)
+	}
+	if strings.Contains(string(gotBody), `"options"`) {
+		t.Errorf("upstream got body = %q, must NOT carry Ollama-wire options key", gotBody)
+	}
+	// Response translation: upstream returned OpenAI {choices: [{message}]},
+	// caller must see Ollama {message, done, done_reason}.
+	respBody, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(respBody), `"message":`) ||
+		!strings.Contains(string(respBody), `"done":true`) {
+		t.Errorf("response body = %q, must be Ollama-shape with message+done", respBody)
+	}
+	if strings.Contains(string(respBody), `"choices":`) {
+		t.Errorf("response body = %q, must NOT pass through OpenAI choices array", respBody)
 	}
 }
 
-// TestSlotKindRouting confirms each route reaches the correct upstream and
-// that the chat/embed upstreams are independent.
+// TestSlotKindRouting confirms each Ollama-wire / OpenAI-wire route
+// reaches the correct slot upstream. Bodies are translator-valid for
+// the wire surface they hit:
+//   - Ollama chat: {model, messages: [{role,content}]}
+//   - Ollama embed: {model, prompt} or {model, input}
+//   - OpenAI chat: {model, messages}
+//   - OpenAI embed: {model, input}
 func TestSlotKindRouting(t *testing.T) {
 	var chatHits, embedHits int
 	chatUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		chatHits++
-		_, _ = w.Write([]byte(`{"kind":"chat"}`))
+		// Return a minimal OpenAI-shape body so the translator can
+		// fold it back into Ollama wire when needed.
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"x","model":"x","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":{}}`))
 	}))
 	defer chatUpstream.Close()
 	embedUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		embedHits++
-		_, _ = w.Write([]byte(`{"kind":"embed"}`))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1]}],"model":"x","usage":{}}`))
 	}))
 	defer embedUpstream.Close()
 
@@ -275,27 +305,28 @@ func TestSlotKindRouting(t *testing.T) {
 	}
 
 	cases := []struct {
-		method, path string
-		wantChat     int
-		wantEmbed    int
+		method, path, body string
+		wantChat           int
+		wantEmbed          int
 	}{
-		{"POST", "/api/chat", 1, 0},
-		{"POST", "/api/generate", 1, 0},
-		{"POST", "/v1/chat/completions", 1, 0},
-		{"POST", "/api/embeddings", 0, 1},
-		{"POST", "/api/embed", 0, 1},
-		{"POST", "/v1/embeddings", 0, 1},
+		{"POST", "/api/chat", `{"model":"x","stream":false,"messages":[{"role":"user","content":"hi"}]}`, 1, 0},
+		{"POST", "/api/generate", `{"model":"x","stream":false,"prompt":"hi"}`, 1, 0},
+		{"POST", "/v1/chat/completions", `{"model":"x","messages":[{"role":"user","content":"hi"}]}`, 1, 0},
+		{"POST", "/api/embeddings", `{"model":"x","prompt":"hi"}`, 0, 1},
+		{"POST", "/api/embed", `{"model":"x","input":"hi"}`, 0, 1},
+		{"POST", "/v1/embeddings", `{"model":"x","input":"hi"}`, 0, 1},
 	}
 	for _, tc := range cases {
 		chatHits, embedHits = 0, 0
 		req, _ := http.NewRequest(tc.method, "http://"+cfg.ListenAddr+tc.path,
-			strings.NewReader(`{"model":"x"}`))
+			strings.NewReader(tc.body))
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Errorf("%s %s: %v", tc.method, tc.path, err)
 			continue
 		}
+		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 		if chatHits != tc.wantChat || embedHits != tc.wantEmbed {
 			t.Errorf("%s %s: chat=%d embed=%d (want chat=%d embed=%d)",

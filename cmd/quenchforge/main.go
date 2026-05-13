@@ -215,6 +215,27 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
+	// Hardware probe — gates per-profile slot tuning. Best-effort: a probe
+	// failure falls back to the unknown profile, which uses the default
+	// (Apple-Silicon-friendly) llama-server args. The slot is still
+	// supervised so degraded inference is better than no inference.
+	hwInfo, hwErr := hardware.Detect()
+	if hwErr != nil {
+		fmt.Fprintf(stderr,
+			"quenchforge: warning: hardware probe failed: %v\n"+
+				"  Slot tuning defaults to apple-silicon profile; chat may be\n"+
+				"  unstable on AMD discrete. Run `quenchforge doctor` to diagnose.\n",
+			hwErr)
+	}
+	if hwInfo.IsAMDDiscrete() {
+		fmt.Fprintf(stdout,
+			"quenchforge: detected %s profile — chat slot will use "+
+				"--flash-attn off --cache-ram 0 --no-cache-prompt\n"+
+				"  (avoids GPU↔CPU flash-attn fallback throttling + Vega II "+
+				"prompt-cache GGML_ASSERT crash; embed/rerank slots are unaffected)\n",
+			hwInfo.Profile)
+	}
+
 	// Orphan reaper — clean up any survivors from a previous crash before we
 	// allocate new ports.
 	reaped := supervisor.ReapOrphans(cfg.PIDDir)
@@ -286,7 +307,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 		if modelName == "" {
 			modelName = cfg.DefaultModel
 		}
-		s, err := startSlot(ctx, cfg, slotSpec{
+		s, err := startSlot(ctx, cfg, hwInfo, slotSpec{
 			Kind:      gateway.KindChat,
 			Name:      "chat",
 			Model:     modelName,
@@ -310,7 +331,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 
 		// Embed slot — opt-in via QUENCHFORGE_EMBED_MODEL or --embed-model.
 		if cfg.EmbedModel != "" {
-			s, err := startSlot(ctx, cfg, slotSpec{
+			s, err := startSlot(ctx, cfg, hwInfo, slotSpec{
 				Kind:  gateway.KindEmbed,
 				Name:  "embed",
 				Model: cfg.EmbedModel,
@@ -336,7 +357,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 		// Rerank slot — opt-in via QUENCHFORGE_RERANK_MODEL. Same
 		// llama-server binary as chat/embed, just --reranking mode.
 		if cfg.RerankModel != "" {
-			s, err := startSlot(ctx, cfg, slotSpec{
+			s, err := startSlot(ctx, cfg, hwInfo, slotSpec{
 				Kind:      gateway.KindRerank,
 				Name:      "rerank",
 				Model:     cfg.RerankModel,
@@ -511,10 +532,62 @@ type slotSpec struct {
 	ExtraArgs []string
 }
 
+// buildSlotArgs constructs the llama-server command-line arguments for
+// one supervised slot. Pure function (no I/O, no globals) so it can be
+// unit-tested without spawning llama-server.
+//
+// AMD-discrete chat-slot flags:
+//
+//   --flash-attn off     The default `--flash-attn auto` correctly
+//                        determines FA can't run on AMD MTL0 (the
+//                        simdgroup-reduction patch disables the ops
+//                        FA needs) but instead of disabling FA
+//                        outright it schedules the FA tensor on CPU
+//                        each decode step, ferrying tensors GPU↔CPU
+//                        per token. Forcing `off` uses standard
+//                        (slower per kernel, but GPU-resident)
+//                        attention.
+//
+//   --cache-ram 0        Disables the server-side LCP-similarity slot
+//                        cache. The crash signature is in
+//                        `prompt_save` → `state_seq_get_data` →
+//                        `ggml_metal_buffer_get_tensor(buf_dst=NULL)`
+//                        on the 2nd chat with LCP similarity > 10%.
+//                        --cache-ram 0 disables the path entirely.
+//
+//   --no-cache-prompt    Companion to --cache-ram 0 — disables the
+//                        per-slot prompt cache so the LCP-similarity
+//                        path can't fire from a per-slot trigger in
+//                        a future llama.cpp release. The two flags
+//                        together belt-and-suspenders the entire
+//                        prompt-cache surface.
+//
+// Embed / rerank slots don't decode autoregressively and don't touch
+// the server-side cache, so they keep the upstream defaults regardless
+// of profile. Apple Silicon and unknown profiles also keep the
+// upstream defaults across all slot kinds.
+func buildSlotArgs(cfg config.Config, hwInfo hardware.Info, spec slotSpec, modelPath string) []string {
+	args := []string{
+		"--model", modelPath,
+		"--host", "127.0.0.1",
+		"--port", fmt.Sprintf("%d", spec.Port),
+		"--ctx-size", fmt.Sprintf("%d", cfg.MaxContext),
+	}
+	args = append(args, spec.ExtraArgs...)
+
+	if spec.Kind == gateway.KindChat && hwInfo.IsAMDDiscrete() {
+		args = append(args,
+			"--flash-attn", "off",
+			"--cache-ram", "0",
+			"--no-cache-prompt",
+		)
+	}
+	return args
+}
+
 // startSlot launches one llama-server with the configured model + Metal
-// defaults. Used for both chat and embed slots; the spec controls the
-// differences (model, port, mode flags).
-func startSlot(ctx context.Context, cfg config.Config, spec slotSpec, stderr io.Writer) (*supervisor.Slot, error) {
+// defaults. Wraps buildSlotArgs with the actual process supervision.
+func startSlot(ctx context.Context, cfg config.Config, hwInfo hardware.Info, spec slotSpec, stderr io.Writer) (*supervisor.Slot, error) {
 	bin, err := resolveLlamaBin(cfg.LlamaBin)
 	if err != nil {
 		return nil, err
@@ -524,13 +597,7 @@ func startSlot(ctx context.Context, cfg config.Config, spec slotSpec, stderr io.
 		return nil, err
 	}
 
-	args := []string{
-		"--model", modelPath,
-		"--host", "127.0.0.1",
-		"--port", fmt.Sprintf("%d", spec.Port),
-		"--ctx-size", fmt.Sprintf("%d", cfg.MaxContext),
-	}
-	args = append(args, spec.ExtraArgs...)
+	args := buildSlotArgs(cfg, hwInfo, spec, modelPath)
 
 	slot := supervisor.NewSlot(spec.Name)
 	slot.BinPath = bin

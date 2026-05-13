@@ -130,6 +130,29 @@ func (i Info) String() string {
 	)
 }
 
+// IsAMDDiscrete reports whether the host is running an AMD discrete GPU
+// that needs the Metal-correctness workarounds — i.e., one of the four
+// AMD profiles (Vega Pro, W6800X, RDNA1, RDNA2). False on Apple Silicon,
+// integrated GPUs, and CPU-only paths.
+//
+// Used by the supervisor to gate chat-slot launch flags:
+//   - `--flash-attn off` (auto-detect tries to keep FA on GPU but ferries
+//     the FA tensor to CPU each decode, throttling tok/s)
+//   - `--no-cache-prompt` (prompt-cache state-save asserts on
+//     ggml_metal_buffer_get_tensor with NULL buf_dst on Vega II)
+//
+// Both fixes match the spirit of the simdgroup-reduction patch — gating
+// Metal code paths that produce wrong/missing buffer pointers on AMD —
+// but live at the supervisor level so we honour the "one patch" rule.
+func (i Info) IsAMDDiscrete() bool {
+	switch i.Profile {
+	case ProfileVegaPro, ProfileW6800X, ProfileRDNA1, ProfileRDNA2:
+		return true
+	default:
+		return false
+	}
+}
+
 // runtimePlatform is a thin shim so tests can spoof GOOS — used by the stub
 // implementation to choose between "cpu" and "unknown" when neither macOS
 // nor a known Linux GPU is present.

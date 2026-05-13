@@ -20,6 +20,71 @@ In `ggml/src/ggml-metal/ggml-metal-device.m`:
 
 Trade-off is a slower scalar fallback for reductions. On AMD Vega II + llama3.2:3b we measured ~4 tok/s patched vs garbage tokens unpatched. Correct slow output beats fast garbage; v0.4 will explore rewriting the reduction kernels to use AMD-compatible intrinsics.
 
+## Supervisor-level companion fixes (no second patch)
+
+Two additional Metal correctness issues surface on AMD discrete that
+the simdgroup/bfloat gating doesn't reach. Both are addressed by the
+Go supervisor passing explicit `llama-server` flags when it detects an
+AMD-discrete profile (`Vega Pro`, `W6800X`, `RDNA1`, `RDNA2`) —
+**no second llama.cpp patch is required**, which keeps the
+"one patch per submodule" rule intact.
+
+### 1. Flash-attention CPU-fallback throttle
+
+With simdgroup reduction disabled, llama-server's `--flash-attn auto`
+correctly determines that FA's GPU path is unavailable, but instead of
+disabling FA outright it schedules the FA tensor on CPU each decode
+step. Result: a GPU↔CPU copy every token, throttling chat to ~3 tok/s
+on Vega II despite all 29/29 model layers being resident on MTL0.
+
+Supervisor passes `--flash-attn off` for the chat slot on AMD
+profiles. Standard attention is slower per kernel than FA but
+stays GPU-resident, yielding a net throughput win.
+
+### 2. Prompt-cache `GGML_ASSERT(buf_dst)` crash
+
+The chat slot's prompt-cache state-save path
+(`server_slot::prompt_save` → `llama_context::state_seq_get_data` →
+`ggml_metal_buffer_get_tensor`) hits a NULL destination buffer on
+Vega II during the second request when LCP similarity > 10%. Slot
+aborts with:
+
+```
+ggml-metal-device.m:1736: GGML_ASSERT(buf_dst) failed
+```
+
+Supervisor passes **two** flags on AMD chat slots:
+
+- `--cache-ram 0` — disables the server-side LCP-similarity slot
+  cache, which is the path that calls `prompt_save`. This is the
+  load-bearing flag.
+- `--no-cache-prompt` — companion: disables per-slot prompt caching
+  so the LCP path can't be entered via a different trigger in a
+  future llama.cpp release.
+
+`--no-cache-prompt` alone is not sufficient — it controls the
+per-slot prompt cache, but the crash is in the server-side
+LCP-similarity cache that runs during slot picking
+(`get_available_slot`).
+
+Embed and rerank slots don't touch either cache, so they keep the
+upstream defaults.
+
+### Why not a second patch?
+
+The "one patch per submodule" rule (`CLAUDE.md` absolute rule #3)
+holds: code that produces wrong/missing Metal buffer pointers should
+be patched at the source. But the two issues above are fixed at the
+correct architectural layer — at the supervisor, by passing
+already-supported `llama-server` flags — and a patch would duplicate
+behavior llama-server already exposes via its CLI. The original
+simdgroup-reduction patch is necessary because that code path has
+no runtime opt-out; these two have an opt-out.
+
+Issue refs: tracked at `Cerid-AI/quenchforge#1` (gateway /api/chat
+translation, separate concern) and `Cerid-AI/quenchforge#2` (the
+prompt-cache crash, now mitigated by `--no-cache-prompt`).
+
 ## Honesty about whisper.cpp Metal
 
 The patch is necessary on both submodules but **not sufficient on whisper.cpp**. Even with `simdgroup_reduction` and `bfloat` both disabled, whisper-server on Vega II still produces garbage tokens — there's an additional Metal-on-AMD bug in whisper-specific kernels (likely the encoder's convolution or attention paths). The patch silences the obvious failure modes; the deeper issue is still being investigated.

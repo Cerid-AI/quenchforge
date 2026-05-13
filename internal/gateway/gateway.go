@@ -144,13 +144,20 @@ func (g *Gateway) Start(ctx context.Context) error {
 	mux.HandleFunc("/", g.handleRoot)
 	mux.HandleFunc("/health", g.handleHealth)
 	mux.HandleFunc("/api/tags", g.handleTags)
-	// chat (Ollama + OpenAI surfaces)
-	mux.HandleFunc("/api/chat", g.proxyHandler(KindChat, ""))
-	mux.HandleFunc("/api/generate", g.proxyHandler(KindChat, ""))
+	// chat (Ollama + OpenAI surfaces).  llama-server only speaks the
+	// OpenAI wire — /api/chat and /api/generate are translated by the
+	// handlers in ollama_translate.go so Ollama clients work end-to-end.
+	// /v1/chat/completions is OpenAI-native and goes through the simple
+	// reverse-proxy path unchanged.
+	mux.HandleFunc("/api/chat", g.handleOllamaChat(false))
+	mux.HandleFunc("/api/generate", g.handleOllamaChat(true))
 	mux.HandleFunc("/v1/chat/completions", g.proxyHandler(KindChat, ""))
-	// embeddings (Ollama + OpenAI surfaces)
-	mux.HandleFunc("/api/embeddings", g.proxyHandler(KindEmbed, ""))
-	mux.HandleFunc("/api/embed", g.proxyHandler(KindEmbed, "")) // Ollama alias
+	// embeddings (Ollama + OpenAI surfaces).  Same translation story:
+	// /api/embeddings and /api/embed are Ollama wire, translated to
+	// /v1/embeddings on the upstream embed slot; /v1/embeddings is
+	// pass-through.
+	mux.HandleFunc("/api/embeddings", g.handleOllamaEmbeddings())
+	mux.HandleFunc("/api/embed", g.handleOllamaEmbeddings())
 	mux.HandleFunc("/v1/embeddings", g.proxyHandler(KindEmbed, ""))
 	// rerank (OpenAI-style /v1/rerank; llama-server speaks its own /rerank
 	// when launched with --reranking; we route both to the same slot).
