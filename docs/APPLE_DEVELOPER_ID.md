@@ -176,6 +176,43 @@ When it's green, the GitHub Release should:
 - The Homebrew tap formula should auto-update — `brew install
   cerid-ai/tap/quenchforge` works without `--no-quarantine`
 
+### Verifying notarization out-of-band
+
+The release workflow uses `wait: false` on the notarize block (goreleaser
+fire-and-forgets each submission and exits the step without polling Apple).
+This avoids Apple's per-API-key hourly rate limit (HTTP 429 `RATE_LIMIT`)
+that gets tripped when 4 binaries × goreleaser's ~50s polling interval
+cross the ~50/hour ceiling.
+
+To confirm Apple accepted the submissions for a given tag, run locally:
+
+```sh
+# Find the API key file you downloaded in step 3:
+KEY_FILE=$(ls ~/Downloads/AuthKey_*.p8 ~/quenchforge-signing/AuthKey_*.p8 2>/dev/null | head -1)
+KEY_ID=$(basename "$KEY_FILE" | sed -E 's/AuthKey_(.+)\.p8/\1/')
+ISSUER_ID="<the Issuer ID UUID you noted in step 3>"
+
+# List recent submissions (should show your tag's 4 binaries):
+xcrun notarytool history --key "$KEY_FILE" --key-id "$KEY_ID" --issuer "$ISSUER_ID" | head -20
+
+# Drill into any specific submission ID — status should be "Accepted":
+xcrun notarytool info <submission-uuid> \
+  --key "$KEY_FILE" --key-id "$KEY_ID" --issuer "$ISSUER_ID"
+
+# If "Invalid", pull the failure log:
+xcrun notarytool log <submission-uuid> \
+  --key "$KEY_FILE" --key-id "$KEY_ID" --issuer "$ISSUER_ID"
+```
+
+The submission IDs are visible in the GitHub Actions log under the
+"Run goreleaser/goreleaser-action@v6" step — search for `notarizing`.
+
+End-user impact of `wait: false` is zero: Apple's cloud-based Gatekeeper
+check at install time uses the binary's hash regardless of whether
+goreleaser polled. Stapling does not apply to raw Mach-O CLI binaries
+(only `.app` / `.dmg` / `.pkg` can be stapled), so there's nothing the
+wait would have given us beyond a confirmation log line.
+
 ## Rotation
 
 - Developer ID Application certificates expire **5 years** after issue.
