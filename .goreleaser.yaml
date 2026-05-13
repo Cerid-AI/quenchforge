@@ -130,7 +130,15 @@ notarize:
         key_id: '{{ .Env.APPLE_NOTARY_API_KEY_ID }}'
         key: '{{ .Env.APPLE_NOTARY_API_KEY_PATH }}'
         wait: true
-        timeout: 10m
+        # Apple's notary queue is bursty — submissions usually complete in
+        # 1–5 minutes but can take 20+ during outages or peak load. With 4
+        # binaries (quenchforge + quenchforge-preflight × amd64 + arm64)
+        # processed serially, the original 10m floor was too tight: v0.3.2
+        # attempt 4 timed out at 10m on the first binary while Apple's
+        # queue was warm. 30m per binary gives sufficient headroom without
+        # making a true Apple outage hang the workflow forever (the GitHub
+        # Actions job-level timeout — 6h default — is the ultimate ceiling).
+        timeout: 30m
       ids:
         - quenchforge
         - quenchforge-preflight
