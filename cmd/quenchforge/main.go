@@ -31,7 +31,7 @@ import (
 //
 // goreleaser handles this in CI. Local dev builds carry the zero value.
 var (
-	Version   = "0.3.1-dev"
+	Version   = "0.3.4-dev"
 	Commit    = "unknown"
 	BuildDate = "unknown"
 )
@@ -538,29 +538,29 @@ type slotSpec struct {
 //
 // AMD-discrete chat-slot flags:
 //
-//   --flash-attn off     The default `--flash-attn auto` correctly
-//                        determines FA can't run on AMD MTL0 (the
-//                        simdgroup-reduction patch disables the ops
-//                        FA needs) but instead of disabling FA
-//                        outright it schedules the FA tensor on CPU
-//                        each decode step, ferrying tensors GPU↔CPU
-//                        per token. Forcing `off` uses standard
-//                        (slower per kernel, but GPU-resident)
-//                        attention.
+//	--flash-attn off     The default `--flash-attn auto` correctly
+//	                     determines FA can't run on AMD MTL0 (the
+//	                     simdgroup-reduction patch disables the ops
+//	                     FA needs) but instead of disabling FA
+//	                     outright it schedules the FA tensor on CPU
+//	                     each decode step, ferrying tensors GPU↔CPU
+//	                     per token. Forcing `off` uses standard
+//	                     (slower per kernel, but GPU-resident)
+//	                     attention.
 //
-//   --cache-ram 0        Disables the server-side LCP-similarity slot
-//                        cache. The crash signature is in
-//                        `prompt_save` → `state_seq_get_data` →
-//                        `ggml_metal_buffer_get_tensor(buf_dst=NULL)`
-//                        on the 2nd chat with LCP similarity > 10%.
-//                        --cache-ram 0 disables the path entirely.
+//	--cache-ram 0        Disables the server-side LCP-similarity slot
+//	                     cache. The crash signature is in
+//	                     `prompt_save` → `state_seq_get_data` →
+//	                     `ggml_metal_buffer_get_tensor(buf_dst=NULL)`
+//	                     on the 2nd chat with LCP similarity > 10%.
+//	                     --cache-ram 0 disables the path entirely.
 //
-//   --no-cache-prompt    Companion to --cache-ram 0 — disables the
-//                        per-slot prompt cache so the LCP-similarity
-//                        path can't fire from a per-slot trigger in
-//                        a future llama.cpp release. The two flags
-//                        together belt-and-suspenders the entire
-//                        prompt-cache surface.
+//	--no-cache-prompt    Companion to --cache-ram 0 — disables the
+//	                     per-slot prompt cache so the LCP-similarity
+//	                     path can't fire from a per-slot trigger in
+//	                     a future llama.cpp release. The two flags
+//	                     together belt-and-suspenders the entire
+//	                     prompt-cache surface.
 //
 // Embed / rerank slots don't decode autoregressively and don't touch
 // the server-side cache, so they keep the upstream defaults regardless

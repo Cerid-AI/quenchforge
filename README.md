@@ -1,6 +1,6 @@
 # Quenchforge
 
-**Correctness patches and a unified runtime for `ggml`-based local inference on Intel Mac + AMD discrete GPU.** Single Go binary that supervises [`llama.cpp`](https://github.com/ggml-org/llama.cpp) and [`whisper.cpp`](https://github.com/ggml-org/whisper.cpp), exposing Ollama-compatible + OpenAI-compatible HTTP APIs on `127.0.0.1:11434`.
+**Ollama for Mac users who care about correctness.** Single Go binary that supervises [`llama.cpp`](https://github.com/ggml-org/llama.cpp) + [`whisper.cpp`](https://github.com/ggml-org/whisper.cpp), exposing Ollama-API + OpenAI-API HTTP on `127.0.0.1:11434`. Drop-in for Ollama clients. Runs unchanged on Apple Silicon (same defaults as Ollama there) and on Intel Mac + AMD discrete (where Ollama falls back to CPU and llama.cpp produces garbage tokens). Same binary, same wire formats, same GGUF models.
 
 ## The bug Quenchforge exists to fix
 
@@ -21,7 +21,9 @@ Quenchforge carries a single load-bearing patch per submodule that gates the bug
 | **Image generation** | `stable-diffusion.cpp` | ✅ shipped in v0.3.1 — sd-server supervised slot, `/v1/images/generations` proxies through gateway |
 | **Text-to-speech** | `bark.cpp` | ✅ shipped in v0.3.1 — bark server supervised slot, `/v1/audio/speech` → `/tts` path-rewrite |
 
-> **Status:** v0.3.1 pre-release. Chat + embeddings + reranker + whisper transcription verified live on Mac Pro 2019 + Radeon Pro Vega II (32 GB HBM2). Image-gen + TTS slots wired end-to-end; correctness on AMD Mac depends on the same `simdgroup_reduction`/`bfloat` fix landing in each project's vendored ggml. Homebrew tap at [`Cerid-AI/homebrew-tap`](https://github.com/Cerid-AI/homebrew-tap) is live; signed bottles ship once Apple Developer ID secrets land (see [docs/APPLE_DEVELOPER_ID.md](docs/APPLE_DEVELOPER_ID.md)).
+> **Status:** v0.3.3 shipped (2026-05-13). Production-stable for chat + embeddings + reranker + whisper transcription on Mac Pro 2019 + Radeon Pro Vega II (32 GB HBM2). Image-gen + TTS slots are wired end-to-end but **AMD-Mac correctness is unverified** — they depend on the same `simdgroup_reduction` / `bfloat` fix landing in each project's vendored ggml, which we haven't audited yet. Treat those two slots as experimental on Intel Mac + AMD until a hardware-profile report confirms. Homebrew tap at [`Cerid-AI/homebrew-tap`](https://github.com/Cerid-AI/homebrew-tap) is live; signed bottles ship once Apple Developer ID secrets land (see [docs/APPLE_DEVELOPER_ID.md](docs/APPLE_DEVELOPER_ID.md)).
+>
+> **v0.3.3 highlights:** Ollama-wire ↔ OpenAI-wire body translation (gateway now translates `/api/chat`, `/api/generate`, `/api/embeddings`, `/api/embed` requests + responses on the way through, so Ollama clients work end-to-end against llama-server's OpenAI wire); hardware-aware chat-slot args on AMD discrete (auto-adds `--flash-attn off --cache-ram 0 --no-cache-prompt` for Vega Pro / W6800X / W6900X / RDNA1+2 to keep attention GPU-resident and avoid the Vega II prompt-cache GGML_ASSERT crash); LaunchAgent template at `packaging/macos/com.cerid.quenchforge.plist` for from-source installs.
 
 ## Hardware compatibility matrix
 
@@ -32,6 +34,7 @@ Quenchforge carries a single load-bearing patch per submodule that gates the bug
 | Intel Mac + AMD RDNA1/RDNA2 (5500M / 5700 / 6700M consumer) | Supported | Same patch surface; smaller HBM/GDDR |
 | Apple Silicon (M1/M2/M3/M4/M5) | Supported (non-degraded) | Patches runtime-gated; effectively stock on this arch |
 | Intel Mac, Intel iGPU only (Iris Plus, etc.) | Supported (CPU-class) | Metal available but very small VRAM — auto fallback to CPU |
+| Intel Mac Pro 2013 + AMD FirePro D300/D500/D700 | **Known incompatible** | Reported gibberish-output ([llama.cpp#20104](https://github.com/ggml-org/llama.cpp/issues/20104)); not Metal3 |
 | Linux / Windows | **Out of scope** | Use stock Ollama with CUDA / ROCm / DirectML; that path is already well-served |
 | Hackintosh + AMD | Community best-effort | Tagged in telemetry as non-genuine; no SLA |
 
@@ -111,7 +114,7 @@ Signed + notarized bottles depend on Apple Developer ID configuration in CI.
 ## First-launch prompts to expect
 
 - **"Quenchforge would like to find and connect to devices on your local network"** — Sonoma+ TCC prompt for mDNS / Bonjour advertisement (`_quenchforge._tcp.local.`). Only shown when `QUENCHFORGE_ADVERTISE_MDNS=true`. Allowing this lets cerid-ai and other LAN clients auto-discover the service.
-- **Telemetry consent** — first launch (when telemetry ships in v0.4) shows a one-screen consent flow. Both error reports and the anonymous benchmark dashboard are off until you opt in.
+- **Telemetry** — none. Zero network traffic in the default config. The CLAUDE.md design contract reserves `QUENCHFORGE_TELEMETRY` for a future opt-in benchmark dashboard at `bench.quenchforge.dev`, but no code is shipped for that yet. Setting `QUENCHFORGE_SENTRY_DSN` enables Sentry error reporting for operators who explicitly want it; absent that env var, no Sentry traffic.
 - **Gatekeeper** — once signed/notarized binaries ship, `quenchforge --version` is the first run that triggers a one-time online check.
 
 ## Configuration
@@ -121,13 +124,27 @@ All settings have sensible defaults. Selected env vars:
 | Env var | Default | What |
 |---|---|---|
 | `QUENCHFORGE_LISTEN_ADDR` | `127.0.0.1:11434` | Gateway bind |
-| `QUENCHFORGE_DEFAULT_MODEL` | `qwen2.5:7b-instruct-q4_k_m` | Chat slot model |
-| `QUENCHFORGE_EMBED_MODEL` | unset | Embed slot opt-in |
-| `QUENCHFORGE_RERANK_MODEL` | unset | Rerank slot opt-in |
-| `QUENCHFORGE_WHISPER_MODEL` | unset | Whisper slot opt-in (ggml model path) |
-| `QUENCHFORGE_WHISPER_GPU` | `false` | Try Metal for whisper (currently buggy on AMD Mac) |
-| `QUENCHFORGE_ADVERTISE_MDNS` | `false` | Bonjour advertisement |
-| `QUENCHFORGE_TELEMETRY` | `false` | Reserved for v0.4 consent flow |
+| `QUENCHFORGE_DEFAULT_MODEL` | `qwen2.5:7b-instruct-q4_k_m` | Chat slot model name (resolved under `QUENCHFORGE_MODELS_DIR`) |
+| `QUENCHFORGE_EMBED_MODEL` | unset | Embed slot opt-in (BERT-family GGUF; produces dense embeddings on `/v1/embeddings`) |
+| `QUENCHFORGE_RERANK_MODEL` | unset | Rerank slot opt-in (cross-encoder GGUF; serves `/v1/rerank`) |
+| `QUENCHFORGE_WHISPER_MODEL` | unset | Whisper slot opt-in (ggml model path; serves `/v1/audio/transcriptions`) |
+| `QUENCHFORGE_WHISPER_GPU` | `false` | Try Metal for whisper (currently buggy on AMD Mac; CPU default is 12.8× real-time on Xeon W-3245) |
+| `QUENCHFORGE_SD_MODEL` | unset | Image-gen slot opt-in (stable-diffusion.cpp; serves `/v1/images/generations`) |
+| `QUENCHFORGE_BARK_MODEL` | unset | TTS slot opt-in (bark.cpp; serves `/v1/audio/speech`) |
+| `QUENCHFORGE_MODELS_DIR` | `~/.quenchforge/models` | Where Quenchforge looks for GGUFs |
+| `QUENCHFORGE_LOG_DIR` | `~/Library/Logs/quenchforge` | Per-slot log files land here |
+| `QUENCHFORGE_PID_DIR` | `~/.config/quenchforge/pids` | Orphan-reaper pidfile dir |
+| `QUENCHFORGE_MAX_CONTEXT` | `8192` | `--ctx-size` passed to every slot |
+| `QUENCHFORGE_METAL_N_CB` | `2` | Metal command-buffer count (`GGML_METAL_N_CB`) |
+| `QUENCHFORGE_ADVERTISE_MDNS` | `false` | Bonjour advertisement (`_quenchforge._tcp.local.`) |
+
+**Operator overrides** (gated by the v0.3.3 hardware-aware defaults):
+| Env var | Default | What |
+|---|---|---|
+| `GGML_METAL_FORCE_SIMDGROUP_REDUCTION` | unset | Re-enables the AMD-buggy reduction kernel — for diagnostic use only |
+| `GGML_METAL_FORCE_BF16` | unset | Re-enables the AMD-buggy bfloat path |
+| `GGML_METAL_BF16_DISABLE` | unset | Hard-disable bfloat regardless of profile |
+| `GGML_METAL_CONCURRENCY_DISABLE` | unset | Serial encoder dispatch (slower but more predictable) |
 
 Full list in `internal/config/config.go`.
 

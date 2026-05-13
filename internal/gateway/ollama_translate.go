@@ -45,12 +45,12 @@ import (
 // intentionally permissive (json.Number, RawMessage) to forward exotic
 // caller payloads without losing fidelity.
 type ollamaChatRequest struct {
-	Model    string                 `json:"model"`
-	Messages []ollamaChatMessage    `json:"messages"`
-	Stream   *bool                  `json:"stream,omitempty"` // pointer so we can distinguish absent from false
-	Options  map[string]interface{} `json:"options,omitempty"`
-	Format   string                 `json:"format,omitempty"`
-	KeepAlive interface{}           `json:"keep_alive,omitempty"`
+	Model     string                 `json:"model"`
+	Messages  []ollamaChatMessage    `json:"messages"`
+	Stream    *bool                  `json:"stream,omitempty"` // pointer so we can distinguish absent from false
+	Options   map[string]interface{} `json:"options,omitempty"`
+	Format    string                 `json:"format,omitempty"`
+	KeepAlive interface{}            `json:"keep_alive,omitempty"`
 	// Tools / images / etc. — passed through verbatim via Raw to avoid
 	// silently dropping fields we don't yet translate.
 	Raw json.RawMessage `json:"-"`
@@ -64,13 +64,13 @@ type ollamaChatMessage struct {
 // ollamaGenerateRequest is /api/generate's body. Generate is sugar for
 // "single user-role message"; we translate it into a chat call.
 type ollamaGenerateRequest struct {
-	Model    string                 `json:"model"`
-	Prompt   string                 `json:"prompt"`
-	System   string                 `json:"system,omitempty"`
-	Stream   *bool                  `json:"stream,omitempty"`
-	Options  map[string]interface{} `json:"options,omitempty"`
-	Format   string                 `json:"format,omitempty"`
-	KeepAlive interface{}           `json:"keep_alive,omitempty"`
+	Model     string                 `json:"model"`
+	Prompt    string                 `json:"prompt"`
+	System    string                 `json:"system,omitempty"`
+	Stream    *bool                  `json:"stream,omitempty"`
+	Options   map[string]interface{} `json:"options,omitempty"`
+	Format    string                 `json:"format,omitempty"`
+	KeepAlive interface{}            `json:"keep_alive,omitempty"`
 }
 
 // ollamaEmbedRequest accepts both wire variants: `prompt` (legacy
@@ -189,11 +189,11 @@ func (g *Gateway) handleOllamaChat(generateMode bool) http.HandlerFunc {
 		}
 
 		var (
-			model       string
-			messages    []ollamaChatMessage
-			streamFlag  bool
-			options     map[string]interface{}
-			format      string
+			model      string
+			messages   []ollamaChatMessage
+			streamFlag bool
+			options    map[string]interface{}
+			format     string
 		)
 		if generateMode {
 			var req ollamaGenerateRequest
