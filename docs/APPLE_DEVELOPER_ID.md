@@ -59,18 +59,32 @@ openssl x509 -inform DER -in developerID_application.cer -out developerID_applic
 printf "Pick a strong P12 passphrase: " >&2
 read -s P12_PASS
 echo
-openssl pkcs12 -export \
+
+# CRITICAL: the `-legacy` flag is load-bearing on modern openssl (3.x ships
+# with macOS Sonoma+; Homebrew openssl defaults to 3.6+). Without it,
+# openssl exports a .p12 with a SHA-256 MAC + AES-256 PBE, which macOS
+# Security framework (`security import`, the CI's keychain ingest) cannot
+# consume. The failure mode is a misleading "MAC verification failed
+# (wrong password?)" — the passphrase is fine; the algorithm is wrong.
+# `-legacy` opts into SHA-1 MAC + PBE-SHA1-3DES, which both macOS Security
+# framework and Apple's notarytool understand.
+openssl pkcs12 -export -legacy \
   -inkey quenchforge-developer-id.key \
   -in developerID_application.pem \
   -name "Quenchforge Developer ID" \
   -password "pass:${P12_PASS}" \
   -out quenchforge-developer-id.p12
 
-# Verify it parses:
-openssl pkcs12 -info -in quenchforge-developer-id.p12 -password "pass:${P12_PASS}" -nokeys | head -10
+# Verify it parses AND verify the MAC algorithm is SHA-1 (NOT SHA-256):
+openssl pkcs12 -info -in quenchforge-developer-id.p12 -password "pass:${P12_PASS}" -nokeys | grep -E '^(MAC|PKCS7)' | head -5
+# Expected: "MAC: sha1, Iteration 2048" — if you see sha256, re-run the
+# export with -legacy and try again. The release.yml workflow's pre-flight
+# step will also catch this and fail with a clear "use -legacy" error.
 
-# Base64-encode for the GitHub Secret:
-base64 -i quenchforge-developer-id.p12 | pbcopy
+# Base64-encode for the GitHub Secret (unwrapped — pbcopy on macOS wraps at
+# 76 chars by default; the workflow tolerates wrapped input but unwrapped
+# is unambiguous):
+base64 -i quenchforge-developer-id.p12 | tr -d '\n' | pbcopy
 echo "P12 base64 now on clipboard. Keep the passphrase in your password manager."
 unset P12_PASS
 ```

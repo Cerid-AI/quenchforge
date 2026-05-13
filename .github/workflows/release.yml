@@ -123,6 +123,38 @@ jobs:
             exit 1
           fi
 
+          # Step 3: MAC algorithm check. macOS `security import` (Sonoma,
+          # 2026) refuses PKCS#12 files that use a SHA-256 MAC and silently
+          # reports "MAC verification failed during PKCS12 import (wrong
+          # password?)" — even when the passphrase is correct. openssl 3.x
+          # defaults to SHA-256 + AES-256 PBE; you have to opt back into
+          # the SHA-1 + PBE-SHA1-3DES legacy format with `-legacy` on the
+          # export step. This pre-flight catches the algorithm mismatch
+          # before `security import` produces its misleading password error.
+          MAC_INFO=$(openssl pkcs12 -in "$CERT_PATH" \
+                       -passin "pass:$APPLE_DEVELOPER_ID_CERT_PASSWORD" \
+                       -info -nokeys -noout 2>&1 | grep -i '^MAC:' || true)
+          echo "P12 MAC line: ${MAC_INFO:-<none>}"
+          if echo "$MAC_INFO" | grep -qi 'sha-\?256'; then
+            echo "::error::The .p12 was exported with a SHA-256 MAC, which macOS \`security import\` cannot consume."
+            echo
+            echo "openssl 3.x defaults to modern algorithms; macOS Security framework"
+            echo "still requires the legacy SHA-1 MAC + PBE-SHA1-3DES format. Re-export"
+            echo "with the -legacy flag, then re-base64 + update the GitHub secret:"
+            echo
+            echo "  cd ~/quenchforge-signing"
+            echo "  openssl pkcs12 -export -legacy \\"
+            echo "    -inkey quenchforge-developer-id.key \\"
+            echo "    -in developerID_application.pem \\"
+            echo "    -name 'Quenchforge Developer ID' \\"
+            echo "    -passout 'pass:YOUR_PASSPHRASE' \\"
+            echo "    -out quenchforge-developer-id.p12"
+            echo "  base64 -i quenchforge-developer-id.p12 | tr -d '\\n' | pbcopy"
+            echo
+            echo "Then paste into APPLE_DEVELOPER_ID_CERT_P12_B64 and re-tag."
+            exit 1
+          fi
+
           security import "$CERT_PATH" \
             -k "$KC" \
             -P "$APPLE_DEVELOPER_ID_CERT_PASSWORD" \
