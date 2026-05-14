@@ -221,8 +221,12 @@ func TestPull_E2E_Idempotent_SkipsWhenAlreadyPresent(t *testing.T) {
 	defer srv.Close()
 
 	tmpDir := t.TempDir()
-	// Pre-place the file at the expected on-disk name.
-	preplacePath := filepath.Join(tmpDir, "y-Q4.gguf")
+	// Pre-place the file at the expected on-disk name. The name must
+	// match what localNameFromRepoMatch produces — lowercase, even when
+	// the spec's FileMatch is upper/mixed case. On a case-insensitive
+	// macOS filesystem the wrong case still resolves; Linux CI is
+	// case-sensitive and would silently re-download.
+	preplacePath := filepath.Join(tmpDir, "y-q4.gguf")
 	if err := os.WriteFile(preplacePath, payload, 0o644); err != nil {
 		t.Fatalf("preplace: %v", err)
 	}
