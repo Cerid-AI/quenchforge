@@ -31,7 +31,7 @@ import (
 //
 // goreleaser handles this in CI. Local dev builds carry the zero value.
 var (
-	Version   = "0.4.0-dev"
+	Version   = "0.4.1-dev"
 	Commit    = "unknown"
 	BuildDate = "unknown"
 )

@@ -8,6 +8,43 @@ patch bumps fix bugs or polish without behaviour change.
 
 ---
 
+## v0.4.1 — docs + Homebrew tap auto-push (2026-05-14)
+
+Polish + supply-chain release. No behaviour change in the binary; the
+tag exists primarily to flip the Homebrew tap from manual updates to
+automated goreleaser pushes now that `HOMEBREW_TAP_GITHUB_TOKEN` is
+configured.
+
+- **`HOMEBREW_TAP_GITHUB_TOKEN` repo secret is set.** Future tags
+  automatically push the updated formula to
+  [`Cerid-AI/homebrew-tap`](https://github.com/Cerid-AI/homebrew-tap).
+  The manual sync recipe at `docs/APPLE_DEVELOPER_ID.md` § 5 is no
+  longer required.
+- **README status block bumped** to v0.4.0 (now also covers v0.4.1).
+- **`third_party/LICENSES.md` created.** Previously a broken link from
+  the README and NOTICE; now exists with full upstream license text
+  for the four submodules (llama.cpp + whisper.cpp + sd.cpp + bark.cpp,
+  all MIT) and modification provenance.
+- **NOTICE updated.** Removed the stale Olla reference (was design-time
+  intent that never shipped — `internal/gateway/` is fully home-grown).
+  Added the two submodules NOTICE was missing (sd.cpp + bark.cpp).
+- **`.goreleaser.yaml` brews scaffold audit-clean.** `brew audit
+  --strict --new` flagged 4 nits on the auto-generated formula; 2 were
+  fixed in the goreleaser scaffold (desc starts with capital,
+  `shell_output` redundant `, 0` arg removed) and 2 in the tap formula
+  directly (version-before-license ordering, `macos:` hash syntax).
+  `brew audit --strict --new cerid-ai/tap/quenchforge` now exits 0.
+- **`docs/APPLE_DEVELOPER_ID.md` status flipped to LIVE.** Status table
+  reflects that all 5 Apple GitHub secrets + the Homebrew tap PAT are
+  set. v0.3.3 / v0.3.4 / v0.4.0 all shipped signed + notarized.
+
+This is also the first release to verify-end-to-end that the auto tap
+push works: pre-v0.4.1 the tap was manually synced because the
+`HOMEBREW_TAP_GITHUB_TOKEN` secret wasn't configured. The release of
+this tag is itself the verification.
+
+---
+
 ## v0.4.0 — model registry + VRAM pre-flight (2026-05-14)
 
 The first-run UX gap vs Ollama is closed. Operators no longer need to
