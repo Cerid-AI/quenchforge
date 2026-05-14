@@ -163,9 +163,11 @@ notarize:
 brews:
   - name: quenchforge
     homepage: https://github.com/Cerid-AI/quenchforge
+    # `brew audit --strict --new` requires the description to start with
+    # a capital letter and avoid lowercase project-name leads.
     description: >-
-      ggml-on-AMD-Mac correctness — chat, embedding, reranker, Whisper
-      transcription. Ollama- and OpenAI-compatible HTTP APIs.
+      Correctness patches for ggml on AMD-Mac — chat, embed, rerank,
+      transcribe. Ollama- and OpenAI-compatible HTTP APIs.
     license: Apache-2.0
     # Skip the tap formula update when:
     #   - the release is a prerelease (auto-skip alpha/rc tags), OR
@@ -186,11 +188,14 @@ brews:
     install: |
       bin.install "quenchforge"
       bin.install "quenchforge-preflight"
+    # `brew audit --strict --new`: passing 0 to shell_output is redundant
+    # (it's the default for "exit code = 0 is success"). Removing the
+    # trailing , 0 keeps the auto-generated formula audit-clean.
     test: |
       output = shell_output("#{bin}/quenchforge version")
       assert_match "quenchforge", output
       assert_match "darwin", output
-      preflight_out = shell_output("#{bin}/quenchforge-preflight", 0)
+      preflight_out = shell_output("#{bin}/quenchforge-preflight 2>&1")
       assert_match "status=", preflight_out
     service: |
       run [opt_bin/"quenchforge", "serve"]

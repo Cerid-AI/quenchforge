@@ -7,6 +7,12 @@ to flip signed + notarized releases on.
 
 ## Status for this maintainer
 
+> **As of 2026-05-14:** Apple signing + notarization are LIVE. v0.3.3,
+> v0.3.4, and v0.4.0 all shipped signed + notarized binaries via the
+> release workflow. The one remaining gap is the Homebrew tap PAT
+> (step 5 below) — without it, the tap formula is updated manually
+> after each release. Releases otherwise succeed end-to-end.
+
 | Item | Status |
 |---|---|
 | Apple ID | `sunrunnerfire@mac.com` — confirmed configured |
@@ -14,10 +20,10 @@ to flip signed + notarized releases on.
 | Xcode + `notarytool` | installed at `/Applications/Xcode.app/...` |
 | CSR | generated at `~/quenchforge-signing/quenchforge-developer-id.csr` |
 | Private key | at `~/quenchforge-signing/quenchforge-developer-id.key` (mode 0600) |
-| Developer ID Application certificate | **not yet minted** — see step 1 below |
-| App Store Connect API key | **not yet created** — see step 3 below |
-| GitHub repo secrets | **not yet set** — see step 4 below |
-| Homebrew tap PAT | **not yet set** — see step 5 below |
+| Developer ID Application certificate | ✅ **minted** (Justin Michaels / 4A5VDRMRB8) |
+| App Store Connect API key | ✅ **created + uploaded as repo secret** |
+| GitHub repo secrets (5 Apple ones) | ✅ **set** — `APPLE_DEVELOPER_ID_CERT_P12_B64`, `APPLE_DEVELOPER_ID_CERT_PASSWORD`, `APPLE_NOTARY_API_KEY_ID`, `APPLE_NOTARY_API_KEY_ISSUER`, `APPLE_NOTARY_API_KEY_P8_B64` |
+| Homebrew tap PAT (`HOMEBREW_TAP_GITHUB_TOKEN`) | ⚠ **not yet set** — see step 5 below. Without this, the tap formula needs a manual update after each release. |
 
 You'll still need:
 
@@ -156,6 +162,31 @@ Without this token, the release succeeds but the tap formula isn't
 updated automatically — operators have to wait for a manual sync. The
 release workflow's brews skip_upload guard handles the missing-token
 case gracefully (added in commit `f16267c`).
+
+### Manual tap update recipe (run after each release until the PAT lands)
+
+```sh
+# 1. Get the live SHA256s from the GitHub release
+cd /tmp && curl -sL "https://github.com/Cerid-AI/quenchforge/releases/download/v${VERSION}/checksums.txt" -o /tmp/qf-checksums.txt
+ARM64_SHA=$(grep "darwin_arm64.tar.gz" /tmp/qf-checksums.txt | awk '{print $1}')
+AMD64_SHA=$(grep "darwin_amd64.tar.gz" /tmp/qf-checksums.txt | awk '{print $1}')
+
+# 2. Clone the tap, edit version + both SHAs, push
+git clone git@github.com:Cerid-AI/homebrew-tap.git /tmp/homebrew-tap-wip
+cd /tmp/homebrew-tap-wip
+# (edit Formula/quenchforge.rb — bump `version`, replace both `sha256` lines)
+git add Formula/quenchforge.rb
+git commit -m "chore(formula): bump quenchforge to v${VERSION}"
+git push origin main
+
+# 3. Verify
+brew untap cerid-ai/tap && brew tap cerid-ai/tap
+brew audit --strict --new cerid-ai/tap/quenchforge  # must exit 0
+brew info cerid-ai/tap/quenchforge | head -3        # should show new version
+```
+
+Once `HOMEBREW_TAP_GITHUB_TOKEN` is set on the quenchforge repo, the
+above goes away — goreleaser auto-pushes on each tag.
 
 ## 6. Verify the first signed release
 
