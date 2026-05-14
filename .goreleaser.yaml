@@ -163,11 +163,13 @@ notarize:
 brews:
   - name: quenchforge
     homepage: https://github.com/Cerid-AI/quenchforge
-    # `brew audit --strict --new` requires the description to start with
-    # a capital letter and avoid lowercase project-name leads.
-    description: >-
-      Correctness patches for ggml on AMD-Mac — chat, embed, rerank,
-      transcribe. Ollama- and OpenAI-compatible HTTP APIs.
+    # `brew audit --strict --new` constraints on the description:
+    # 1. must start with a capital letter
+    # 2. must be < 80 characters (homebrew/core convention)
+    # 3. must NOT end with a full stop
+    # The previous longer description tripped (1) clean but blew past
+    # (2) at 115 chars and tripped (3) on the trailing period.
+    description: Patched ggml inference for AMD-Mac (chat, embed, rerank, transcribe)
     license: Apache-2.0
     # Skip the tap formula update when:
     #   - the release is a prerelease (auto-skip alpha/rc tags), OR
