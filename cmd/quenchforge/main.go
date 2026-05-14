@@ -31,7 +31,7 @@ import (
 //
 // goreleaser handles this in CI. Local dev builds carry the zero value.
 var (
-	Version   = "0.3.4-dev"
+	Version   = "0.4.0-dev"
 	Commit    = "unknown"
 	BuildDate = "unknown"
 )
@@ -44,9 +44,17 @@ Usage:
 Commands:
     serve              Start the HTTP gateway (Ollama + OpenAI compatible).
     doctor             Print a hardware-and-environment report for bug triage.
+    pull               Download a GGUF model from HuggingFace.
+    list               List GGUFs cached locally.
+    rm                 Remove a cached GGUF.
     migrate-from-ollama  Symlink ~/.ollama/models/ GGUFs into the quenchforge cache.
     version            Print version, commit, and build date.
     help               Show this message.
+
+Examples:
+    quenchforge pull llama3.2:3b                                  # catalog alias
+    quenchforge pull bartowski/Llama-3.2-3B-Instruct-GGUF:Q4_K_M  # explicit repo:quant
+    quenchforge pull --list                                       # show catalog
 
 Documentation: https://github.com/cerid-ai/quenchforge
 Report a bug:  https://github.com/cerid-ai/quenchforge/issues/new/choose
@@ -74,6 +82,12 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return cmdServe(args[1:], stdout, stderr)
 	case "migrate-from-ollama":
 		return cmdMigrate(args[1:], stdout, stderr)
+	case "pull":
+		return cmdPull(args[1:], stdout, stderr)
+	case "list", "ls":
+		return cmdList(args[1:], stdout, stderr)
+	case "rm", "remove":
+		return cmdRm(args[1:], stdout, stderr)
 	case "help", "--help", "-h":
 		fmt.Fprint(stdout, rootUsage)
 		return nil
@@ -234,6 +248,16 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 				"  (avoids GPU↔CPU flash-attn fallback throttling + Vega II "+
 				"prompt-cache GGML_ASSERT crash; embed/rerank slots are unaffected)\n",
 			hwInfo.Profile)
+	}
+
+	// VRAM pre-flight (v0.4.0). Refuse to spawn slots whose combined
+	// model weights would over-subscribe VRAM. Operator-friendly error
+	// is better than three Metal-load failures in a row.
+	if !*noSlot && !vramCheckDisabled() {
+		if err := checkVRAMBudget(cfg, hwInfo, stdout); err != nil {
+			fmt.Fprintf(stderr, "quenchforge: %v\n", err)
+			return fmt.Errorf("VRAM pre-flight failed")
+		}
 	}
 
 	// Orphan reaper — clean up any survivors from a previous crash before we

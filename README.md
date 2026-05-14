@@ -81,13 +81,14 @@ go build -o /usr/local/bin/quenchforge-preflight ./cmd/quenchforge-preflight
 quenchforge-preflight                       # status=ok on supported Mac
 quenchforge doctor                          # hardware + config + registry
 
-# Pull a small model (one-time) and serve
-mkdir -p ~/.quenchforge/models
-ln -sf ~/.ollama/models/blobs/sha256-... ~/.quenchforge/models/llama3.2-3b.gguf
+# Pull a model from HuggingFace and serve (v0.4.0+)
+quenchforge pull llama3.2:3b              # see `quenchforge pull --list` for the curated catalog
+quenchforge list                          # what's installed
+QUENCHFORGE_DEFAULT_MODEL=llama-3.2-3b-instruct-q4_k_m quenchforge serve
 
-QUENCHFORGE_DEFAULT_MODEL=llama3.2-3b \
-  QUENCHFORGE_WHISPER_MODEL=$PWD/whisper.cpp/models/ggml-tiny.en.bin \
-  quenchforge serve
+# Or, if you already have Ollama with models cached locally:
+quenchforge migrate-from-ollama           # symlinks ~/.ollama/models/ blobs in (no redownload)
+QUENCHFORGE_DEFAULT_MODEL=llama3.2-3b quenchforge serve
 ```
 
 ### Use it as a drop-in for Ollama clients
