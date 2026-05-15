@@ -28,6 +28,16 @@
 //	QUENCHFORGE_EMBED_MODEL  — GGUF model for the embedding slot. Empty = no
 //	                            embed slot is started; /api/embeddings 503s.
 //	QUENCHFORGE_EMBED_PORT   — supervised embed-slot port. Default 11501.
+//	QUENCHFORGE_CODE_EMBED_MODEL — GGUF model for the *code-tuned* embedding
+//	                            slot. Empty = no code-embed slot; embed
+//	                            requests fall through to the regular embed
+//	                            slot. Routed by request-body model match in
+//	                            the gateway — clients (e.g. semantic-code
+//	                            search MCPs) get the code-tuned slot by
+//	                            asking for this model name; general-text
+//	                            clients are unaffected.
+//	QUENCHFORGE_CODE_EMBED_PORT — supervised code-embed-slot port. Default
+//	                            11506 (11503-11505 reserved for whisper/sd/bark).
 //	QUENCHFORGE_RERANK_MODEL — GGUF reranker model (BGE-reranker etc.).
 //	                            Empty = no rerank slot; /v1/rerank 503s.
 //	QUENCHFORGE_RERANK_PORT  — supervised rerank-slot port. Default 11502.
@@ -94,6 +104,19 @@ type Config struct {
 
 	// EmbedPort is where the supervised embed slot binds. Default 11501.
 	EmbedPort int
+
+	// CodeEmbedModel is the GGUF the *code-tuned* embedding slot loads.
+	// Empty means no code-embed slot is started; embed requests for any
+	// model name route to the regular embed slot. When set, the gateway
+	// dispatches embed requests whose `model` field equals CodeEmbedModel
+	// to this slot instead. Lets a single quenchforge process serve a
+	// general-text embedder (for KB / RAG) and a code-tuned embedder (for
+	// semantic-code-search MCPs) on the same gateway port.
+	CodeEmbedModel string
+
+	// CodeEmbedPort is where the supervised code-embed slot binds.
+	// Default 11506 — 11503-11505 are reserved for whisper/sd/bark.
+	CodeEmbedPort int
 
 	// RerankModel is the GGUF reranker model. Empty disables /v1/rerank.
 	RerankModel string
@@ -163,9 +186,11 @@ func Default() (Config, error) {
 		PIDDir:       filepath.Join(home, ".config", "quenchforge", "pids"),
 		DefaultModel: "qwen2.5:7b-instruct-q4_k_m",
 		ChatPort:     11500,
-		EmbedModel:   "", // opt-in
-		EmbedPort:    11501,
-		RerankModel:  "", // opt-in
+		EmbedModel:     "", // opt-in
+		EmbedPort:      11501,
+		CodeEmbedModel: "", // opt-in
+		CodeEmbedPort:  11506,
+		RerankModel:    "", // opt-in
 		RerankPort:   11502,
 		WhisperModel: "", // opt-in
 		WhisperPort:  11503,
@@ -197,6 +222,8 @@ func Load() (Config, error) {
 	cfg.ChatPort = envIntOr("QUENCHFORGE_CHAT_PORT", cfg.ChatPort)
 	cfg.EmbedModel = envOr("QUENCHFORGE_EMBED_MODEL", cfg.EmbedModel)
 	cfg.EmbedPort = envIntOr("QUENCHFORGE_EMBED_PORT", cfg.EmbedPort)
+	cfg.CodeEmbedModel = envOr("QUENCHFORGE_CODE_EMBED_MODEL", cfg.CodeEmbedModel)
+	cfg.CodeEmbedPort = envIntOr("QUENCHFORGE_CODE_EMBED_PORT", cfg.CodeEmbedPort)
 	cfg.RerankModel = envOr("QUENCHFORGE_RERANK_MODEL", cfg.RerankModel)
 	cfg.RerankPort = envIntOr("QUENCHFORGE_RERANK_PORT", cfg.RerankPort)
 	cfg.WhisperModel = envOr("QUENCHFORGE_WHISPER_MODEL", cfg.WhisperModel)
@@ -243,6 +270,7 @@ func (c Config) Validate() error {
 		name string
 		v    int
 	}{
+		{"CodeEmbedPort", c.CodeEmbedPort},
 		{"RerankPort", c.RerankPort},
 		{"WhisperPort", c.WhisperPort},
 		{"SDPort", c.SDPort},
@@ -254,12 +282,13 @@ func (c Config) Validate() error {
 	}
 	// No two slot ports can collide.
 	ports := map[string]int{
-		"ChatPort":    c.ChatPort,
-		"EmbedPort":   c.EmbedPort,
-		"RerankPort":  c.RerankPort,
-		"WhisperPort": c.WhisperPort,
-		"SDPort":      c.SDPort,
-		"BarkPort":    c.BarkPort,
+		"ChatPort":      c.ChatPort,
+		"EmbedPort":     c.EmbedPort,
+		"CodeEmbedPort": c.CodeEmbedPort,
+		"RerankPort":    c.RerankPort,
+		"WhisperPort":   c.WhisperPort,
+		"SDPort":        c.SDPort,
+		"BarkPort":      c.BarkPort,
 	}
 	seen := map[int]string{}
 	for name, p := range ports {

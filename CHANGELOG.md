@@ -8,6 +8,48 @@ patch bumps fix bugs or polish without behaviour change.
 
 ---
 
+## v0.5.0 — second embed slot + embed-batch fix (UNRELEASED)
+
+Feature release. Adds a dedicated **code-tuned embedding slot** that
+runs alongside the existing general-text embed slot in one quenchforge
+process, plus a long-standing batch-size bug fix that was blocking any
+embedding input over 512 tokens.
+
+- **New slot kind: `code-embed`.** Opt-in via `QUENCHFORGE_CODE_EMBED_MODEL`
+  (port: `QUENCHFORGE_CODE_EMBED_PORT`, default `11506`). Lets one
+  quenchforge process serve a general-text embedder (Nomic, Snowflake,
+  etc. — for KB / RAG workloads) alongside a code-tuned embedder
+  (CodeRankEmbed, jina-embeddings-v2-base-code, etc. — for
+  semantic-code-search MCPs like `contextplus`).
+- **Model-name dispatch.** The gateway peeks at the `model` field of
+  inbound `/api/embeddings`, `/api/embed`, and `/v1/embeddings`
+  requests. When it matches `Config.CodeEmbedModel` AND a `code-embed`
+  upstream is registered, the call routes to the code-embed slot;
+  otherwise it falls through to the regular embed slot (so callers that
+  don't know about the code slot keep working). Transparent to clients
+  — no URL change, no API change.
+- **Embed slots now pin `--batch-size` and `--ubatch-size` to
+  `MaxContext`.** llama-server's default `ubatch=512` rejected any
+  embedding input over 512 tokens with `input (N tokens) is too large
+  to process. increase the physical batch size`. Code-search MCPs send
+  chunks in the 600–2000 token range and tripped this every call. The
+  fix applies to both `embed` and `code-embed` slots; VRAM cost is
+  small for typical embed models (~138 MB nomic-embed at Q8, ~280 MB
+  CodeRankEmbed at Q8).
+- **`quenchforge doctor` now reports per-slot config.** New `slots:`
+  section shows model + port for each kind, with `(opt-in; port=N)`
+  for slots whose model env var is unset — so operators can verify
+  their config from a single command without `env | grep`.
+- **Tests:** new coverage for `buildSlotArgs` (embed batch override,
+  non-embed kinds unaffected), `resolveEmbedKind` dispatch
+  (model-match → code-embed, fallback → regular embed, unknown model
+  → regular embed), and config port-collision rules for the new port.
+
+Migration: existing operators see zero behaviour change. To opt into
+the new slot, set `QUENCHFORGE_CODE_EMBED_MODEL=<gguf-name>` in your
+`com.cerid.quenchforge.plist` (or wherever you launch quenchforge from)
+and `launchctl kickstart -k gui/$(id -u)/com.cerid.quenchforge`.
+
 ## v0.4.1 — docs + Homebrew tap auto-push (2026-05-14)
 
 Polish + supply-chain release. No behaviour change in the binary; the

@@ -28,12 +28,14 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -53,12 +55,19 @@ import (
 type SlotKind string
 
 const (
-	KindChat     SlotKind = "chat"
-	KindEmbed    SlotKind = "embed"
-	KindRerank   SlotKind = "rerank"
-	KindWhisper  SlotKind = "whisper"
-	KindImageGen SlotKind = "imagegen"
-	KindTTS      SlotKind = "tts"
+	KindChat SlotKind = "chat"
+	KindEmbed SlotKind = "embed"
+	// KindCodeEmbed is a *second* embedding slot dedicated to code-tuned
+	// models. Requests arriving at /api/embeddings or /v1/embeddings whose
+	// body specifies a `model` matching Config.CodeEmbedModel are dispatched
+	// here instead of KindEmbed. Lets one quenchforge process serve a
+	// general-text embedder (for KB / RAG) alongside a code-tuned embedder
+	// (for semantic-code-search MCPs) without forcing operators to choose.
+	KindCodeEmbed SlotKind = "code-embed"
+	KindRerank    SlotKind = "rerank"
+	KindWhisper   SlotKind = "whisper"
+	KindImageGen  SlotKind = "imagegen"
+	KindTTS       SlotKind = "tts"
 )
 
 // String implements fmt.Stringer.
@@ -158,7 +167,7 @@ func (g *Gateway) Start(ctx context.Context) error {
 	// pass-through.
 	mux.HandleFunc("/api/embeddings", g.handleOllamaEmbeddings())
 	mux.HandleFunc("/api/embed", g.handleOllamaEmbeddings())
-	mux.HandleFunc("/v1/embeddings", g.proxyHandler(KindEmbed, ""))
+	mux.HandleFunc("/v1/embeddings", g.handleOpenAIEmbeddings())
 	// rerank (OpenAI-style /v1/rerank; llama-server speaks its own /rerank
 	// when launched with --reranking; we route both to the same slot).
 	mux.HandleFunc("/v1/rerank", g.proxyHandler(KindRerank, "/rerank"))
@@ -242,7 +251,7 @@ func (g *Gateway) handleRoot(w http.ResponseWriter, r *http.Request) {
 	}
 	// Always include known kinds in the report so consumers can see which
 	// ones aren't configured.
-	for _, k := range []SlotKind{KindChat, KindEmbed, KindRerank, KindWhisper, KindImageGen, KindTTS} {
+	for _, k := range []SlotKind{KindChat, KindEmbed, KindCodeEmbed, KindRerank, KindWhisper, KindImageGen, KindTTS} {
 		if _, ok := slots[string(k)]; !ok {
 			slots[string(k)] = map[string]any{"configured": false}
 		}
@@ -322,6 +331,75 @@ func (g *Gateway) proxyHandler(kind SlotKind, rewriteTo string) http.HandlerFunc
 		}
 		entry.proxy.ServeHTTP(w, r)
 	}
+}
+
+// resolveEmbedKind picks the embed slot kind for an inbound request by
+// matching the request's `model` field against Config.CodeEmbedModel.
+//
+// - Empty CodeEmbedModel  → always KindEmbed (legacy single-slot behavior).
+// - model == CodeEmbedModel and a KindCodeEmbed upstream is registered →
+//   KindCodeEmbed.
+// - Anything else → KindEmbed.
+//
+// The fallback to KindEmbed is deliberate: if an operator typo'd the code
+// model name or the code-embed slot failed to register, callers still get
+// a working general-text response instead of a 503 they can't diagnose.
+func (g *Gateway) resolveEmbedKind(model string) SlotKind {
+	if g.cfg.CodeEmbedModel == "" || model == "" {
+		return KindEmbed
+	}
+	if model != g.cfg.CodeEmbedModel {
+		return KindEmbed
+	}
+	g.mu.RLock()
+	_, ok := g.upstreams[KindCodeEmbed]
+	g.mu.RUnlock()
+	if !ok {
+		return KindEmbed
+	}
+	return KindCodeEmbed
+}
+
+// handleOpenAIEmbeddings is the OpenAI-native /v1/embeddings entry point.
+// Peeks at the body's `model` field to dispatch between KindEmbed and
+// KindCodeEmbed, then reverse-proxies to the chosen upstream. Replaces the
+// static proxyHandler(KindEmbed, "") registration for this route so a
+// single quenchforge process can serve two embedders on the same gateway.
+func (g *Gateway) handleOpenAIEmbeddings() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		raw, err := readAllLimited(w, r)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest,
+				fmt.Sprintf("read request body: %v", err))
+			return
+		}
+		// Minimal probe — only `model` matters for routing; everything
+		// else passes through unchanged. We re-attach the body below.
+		var probe struct {
+			Model string `json:"model"`
+		}
+		_ = json.Unmarshal(raw, &probe) // tolerate empty/invalid bodies; let upstream reject
+		kind := g.resolveEmbedKind(probe.Model)
+		g.mu.RLock()
+		entry, ok := g.upstreams[kind]
+		g.mu.RUnlock()
+		if !ok || entry.proxy == nil {
+			writeJSONError(w, http.StatusServiceUnavailable,
+				fmt.Sprintf("no %s slot configured. Check `quenchforge doctor` for status.", kind))
+			return
+		}
+		// Re-attach the consumed body so the reverse-proxy can forward it.
+		r.Body = io.NopCloser(bytes.NewReader(raw))
+		r.ContentLength = int64(len(raw))
+		entry.proxy.ServeHTTP(w, r)
+	}
+}
+
+// readAllLimited reads the request body with the same MaxBytesReader cap
+// the Ollama-translation handlers use. Extracted so /v1/embeddings's body
+// peek shares the limit.
+func readAllLimited(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	return io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBodyBytes))
 }
 
 // handlePull is a deliberate stub. Ollama's /api/pull downloads a model

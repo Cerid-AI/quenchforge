@@ -135,6 +135,49 @@ func TestBuildSlotArgs_AMDEmbedRerankUnchanged(t *testing.T) {
 	}
 }
 
+func TestBuildSlotArgs_EmbedKindsGetBatchOverride(t *testing.T) {
+	// Embed-class slots must pin --batch-size and --ubatch-size to
+	// MaxContext so any input that fits the context fits one batch.
+	// Pre-2026-05 the embed slot kept llama-server's 512 ubatch default,
+	// and contextplus's per-file embeds (typically 600-2000 tokens)
+	// hard-failed with "input (N tokens) is too large to process".
+	cfg := config.Config{MaxContext: 8192}
+	info := hardware.Info{Profile: hardware.ProfileVegaPro}
+
+	for _, kind := range []gateway.SlotKind{gateway.KindEmbed, gateway.KindCodeEmbed} {
+		t.Run(string(kind), func(t *testing.T) {
+			spec := slotSpec{Kind: kind, Name: string(kind), Port: 11501}
+			args := buildSlotArgs(cfg, info, spec, "/tmp/model.gguf")
+
+			if !containsArgPair(args, "--batch-size", "8192") {
+				t.Errorf("%s slot missing --batch-size 8192: %v", kind, args)
+			}
+			if !containsArgPair(args, "--ubatch-size", "8192") {
+				t.Errorf("%s slot missing --ubatch-size 8192: %v", kind, args)
+			}
+		})
+	}
+}
+
+func TestBuildSlotArgs_NonEmbedKindsSkipBatchOverride(t *testing.T) {
+	// Chat / rerank / whisper slots don't need the embed batch override
+	// (they decode autoregressively or operate per-pair). Adding it
+	// would waste VRAM on the chat slot in particular.
+	cfg := config.Config{MaxContext: 8192}
+	info := hardware.Info{Profile: hardware.ProfileVegaPro}
+
+	for _, kind := range []gateway.SlotKind{gateway.KindChat, gateway.KindRerank} {
+		t.Run(string(kind), func(t *testing.T) {
+			spec := slotSpec{Kind: kind, Name: string(kind), Port: 11500}
+			args := buildSlotArgs(cfg, info, spec, "/tmp/model.gguf")
+
+			if containsArgPair(args, "--batch-size", "8192") {
+				t.Errorf("%s slot must not pass --batch-size 8192: %v", kind, args)
+			}
+		})
+	}
+}
+
 func TestBuildSlotArgs_AppleSiliconChatUnchanged(t *testing.T) {
 	// Apple Silicon and the unknown fallback must keep the upstream
 	// defaults — flash-attn=auto, cache-ram=8192, cache-prompt enabled.

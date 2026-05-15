@@ -322,17 +322,13 @@ func (g *Gateway) handleOllamaChat(generateMode bool) http.HandlerFunc {
 
 // handleOllamaEmbeddings translates /api/embeddings and /api/embed into
 // /v1/embeddings on the embed slot. Always non-streaming.
+//
+// Model-name dispatch: when the request body's `model` field matches
+// Config.CodeEmbedModel and a code-embed slot is registered, the call is
+// routed to KindCodeEmbed instead of KindEmbed. Lets one quenchforge
+// process serve a general-text and a code-tuned embedder side-by-side.
 func (g *Gateway) handleOllamaEmbeddings() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		g.mu.RLock()
-		entry, ok := g.upstreams[KindEmbed]
-		g.mu.RUnlock()
-		if !ok || entry.proxy == nil {
-			writeJSONError(w, http.StatusServiceUnavailable,
-				"no embed slot configured. Check `quenchforge doctor` for status.")
-			return
-		}
-
 		raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBodyBytes))
 		if err != nil {
 			writeJSONError(w, http.StatusBadRequest,
@@ -344,6 +340,16 @@ func (g *Gateway) handleOllamaEmbeddings() http.HandlerFunc {
 		if err := json.Unmarshal(raw, &req); err != nil {
 			writeJSONError(w, http.StatusBadRequest,
 				fmt.Sprintf("decode embed body: %v", err))
+			return
+		}
+
+		kind := g.resolveEmbedKind(req.Model)
+		g.mu.RLock()
+		entry, ok := g.upstreams[kind]
+		g.mu.RUnlock()
+		if !ok || entry.proxy == nil {
+			writeJSONError(w, http.StatusServiceUnavailable,
+				fmt.Sprintf("no %s slot configured. Check `quenchforge doctor` for status.", kind))
 			return
 		}
 

@@ -335,6 +335,68 @@ func TestSlotKindRouting(t *testing.T) {
 	}
 }
 
+// TestEmbedDispatchByModelName confirms the model-name routing rule:
+// requests whose body's `model` field matches Config.CodeEmbedModel land
+// on the KindCodeEmbed upstream; anything else lands on KindEmbed. Covers
+// both the Ollama-translated path (/api/embeddings, /api/embed) and the
+// OpenAI-native passthrough (/v1/embeddings).
+func TestEmbedDispatchByModelName(t *testing.T) {
+	var embedHits, codeEmbedHits int
+	embedUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		embedHits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.1]}],"model":"text-emb","usage":{}}`))
+	}))
+	defer embedUpstream.Close()
+	codeEmbedUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		codeEmbedHits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"object":"embedding","index":0,"embedding":[0.2]}],"model":"code-emb","usage":{}}`))
+	}))
+	defer codeEmbedUpstream.Close()
+
+	cfg := newTestConfig(t)
+	cfg.ListenAddr = pickListenAddr(t)
+	cfg.CodeEmbedModel = "code-emb" // arm dispatch
+	g := newRunningGateway(t, cfg)
+	if err := g.SetUpstream(KindEmbed, embedUpstream.URL); err != nil {
+		t.Fatalf("set embed: %v", err)
+	}
+	if err := g.SetUpstream(KindCodeEmbed, codeEmbedUpstream.URL); err != nil {
+		t.Fatalf("set code-embed: %v", err)
+	}
+
+	cases := []struct {
+		path, body         string
+		wantEmbed, wantCode int
+	}{
+		{"/api/embeddings", `{"model":"text-emb","prompt":"hi"}`, 1, 0},
+		{"/api/embeddings", `{"model":"code-emb","prompt":"def f(): pass"}`, 0, 1},
+		{"/api/embed", `{"model":"text-emb","input":"hi"}`, 1, 0},
+		{"/api/embed", `{"model":"code-emb","input":"def f(): pass"}`, 0, 1},
+		{"/v1/embeddings", `{"model":"text-emb","input":"hi"}`, 1, 0},
+		{"/v1/embeddings", `{"model":"code-emb","input":"def f(): pass"}`, 0, 1},
+		// Unknown model name falls through to the regular embed slot
+		// instead of 503-ing — keeps the legacy single-slot UX intact.
+		{"/v1/embeddings", `{"model":"unknown","input":"hi"}`, 1, 0},
+	}
+	for _, tc := range cases {
+		embedHits, codeEmbedHits = 0, 0
+		resp, err := http.Post("http://"+cfg.ListenAddr+tc.path,
+			"application/json", strings.NewReader(tc.body))
+		if err != nil {
+			t.Errorf("%s body=%q: %v", tc.path, tc.body, err)
+			continue
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if embedHits != tc.wantEmbed || codeEmbedHits != tc.wantCode {
+			t.Errorf("%s body=%q: embed=%d code=%d (want embed=%d code=%d)",
+				tc.path, tc.body, embedHits, codeEmbedHits, tc.wantEmbed, tc.wantCode)
+		}
+	}
+}
+
 // TestPullReturns501 — Quenchforge's MVP doesn't pull from a registry.
 func TestPullReturns501(t *testing.T) {
 	cfg := newTestConfig(t)

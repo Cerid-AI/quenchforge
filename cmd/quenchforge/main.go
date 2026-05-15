@@ -31,7 +31,7 @@ import (
 //
 // goreleaser handles this in CI. Local dev builds carry the zero value.
 var (
-	Version   = "0.4.1-dev"
+	Version   = "0.5.0-dev"
 	Commit    = "unknown"
 	BuildDate = "unknown"
 )
@@ -167,6 +167,22 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) error {
 	fmt.Fprintf(stdout, "  max context:   %d\n", cfg.MaxContext)
 	fmt.Fprintf(stdout, "  metal n_cb:    %d\n", cfg.MetalNCB)
 	fmt.Fprintf(stdout, "  telemetry:     %v\n", cfg.TelemetryEnabled)
+	fmt.Fprintln(stdout)
+
+	// Slot config — operators read this to verify their env vars took
+	// effect and to see at a glance which slots are configured to start.
+	// Order mirrors gateway.SlotKind. Each "(opt-in)" annotation reflects
+	// whether the slot starts unconditionally (chat) or only when its
+	// model env var is set.
+	fmt.Fprintln(stdout, "slots:")
+	fmt.Fprintf(stdout, "  chat:         model=%s port=%d\n", cfg.DefaultModel, cfg.ChatPort)
+	fmt.Fprintf(stdout, "  embed:        %s\n", slotLine(cfg.EmbedModel, cfg.EmbedPort))
+	fmt.Fprintf(stdout, "  code-embed:   %s   (routed by request model == cfg.CodeEmbedModel)\n",
+		slotLine(cfg.CodeEmbedModel, cfg.CodeEmbedPort))
+	fmt.Fprintf(stdout, "  rerank:       %s\n", slotLine(cfg.RerankModel, cfg.RerankPort))
+	fmt.Fprintf(stdout, "  whisper:      %s\n", slotLine(cfg.WhisperModel, cfg.WhisperPort))
+	fmt.Fprintf(stdout, "  imagegen (sd):%s\n", slotLine(cfg.SDModel, cfg.SDPort))
+	fmt.Fprintf(stdout, "  tts (bark):   %s\n", slotLine(cfg.BarkModel, cfg.BarkPort))
 	fmt.Fprintln(stdout)
 
 	// llama-server binary check
@@ -375,6 +391,34 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 					s.PID(), cfg.EmbedModel, cfg.EmbedPort)
 				_ = g.SetUpstream(gateway.KindEmbed,
 					fmt.Sprintf("http://127.0.0.1:%d", cfg.EmbedPort))
+			}
+		}
+
+		// Code-embed slot — opt-in via QUENCHFORGE_CODE_EMBED_MODEL.
+		// Sibling to the regular embed slot; the gateway dispatches
+		// /api/embeddings and /v1/embeddings requests here when the body's
+		// `model` field equals cfg.CodeEmbedModel. Lets one quenchforge
+		// process serve a general-text embedder (for KB / RAG) alongside
+		// a code-tuned embedder (for semantic-code-search MCPs).
+		if cfg.CodeEmbedModel != "" {
+			s, err := startSlot(ctx, cfg, hwInfo, slotSpec{
+				Kind:      gateway.KindCodeEmbed,
+				Name:      "code-embed",
+				Model:     cfg.CodeEmbedModel,
+				Port:      cfg.CodeEmbedPort,
+				ExtraArgs: []string{"--embedding", "--pooling", "cls"},
+			}, stderr)
+			if err != nil {
+				fmt.Fprintf(stderr,
+					"quenchforge: warning: code-embed slot not started: %v\n"+
+						"  Embed requests for %q will fall back to the regular embed slot.\n",
+					err, cfg.CodeEmbedModel)
+			} else {
+				slots[gateway.KindCodeEmbed] = s
+				fmt.Fprintf(stdout, "quenchforge: code-embed slot pid=%d model=%s port=%d\n",
+					s.PID(), cfg.CodeEmbedModel, cfg.CodeEmbedPort)
+				_ = g.SetUpstream(gateway.KindCodeEmbed,
+					fmt.Sprintf("http://127.0.0.1:%d", cfg.CodeEmbedPort))
 			}
 		}
 
@@ -598,6 +642,21 @@ func buildSlotArgs(cfg config.Config, hwInfo hardware.Info, spec slotSpec, model
 		"--ctx-size", fmt.Sprintf("%d", cfg.MaxContext),
 	}
 	args = append(args, spec.ExtraArgs...)
+
+	// Embed-class slots need --batch-size / --ubatch-size raised to match
+	// --ctx-size. llama-server's default ubatch is 512, which means any
+	// single embedding input over 512 tokens hard-fails with
+	// "input (N tokens) is too large to process. increase the physical
+	// batch size". Code-search MCPs (contextplus) routinely send chunks
+	// in the 600-2000 token range and pre-2026-05 trip this without
+	// recourse. Setting both to MaxContext lets any input that fits the
+	// context fit a single batch; VRAM cost is small for embed models.
+	if spec.Kind == gateway.KindEmbed || spec.Kind == gateway.KindCodeEmbed {
+		args = append(args,
+			"--batch-size", fmt.Sprintf("%d", cfg.MaxContext),
+			"--ubatch-size", fmt.Sprintf("%d", cfg.MaxContext),
+		)
+	}
 
 	if spec.Kind == gateway.KindChat && hwInfo.IsAMDDiscrete() {
 		args = append(args,
@@ -872,6 +931,16 @@ func resolveModelPath(modelsDir, name string) (string, error) {
 // lookPath is a thin wrapper so tests can monkey-patch the PATH search.
 var lookPath = func(name string) (string, error) {
 	return exec.LookPath(name)
+}
+
+// slotLine renders one slot's doctor row. When the slot's model is unset
+// the line says "(opt-in: set $QUENCHFORGE_*_MODEL to enable)" so an
+// operator can copy a known port and know exactly which env var to flip.
+func slotLine(model string, port int) string {
+	if model == "" {
+		return fmt.Sprintf("(opt-in; port=%d)", port)
+	}
+	return fmt.Sprintf("model=%s port=%d", model, port)
 }
 
 // redactPath replaces the user's home dir with "~" when --redacted is set.
