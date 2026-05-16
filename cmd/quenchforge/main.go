@@ -43,6 +43,7 @@ Usage:
 
 Commands:
     serve              Start the HTTP gateway (Ollama + OpenAI compatible).
+    install            Drop the LaunchAgent plist into ~/Library/LaunchAgents/ (macOS).
     doctor             Print a hardware-and-environment report for bug triage.
     pull               Download a GGUF model from HuggingFace.
     list               List GGUFs cached locally.
@@ -80,6 +81,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return cmdDoctor(args[1:], stdout, stderr)
 	case "serve":
 		return cmdServe(args[1:], stdout, stderr)
+	case "install":
+		return cmdInstall(args[1:], stdout, stderr)
 	case "migrate-from-ollama":
 		return cmdMigrate(args[1:], stdout, stderr)
 	case "pull":

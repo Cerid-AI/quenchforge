@@ -8,6 +8,41 @@ patch bumps fix bugs or polish without behaviour change.
 
 ---
 
+## v0.5.1 — `quenchforge install` LaunchAgent helper (UNRELEASED)
+
+Operator-experience polish. Adds the missing CLI step in the "auto-drop
+the LaunchAgent plist" story that was tracked as the last remaining
+v0.95.x cerid-ai follow-on. From-source operators no longer need to
+`cp packaging/macos/...` + edit `REPLACE_ME` by hand.
+
+- **New subcommand: `quenchforge install`.** Copies the LaunchAgent
+  plist into `~/Library/LaunchAgents/com.cerid.quenchforge.plist` with
+  the operator's `$USER` substituted into the `REPLACE_ME` placeholders
+  automatically. Refuses to overwrite an existing plist unless `--force`
+  is passed. Prints the `launchctl bootstrap` next-step instructions
+  on success.
+- **Single canonical plist source.** The plist now lives at
+  `cmd/quenchforge/plist_template.plist` and is embedded into the
+  binary via `//go:embed`. The previous duplicate at
+  `packaging/macos/com.cerid.quenchforge.plist` is removed — operators
+  who want to inspect the template can read the canonical file or run
+  `quenchforge install --print-path` to confirm the target path.
+- **`packaging/macos/README.md` rewritten** to lead with the install
+  command + show the `--force`, `--skip-user-substitution`, and
+  `--print-path` flags.
+
+Flags:
+
+- `--force` overwrites an existing plist (default: refuse with a
+  helpful uninstall hint).
+- `--skip-user-substitution` leaves `REPLACE_ME` untouched (for
+  operators who want to edit by hand).
+- `--print-path` prints the resolved target and exits without writing
+  (useful for `make` integrations).
+
+Non-macOS platforms get a clear "macOS only" error instead of a
+silent no-op.
+
 ## v0.5.0 — second embed slot + embed-batch fix (UNRELEASED)
 
 Feature release. Adds a dedicated **code-tuned embedding slot** that

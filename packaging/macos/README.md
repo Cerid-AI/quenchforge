@@ -1,42 +1,38 @@
 # macOS distribution helpers
 
-Templates for operators installing Quenchforge outside Homebrew.
+## Auto-install (recommended)
 
-## Files
+`quenchforge install` drops the LaunchAgent plist into
+`~/Library/LaunchAgents/` with your `$USER` substituted into the
+`REPLACE_ME` placeholders automatically.
 
-- `com.cerid.quenchforge.plist` — LaunchAgent template for from-source
-  installs. Replace `REPLACE_ME` with your username and the
-  `QUENCHFORGE_*_MODEL` values with GGUF filenames under
-  `~/.quenchforge/models/`. Install with:
+```bash
+quenchforge install
+# Inspect (model env vars may need editing for your GGUFs):
+less ~/Library/LaunchAgents/com.cerid.quenchforge.plist
+# Bootstrap the daemon:
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cerid.quenchforge.plist
+# Verify:
+curl http://127.0.0.1:11434/
+```
 
-  ```bash
-  cp packaging/macos/com.cerid.quenchforge.plist \
-      ~/Library/LaunchAgents/com.cerid.quenchforge.plist
-  # then edit the file:
-  #   - replace REPLACE_ME with $USER (3 occurrences)
-  #   - point the three model env vars at GGUFs you have locally
-  launchctl load -w ~/Library/LaunchAgents/com.cerid.quenchforge.plist
-  ```
+Flags:
 
-  Verify:
+- `--force` — overwrite an existing plist (default: refuse if one exists)
+- `--skip-user-substitution` — leave `REPLACE_ME` unchanged so you can
+  edit by hand
+- `--print-path` — print the target path and exit (no write)
 
-  ```bash
-  launchctl list | grep com.cerid.quenchforge   # expect non-empty
-  curl http://127.0.0.1:11434/health             # {"status":"ok"}
-  ```
+The canonical source for the embedded template is
+[`cmd/quenchforge/plist_template.plist`](../../cmd/quenchforge/plist_template.plist) —
+inspect it before installing if you want to see what will land.
 
-  Tail logs:
+To uninstall:
 
-  ```bash
-  tail -F ~/Library/Logs/quenchforge/quenchforge.out.log
-  ```
-
-  Uninstall:
-
-  ```bash
-  launchctl unload ~/Library/LaunchAgents/com.cerid.quenchforge.plist
-  rm ~/Library/LaunchAgents/com.cerid.quenchforge.plist
-  ```
+```bash
+launchctl bootout gui/$(id -u)/com.cerid.quenchforge
+rm ~/Library/LaunchAgents/com.cerid.quenchforge.plist
+```
 
 ## Why not use `brew services`?
 
@@ -49,9 +45,9 @@ brew services stop quenchforge
 brew services restart quenchforge
 ```
 
-This template is for the from-source case where the Homebrew formula's
-release artifact isn't published yet (development builds, custom
-patches, etc.).
+`quenchforge install` is for the from-source case where the Homebrew
+formula's release artifact isn't published yet (development builds,
+custom patches, machines without Homebrew).
 
 ## Hardware-aware slot args (informational)
 
@@ -75,3 +71,10 @@ across all slots.
 
 These flags are applied automatically by the supervisor — no manual
 override needed.
+
+## Logs
+
+```bash
+tail -F ~/Library/Logs/quenchforge/quenchforge.out.log
+tail -F ~/Library/Logs/quenchforge/quenchforge.err.log
+```
