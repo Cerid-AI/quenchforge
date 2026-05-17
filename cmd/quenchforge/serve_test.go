@@ -107,10 +107,16 @@ func TestBuildSlotArgs_AMDChatGetsCorrectnessFlags(t *testing.T) {
 	}
 }
 
-func TestBuildSlotArgs_AMDEmbedRerankUnchanged(t *testing.T) {
+func TestBuildSlotArgs_AMDEmbedRerankDontGetChatFlags(t *testing.T) {
 	// Embed and rerank slots don't autoregressively decode and don't
-	// touch the prompt-cache state-save path; they must NOT get the
-	// chat-slot correctness flags even on AMD discrete.
+	// touch the LCP-prompt-save path; the chat-slot safety flags
+	// (--flash-attn off, --cache-ram 0, --no-cache-prompt) are
+	// chat-specific. They must NOT appear on AMD embed/rerank.
+	//
+	// Note: the AMD embed/rerank slots DO get their own protections via
+	// the tuning module (auto-respawn + the env-tunable ubatch/N_CB
+	// knobs documented in `patches/README.md` section 3). Those are
+	// orthogonal to the chat-slot flag set this test asserts against.
 	cfg := config.Config{MaxContext: 8192}
 	info := hardware.Info{Profile: hardware.ProfileVegaPro}
 
@@ -132,6 +138,81 @@ func TestBuildSlotArgs_AMDEmbedRerankUnchanged(t *testing.T) {
 					kind, args)
 			}
 		})
+	}
+}
+
+func TestBuildSlotArgs_DelegatesToTuningModule(t *testing.T) {
+	// Regression guard: buildSlotArgs must surface every flag the
+	// tuning module asks for. Failing this test means a new
+	// SlotTuning field was added without the corresponding wire-up
+	// in main.go (or vice-versa).
+	cfg := config.Config{
+		MaxContext:      8192,
+		EmbedUbatchSize: 1024, // exercises the embed override
+	}
+	info := hardware.Info{Profile: hardware.ProfileVegaPro}
+	spec := slotSpec{Kind: gateway.KindEmbed, Name: "embed", Port: 11501}
+	args := buildSlotArgs(cfg, info, spec, "/tmp/embed.gguf")
+
+	// The env-override value (1024) must show up, not MaxContext (8192).
+	if !containsArgPair(args, "--ubatch-size", "1024") {
+		t.Errorf("--ubatch-size 1024 from env override not in args: %v", args)
+	}
+	if !containsArgPair(args, "--batch-size", "1024") {
+		t.Errorf("--batch-size 1024 from env override not in args: %v", args)
+	}
+	// MaxContext-based default must NOT appear when the override is set.
+	if containsArgPair(args, "--ubatch-size", "8192") {
+		t.Errorf("env override should have replaced MaxContext default: %v", args)
+	}
+}
+
+func TestSlotEnv_NoOverridesInheritsGlobal(t *testing.T) {
+	cfg := config.Config{MetalNCB: 2}
+	info := hardware.Info{Profile: hardware.ProfileVegaPro}
+	env := slotEnv(cfg, info, gateway.KindEmbed)
+	want := "GGML_METAL_N_CB=2"
+	found := false
+	for _, e := range env {
+		if e == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected env to contain %q, got %v", want, env)
+	}
+}
+
+func TestSlotEnv_EmbedMetalNCBOverride(t *testing.T) {
+	cfg := config.Config{MetalNCB: 2, EmbedMetalNCB: 1}
+	info := hardware.Info{Profile: hardware.ProfileVegaPro}
+	env := slotEnv(cfg, info, gateway.KindEmbed)
+	want := "GGML_METAL_N_CB=1"
+	found := false
+	for _, e := range env {
+		if e == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("EmbedMetalNCB override must produce %q, got %v", want, env)
+	}
+}
+
+func TestSlotEnv_ChatKeepsGlobalNCB(t *testing.T) {
+	// Embed-specific override must not bleed into chat.
+	cfg := config.Config{MetalNCB: 2, EmbedMetalNCB: 1}
+	info := hardware.Info{Profile: hardware.ProfileVegaPro}
+	env := slotEnv(cfg, info, gateway.KindChat)
+	want := "GGML_METAL_N_CB=2"
+	found := false
+	for _, e := range env {
+		if e == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Chat slot should use global MetalNCB %q, got %v", want, env)
 	}
 }
 

@@ -391,14 +391,26 @@ func (g *Gateway) handleOllamaEmbeddings() http.HandlerFunc {
 		upReq.Header.Set("Content-Type", "application/json")
 		upReq.Header.Set("Accept", "application/json")
 
+		// Pre-emptive back-off if AUTO_BACKOFF is on and the slot is at
+		// critical latency. Same contract as the OpenAI-shaped path.
+		if g.shouldBackoff(kind) {
+			w.Header().Set("Retry-After", "2")
+			writeJSONError(w, http.StatusServiceUnavailable,
+				fmt.Sprintf("%s slot is at critical latency — back off (Retry-After: 2s)", kind))
+			return
+		}
+
+		started := time.Now()
 		resp, err := translateHTTPClient.Do(upReq)
 		if err != nil {
+			g.latency.Record(kind, time.Since(started), true)
 			writeJSONError(w, http.StatusBadGateway,
 				fmt.Sprintf("embed upstream %s unreachable: %v",
 					entry.url.Host, err))
 			return
 		}
 		defer resp.Body.Close()
+		g.latency.Record(kind, time.Since(started), resp.StatusCode >= 500)
 
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))

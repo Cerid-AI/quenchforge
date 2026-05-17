@@ -138,7 +138,12 @@ All settings have sensible defaults. Selected env vars:
 | `QUENCHFORGE_LOG_DIR` | `~/Library/Logs/quenchforge` | Per-slot log files land here |
 | `QUENCHFORGE_PID_DIR` | `~/.config/quenchforge/pids` | Orphan-reaper pidfile dir |
 | `QUENCHFORGE_MAX_CONTEXT` | `8192` | `--ctx-size` passed to every slot |
-| `QUENCHFORGE_METAL_N_CB` | `2` | Metal command-buffer count (`GGML_METAL_N_CB`) |
+| `QUENCHFORGE_METAL_N_CB` | `2` | Metal command-buffer count (`GGML_METAL_N_CB`); global default — per-slot overrides below |
+| `QUENCHFORGE_EMBED_UBATCH_SIZE` | `0` (inherit MaxContext) | Per-call `--batch-size` / `--ubatch-size` for embed and code-embed slots. On AMD discrete, lowering this (e.g. `1024`) caps Metal staging-buffer pressure and prevents the family-B sustained-load SIGABRT documented in `patches/README.md` section 3. |
+| `QUENCHFORGE_EMBED_METAL_N_CB` | `0` (inherit `METAL_N_CB`) | Per-slot `GGML_METAL_N_CB` for embed and code-embed. Set to `1` on AMD discrete to serialise Metal command-buffer submission. |
+| `QUENCHFORGE_RERANK_BATCH_SIZE` | `0` (llama.cpp's 512-token default) | Rerank slot `--batch-size` and `--ubatch-size`. Raise this when the reranker takes (query, doc) pairs longer than 510 tokens (e.g. `bge-reranker-v2-m3` with ≥ 1k-token chunks). |
+| `QUENCHFORGE_RERANK_METAL_N_CB` | `0` (inherit `METAL_N_CB`) | Per-slot `GGML_METAL_N_CB` for the rerank slot. |
+| `QUENCHFORGE_AUTO_BACKOFF` | `false` | Opt-in: gateway returns `HTTP 503` + `Retry-After: 2` on `/v1/embeddings` etc. when the slot's rolling p99 latency is `critical` (5× p50 or error rate > 5%). Default off — observability via `/health` works without this flag. |
 | `QUENCHFORGE_ADVERTISE_MDNS` | `false` | Bonjour advertisement (`_quenchforge._tcp.local.`) |
 
 **Operator overrides** (gated by the v0.3.3 hardware-aware defaults):

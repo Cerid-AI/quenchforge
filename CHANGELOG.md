@@ -8,6 +8,62 @@ patch bumps fix bugs or polish without behaviour change.
 
 ---
 
+## v0.6.0 — sustained-load Metal hardening for embed/rerank slots (UNRELEASED)
+
+Reliability release. Closes the third Metal-on-AMD failure class
+(graph-compute buffer-corruption under sustained embed/rerank load —
+the family-B SIGABRT documented in `patches/README.md` section 3). No
+behaviour change at defaults; operators on AMD-discrete hardware
+running batch eval / bulk-ingest workloads can opt into the new
+tuning knobs and observability surface. Follow-up PR will bench
+per-profile defaults on the `[amd-gpu]` runner and flip them in
+`internal/tuning/`.
+
+- **New package `internal/tuning/`** is the sole owner of `(profile,
+  slot-kind) → SlotTuning` mapping. Replaces inline `if spec.Kind ==
+  ... && IsAMDDiscrete()` blocks in `buildSlotArgs`. Pure function,
+  table-driven tests cover every (profile, kind) pair.
+- **Four new env knobs** (defaults preserve current behaviour):
+  `QUENCHFORGE_EMBED_UBATCH_SIZE`, `QUENCHFORGE_EMBED_METAL_N_CB`,
+  `QUENCHFORGE_RERANK_BATCH_SIZE`, `QUENCHFORGE_RERANK_METAL_N_CB`.
+  Set the embed knobs to smaller values (e.g. ubatch=1024, N_CB=1)
+  on AMD discrete to bound the per-call Metal staging allocations
+  and let the staging-buffer pool drain between calls.
+- **Auto-respawn on SIGABRT.** AMD-discrete embed and rerank slots
+  set `supervisor.RestartPolicy = PolicyExpBackoff`. The supervisor
+  waits 2s / 4s / 8s after a non-zero exit and retries `Start`,
+  capped at 3 attempts per 60-second window. Default `PolicyNone`
+  preserves prior behaviour for other slot kinds.
+- **Gateway latency tracker + `/health`.** The gateway records every
+  upstream call's duration + error-flag in a rolling 60-second
+  per-kind window. `/health` returns a JSON snapshot with `p50_ms`,
+  `p99_ms`, `error_rate`, and a `status` field (`ok` | `degraded` |
+  `critical`). Consumers can poll this to back off before the
+  family-B SIGABRT.
+- **Opt-in auto-backoff.** Setting `QUENCHFORGE_AUTO_BACKOFF=true`
+  turns a `critical` snapshot into an automatic `HTTP 503` +
+  `Retry-After: 2` on the upstream proxy paths. Default off —
+  observability without behaviour change.
+- **New binary `cmd/quenchforge-bench`.** Subcommand
+  `sustained-embed --gateway <url> --model <name> --duration 10m`
+  POST-loops `/v1/embeddings` and reports per-30s progress + final
+  p50/p99 + crash-time. Exits 1 on slot crash, 2 on degraded but
+  not crashed, 0 on clean completion. Used as the harness for the
+  follow-up Vega II default-tuning PR.
+- **Per-slot `GGML_METAL_N_CB` env injection.** `startSlot` previously
+  passed a single global `MetalNCB` to every slot's env. It now
+  consults `tuning.KernelParams` per slot so an operator can set
+  `EmbedMetalNCB=1` without affecting the chat slot.
+- **Tests:** `internal/tuning/tuning_test.go`,
+  `internal/gateway/latency_test.go`,
+  `cmd/quenchforge-bench/sustained_embed_test.go`, plus three new
+  cases in `cmd/quenchforge/serve_test.go`. `go test ./...` green.
+- **Documentation:** new section 3 in `patches/README.md` documents
+  the staging-buffer-pool mechanism + supervisor mitigations.
+  Operators on cerid workloads see the gotcha update in `CLAUDE.md`.
+
+---
+
 ## v0.5.1 — `quenchforge install` LaunchAgent helper (UNRELEASED)
 
 Operator-experience polish. Adds the missing CLI step in the "auto-drop

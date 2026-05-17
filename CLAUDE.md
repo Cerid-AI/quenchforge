@@ -133,6 +133,38 @@ user-identifiable. The consent screen copy lives in
 [`internal/obs/consent.go`](internal/obs/consent.go) (TBD); changes to
 that copy require a maintainer review.
 
+## Operational gotchas
+
+1. **Chat-slot AMD safety args do not apply to embed/rerank slots.**
+   Sections 1 + 2 of `patches/README.md` document `--flash-attn off`,
+   `--cache-ram 0`, and `--no-cache-prompt` as chat-specific (they
+   address LCP-prompt-save and FA-CPU-fallback bugs absent on
+   embed/rerank). Adding them to embed/rerank would force a sub-optimal
+   attention path with no safety win.
+
+2. **Embed/rerank slots have their own AMD safety surface — section 3.**
+   The family-B graph-compute buffer-corruption crash hits embed/rerank
+   under sustained batch load (eval suites, bulk KB ingest, sustained
+   MCP retrieval). Operators on AMD discrete running those workloads
+   should set:
+
+   ```
+   QUENCHFORGE_EMBED_UBATCH_SIZE=1024   # or smaller — caps Metal staging-buffer pressure
+   QUENCHFORGE_EMBED_METAL_N_CB=1       # serialise command-buffer submission
+   QUENCHFORGE_AUTO_BACKOFF=true        # auto-503 before SIGABRT
+   ```
+
+   Defaults preserve historical behaviour. `quenchforge-bench
+   sustained-embed` is the empirical tuning tool; the follow-up PR
+   will land bench-driven Vega-II defaults.
+
+3. **`internal/tuning/` is the sole owner of per-(profile, kind) slot
+   tuning.** `cmd/quenchforge/main.go::buildSlotArgs` and `slotEnv`
+   delegate to it. Adding a new per-profile or per-slot-kind flag
+   means updating `tuning.go::KernelParams` + `tuning_test.go`, not
+   adding a new `if hwInfo.IsAMDDiscrete() && spec.Kind == ...` block
+   to `buildSlotArgs`.
+
 ## Anti-patterns to reject
 
 - Adding a Linux build tag for any non-test file
