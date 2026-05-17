@@ -8,6 +8,61 @@ patch bumps fix bugs or polish without behaviour change.
 
 ---
 
+## v0.6.2 — bench-validated AMD defaults baked into tuning module (UNRELEASED)
+
+Reliability release. Bakes the bench-validated conservative tuning
+into `internal/tuning/tuning.go` so AMD-discrete operators no longer
+need to set `QUENCHFORGE_EMBED_UBATCH_SIZE=1024` +
+`QUENCHFORGE_EMBED_METAL_N_CB=1` in the launchd plist by hand. The
+env knobs still exist and still override the baked defaults; this is
+purely about the out-of-box behaviour on AMD-discrete hardware.
+
+- **Vega II tested-stable embed defaults** (apply to all AMD-discrete
+  profiles): `ubatch=1024`, `MetalNCB=1`. Empirical evidence from
+  the cerid LongMemEval canonical run 2026-05-17: ubatch=1024 sustained
+  ~0.5 req/s for >70 min with a single auto-respawned family-B crash;
+  ubatch=8192 (v0.5.x default) crashed within ~80 calls / ~2 min.
+- **AMD-discrete rerank defaults**: `MetalNCB=1` (mirrors embed).
+  RerankBatchSize stays operator-opt-in because the right value is
+  workload-specific.
+- **Other AMD profiles** (W6800X, RDNA1, RDNA2) inherit Vega II's
+  values until benched independently — fail-conservative matches the
+  CLAUDE.md "fail to slower-but-stable" policy.
+- **Apple Silicon / CPU / iGPU / unknown** profiles unchanged
+  (family-B is structurally impossible on shared-memory hosts;
+  ubatch=MaxContext=8192 stays the default).
+- **Operator env overrides win** as before — set
+  `QUENCHFORGE_EMBED_UBATCH_SIZE` to override.
+
+Tests: `internal/tuning/tuning_test.go::TestKernelParams_EmbedDefaultsByProfile`
+asserts the per-profile defaults. `cmd/quenchforge/serve_test.go`
+gets two new cases (AMD vs Apple) and one renamed env test
+(`TestSlotEnv_AMDEmbedGetsBakedDefault`).
+
+No new env knobs, no plist changes required to upgrade. Operators
+who'd manually set the conservative env in their plist can leave it
+in place (no-op now) or remove it (defaults take over).
+
+---
+
+## v0.6.1 — chat slot AutoRespawn on AMD discrete (UNRELEASED)
+
+Caught during cerid v0.96.0 GPU validation: PR-3 wired AutoRespawn
+for embed/rerank on AMD but missed chat. cerid's LongMemEval
+extraction workload hammered the chat slot through ~30 successful
+completions; task 143 hit `GGML_ASSERT(buf_src)` at `set_tensor` and
+SIGABRT'd. The process stayed dead because `RestartPolicy` was
+`PolicyNone`; subsequent /api/chat returned 502 until manual
+`launchctl kickstart`.
+
+The fix is one line in `chatParams`: `AutoRespawn: true` on AMD
+profiles. Same supervisor-side restart-on-SIGABRT logic the
+embed/rerank slots already use; 2s/4s/8s exp backoff, cap 3 per
+60s. Tuning-test `TestKernelParams_ChatAMDGetsCorrectnessFlags`
+updated to assert `AutoRespawn=true` on AMD chat.
+
+---
+
 ## v0.6.0 — sustained-load Metal hardening for embed/rerank slots (UNRELEASED)
 
 Reliability release. Closes the third Metal-on-AMD failure class

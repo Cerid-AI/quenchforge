@@ -167,9 +167,11 @@ func TestBuildSlotArgs_DelegatesToTuningModule(t *testing.T) {
 	}
 }
 
-func TestSlotEnv_NoOverridesInheritsGlobal(t *testing.T) {
+func TestSlotEnv_AppleInheritsGlobal(t *testing.T) {
+	// Apple Silicon doesn't get the AMD-specific tuning, so the embed
+	// slot's GGML_METAL_N_CB falls through to the global default.
 	cfg := config.Config{MetalNCB: 2}
-	info := hardware.Info{Profile: hardware.ProfileVegaPro}
+	info := hardware.Info{Profile: hardware.ProfileAppleSilicon}
 	env := slotEnv(cfg, info, gateway.KindEmbed)
 	want := "GGML_METAL_N_CB=2"
 	found := false
@@ -179,7 +181,27 @@ func TestSlotEnv_NoOverridesInheritsGlobal(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Errorf("expected env to contain %q, got %v", want, env)
+		t.Errorf("expected Apple Silicon embed env to contain %q, got %v",
+			want, env)
+	}
+}
+
+func TestSlotEnv_AMDEmbedGetsBakedDefault(t *testing.T) {
+	// AMD discrete embed slot inherits the v0.6.2 bench-validated
+	// conservative default (MetalNCB=1) baked into tuning.go — even
+	// when the global cfg.MetalNCB is the larger v0.5.x default.
+	cfg := config.Config{MetalNCB: 2}
+	info := hardware.Info{Profile: hardware.ProfileVegaPro}
+	env := slotEnv(cfg, info, gateway.KindEmbed)
+	want := "GGML_METAL_N_CB=1"
+	found := false
+	for _, e := range env {
+		if e == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("AMD embed env should bake MetalNCB=1, got %v", env)
 	}
 }
 
@@ -217,24 +239,37 @@ func TestSlotEnv_ChatKeepsGlobalNCB(t *testing.T) {
 }
 
 func TestBuildSlotArgs_EmbedKindsGetBatchOverride(t *testing.T) {
-	// Embed-class slots must pin --batch-size and --ubatch-size to
-	// MaxContext so any input that fits the context fits one batch.
-	// Pre-2026-05 the embed slot kept llama-server's 512 ubatch default,
-	// and contextplus's per-file embeds (typically 600-2000 tokens)
-	// hard-failed with "input (N tokens) is too large to process".
+	// Embed-class slots on AMD discrete get the v0.6.2 bench-validated
+	// conservative ubatch (1024) — the v0.5.0 contextplus 512-token-limit
+	// fix still applies, but at a smaller per-call batch that survives
+	// sustained Vega II load without family-B SIGABRT. Apple Silicon and
+	// other non-AMD profiles get the full MaxContext (8192) batch
+	// because they can't hit family-B.
 	cfg := config.Config{MaxContext: 8192}
-	info := hardware.Info{Profile: hardware.ProfileVegaPro}
+	infoAMD := hardware.Info{Profile: hardware.ProfileVegaPro}
+	infoApple := hardware.Info{Profile: hardware.ProfileAppleSilicon}
 
 	for _, kind := range []gateway.SlotKind{gateway.KindEmbed, gateway.KindCodeEmbed} {
-		t.Run(string(kind), func(t *testing.T) {
+		t.Run("amd-"+string(kind), func(t *testing.T) {
 			spec := slotSpec{Kind: kind, Name: string(kind), Port: 11501}
-			args := buildSlotArgs(cfg, info, spec, "/tmp/model.gguf")
+			args := buildSlotArgs(cfg, infoAMD, spec, "/tmp/model.gguf")
+
+			if !containsArgPair(args, "--batch-size", "1024") {
+				t.Errorf("AMD %s slot missing --batch-size 1024: %v", kind, args)
+			}
+			if !containsArgPair(args, "--ubatch-size", "1024") {
+				t.Errorf("AMD %s slot missing --ubatch-size 1024: %v", kind, args)
+			}
+		})
+		t.Run("apple-"+string(kind), func(t *testing.T) {
+			spec := slotSpec{Kind: kind, Name: string(kind), Port: 11501}
+			args := buildSlotArgs(cfg, infoApple, spec, "/tmp/model.gguf")
 
 			if !containsArgPair(args, "--batch-size", "8192") {
-				t.Errorf("%s slot missing --batch-size 8192: %v", kind, args)
+				t.Errorf("Apple %s slot missing --batch-size 8192: %v", kind, args)
 			}
 			if !containsArgPair(args, "--ubatch-size", "8192") {
-				t.Errorf("%s slot missing --ubatch-size 8192: %v", kind, args)
+				t.Errorf("Apple %s slot missing --ubatch-size 8192: %v", kind, args)
 			}
 		})
 	}

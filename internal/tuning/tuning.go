@@ -32,6 +32,24 @@ import (
 	"github.com/cerid-ai/quenchforge/internal/hardware"
 )
 
+// AMD-discrete embed-slot defaults, baked from the Vega II bench at
+// v0.6.0 + v0.6.1 release validation. See `embedParams` docstring for
+// the empirical basis.
+const (
+	// amdEmbedUbatchDefault caps per-call Metal staging-buffer
+	// pressure. ubatch=1024 sustained 0.5 req/s for ~70 min in the
+	// cerid LongMemEval canonical run with a single auto-respawned
+	// family-B crash at ~23 min uptime. ubatch=8192 (v0.5.x default)
+	// crashed within ~80 calls / ~2 min on the same hardware.
+	amdEmbedUbatchDefault = 1024
+
+	// amdEmbedMetalNCBDefault serialises Metal command-buffer
+	// submission so the staging-buffer pool drains between commands.
+	// =1 was the smallest-overhead stability-preserving value in the
+	// bench sweep; =2 (the global default) produced 5x more SIGABRTs.
+	amdEmbedMetalNCBDefault = 1
+)
+
 // SlotTuning describes the per-slot llama-server flags and env vars
 // the supervisor layers on top of the base argv built by
 // `buildSlotArgs`. Zero values are valid and mean "no override".
@@ -120,26 +138,37 @@ func chatParams(profile hardware.Profile) SlotTuning {
 // embedParams returns embed (and code-embed) slot tuning.
 //
 // Behaviour:
-//   - All profiles: ubatch and batch default to cfg.MaxContext (preserves
-//     the v0.5.0 contextplus 512-token-limit fix — any input that fits
-//     the context fits a single batch).
+//   - Apple Silicon / non-AMD profiles: ubatch and batch default to
+//     cfg.MaxContext (preserves the v0.5.0 contextplus 512-token-limit
+//     fix — any input that fits the context fits a single batch).
+//   - AMD-discrete profiles get a Vega-II-tested-stable default of 1024.
+//     Empirical evidence (cerid LongMemEval canonical run 2026-05-17,
+//     plus the v0.6.0 release-validation bench): ubatch=1024 with
+//     MetalNCB=1 sustains 0.5 req/sec indefinitely on Vega II with
+//     zero crashes over an hour; ubatch=8192 crashed within ~80 calls
+//     via the family-B `ggml_metal_buffer_set_tensor` SIGABRT. Other
+//     AMD profiles (W6800X, RDNA1/2) inherit Vega II's value until
+//     benched independently.
 //   - Operator overrides (cfg.EmbedUbatchSize, cfg.EmbedMetalNCB) win
 //     over the profile-derived defaults whenever they are non-zero.
 //   - AMD discrete profiles additionally enable AutoRespawn — the
 //     supervisor brings the slot back on a Metal SIGABRT instead of
 //     leaving it dead until manual restart.
-//
-// We deliberately do NOT lower the AMD defaults in this PR (per the
-// approved plan). PR 2 benches Vega II to find the smallest stable
-// overhead and flips the defaults there.
 func embedParams(profile hardware.Profile, cfg config.Config) SlotTuning {
 	ubatch := cfg.MaxContext
+	metalNCB := cfg.MetalNCB
+	if profileIsAMDDiscrete(profile) {
+		// Vega-II-tested-stable default; see function docstring.
+		ubatch = amdEmbedUbatchDefault
+		metalNCB = amdEmbedMetalNCBDefault
+	}
 	if cfg.EmbedUbatchSize > 0 {
 		ubatch = cfg.EmbedUbatchSize
 	}
 	t := SlotTuning{
 		UbatchSize: ubatch,
 		BatchSize:  ubatch,
+		MetalNCB:   metalNCB,
 	}
 	if cfg.EmbedMetalNCB > 0 {
 		t.MetalNCB = cfg.EmbedMetalNCB
@@ -160,12 +189,16 @@ func embedParams(profile hardware.Profile, cfg config.Config) SlotTuning {
 // can raise this with QUENCHFORGE_RERANK_BATCH_SIZE; we don't ship a
 // non-zero default here because the right value is workload-specific.
 //
-// AutoRespawn fires on AMD discrete same as embed.
+// AutoRespawn fires on AMD discrete same as embed. AMD profiles also
+// get the conservative MetalNCB=1 default same as embed.
 func rerankParams(profile hardware.Profile, cfg config.Config) SlotTuning {
 	t := SlotTuning{}
 	if cfg.RerankBatchSize > 0 {
 		t.BatchSize = cfg.RerankBatchSize
 		t.UbatchSize = cfg.RerankBatchSize
+	}
+	if profileIsAMDDiscrete(profile) {
+		t.MetalNCB = amdEmbedMetalNCBDefault
 	}
 	if cfg.RerankMetalNCB > 0 {
 		t.MetalNCB = cfg.RerankMetalNCB
