@@ -96,7 +96,13 @@ func KernelParams(profile hardware.Profile, kind gateway.SlotKind, cfg config.Co
 }
 
 // chatParams returns the chat-slot tuning. AMD-discrete profiles get
-// the existing three safety flags; everything else gets defaults.
+// the existing three safety flags AND AutoRespawn — sustained chat
+// inference (cerid LongMemEval extraction, agentic tool-use loops)
+// produces family-B `GGML_ASSERT(buf_src)` crashes the same as embed
+// under sustained load. v0.6.0 missed wiring AutoRespawn here on the
+// theory that chat is naturally bursty; cerid eval workloads broke
+// that assumption (chat.log entry at 2026-05-16T23:14 — task 143
+// hit GGML_ASSERT at `set_tensor` after ~30 successful chat calls).
 func chatParams(profile hardware.Profile) SlotTuning {
 	if !profileIsAMDDiscrete(profile) {
 		return SlotTuning{}
@@ -107,6 +113,7 @@ func chatParams(profile hardware.Profile) SlotTuning {
 			"--cache-ram", "0",
 			"--no-cache-prompt",
 		},
+		AutoRespawn: true,
 	}
 }
 
