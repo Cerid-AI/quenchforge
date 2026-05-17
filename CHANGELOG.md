@@ -8,6 +8,66 @@ patch bumps fix bugs or polish without behaviour change.
 
 ---
 
+## v0.7.1 — partial kernel-level BERT correctness: norm + softmax fallbacks (2026-05-17)
+
+First foundation slice toward the v0.8.0 kernel-level fix. Ships
+fallback Metal kernels for `kernel_norm_fuse_impl` (LayerNorm) and
+`kernel_soft_max{,_4}` (bidirectional-attention softmax) that use
+fixed-size function-local threadgroup memory + pure threadgroup
+tree-reductions instead of `simd_sum`/`simd_max`+dynamic
+threadgroup memory parameters.
+
+The dispatchers in `ggml-metal-device.cpp` now select the `_fb`
+suffix variant when `has_simdgroup_reduction == false`. Apple
+Silicon is unaffected — the existing kernels stay in use there.
+
+### Measured impact (Vega II, 2026-05-17)
+
+| Test | Pre-patch | Post-patch | CPU route |
+|---|---|---|---|
+| identical "hello" same batch | cos_sim 0.07 | cos_sim **0.29** | cos_sim 1.0000 |
+| two separate "hello" calls | cos_sim 0.15 | cos_sim **0.06** | cos_sim 1.0000 |
+| chat (llama3.1-8b seeded) | deterministic | deterministic | n/a (GPU) |
+
+**Not sufficient alone.** The `simd_sum` bug also affects matmul
+kernels (`kernel_mul_mv_t_t`, `kernel_mul_mv_q*_f32`, etc.) that
+compute attention's QKV projections and the FFN forward pass. The
+norm/softmax fallback is correct but the broken matmuls keep the
+overall BERT output non-deterministic.
+
+**Production stays on the v0.7.0 CPU route** (`--gpu-layers 0` for
+AMD-discrete embed/rerank in `internal/tuning/tuning.go`). The
+fallback dispatch path is wired but only takes effect when an
+operator overrides the CPU-route flag.
+
+### Files
+
+- `patches/llama.cpp/0003-...` (in-tree edit to ggml-metal.metal +
+  ggml-metal-device.cpp): adds `kernel_norm_fuse_fb_impl` (with all
+  6 host-name template instantiations for f32/f32_4 × fuse=1,2,3)
+  and `kernel_soft_max{,_4}_fb` (4 host names: f16/f32 × scalar/_4)
+- `docs/METAL_AMD_BERT_CORRECTNESS.md`: "v0.7.1 partial fix"
+  section with the measurement table, plus an expanded "v0.8.0
+  full scope" section enumerating the matmul + argmax kernels
+  that also need fallbacks (40+ `simd_sum` hits across the file)
+
+### v0.8.0 scope
+
+The grep across `ggml-metal.metal` shows 40+ `simd_*` hits across:
+- `kernel_mul_mv_*` (quantized mat-vec): q1/q4/q5/q8/iq* — ~10
+  variants per quantization scheme
+- `kernel_mul_mv_t_t`, `kernel_mul_mv_t_t_4` — fp16/fp32 mat-vec
+  (the dominant path for nomic-embed-text-v1.5)
+- `kernel_mul_mv_ext_*` — extended quantized paths
+- `kernel_argmax_*` — argmax with bool / arg pair
+- `kernel_rms_norm_fuse_impl` — RMSNorm (works for chat, may
+  surface a regression under sustained throughput; deferred)
+
+Estimated full BERT Metal correctness: ~5-10 days of focused
+shader work + bench-validation.
+
+---
+
 ## v0.7.0 — Metal-on-AMD BERT correctness: route embed + rerank to CPU (2026-05-17)
 
 **Closes the fourth Metal-on-AMD failure class** — BERT-family

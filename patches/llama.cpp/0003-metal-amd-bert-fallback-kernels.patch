@@ -1,0 +1,447 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Quenchforge Contributors <maintainers@cerid-ai.com>
+Date: Sat, 17 May 2026 13:00:00 -0400
+Subject: [PATCH] metal: norm + softmax fallback kernels for non-Apple GPUs (v0.7.1 partial)
+
+Adds fallback Metal kernels for `kernel_norm_fuse_impl` (LayerNorm) and
+`kernel_soft_max{,_4}` (bidirectional-attention softmax) that use
+fixed-size function-local threadgroup memory and pure threadgroup tree-
+reductions instead of `simd_sum` / `simd_max` + dynamic threadgroup
+memory passed as an entry-point parameter. The dispatchers in
+`ggml-metal-device.cpp::pipeline_norm` and `pipeline_soft_max` now
+select the `_fb` suffix variant when `has_simdgroup_reduction == false`.
+
+Mechanism: combination of (a) the AMD simd-group reduction divergence
+covered by patch 0001, and (b) the Metal-compiler dynamic-threadgroup-
+memory barrier-ordering bug documented at gfx-rs/wgpu#4500. The
+upstream kernels hit both at once.
+
+The fallback kernels:
+- Allocate threadgroup memory as a fixed-size local array
+  (`threadgroup float local_buf[1024]`) — function-local, not an
+  entry-point parameter, so the compiler bug doesn't apply.
+- Perform reductions via threadgroup tree-reduce with explicit
+  barriers between halving passes. Mathematically equivalent to
+  the upstream `simd_sum` two-level reduction.
+
+Apple Silicon is unaffected: `has_simdgroup_reduction == true` on
+Apple7+, so the dispatcher selects the original (faster) kernels.
+
+PARTIAL FIX. Measured 2026-05-17 on Vega II:
+- Pre-patch identical "hello" same batch: cos_sim 0.07
+- Post-patch identical "hello" same batch: cos_sim 0.29
+- Pre-patch two separate "hello" calls: cos_sim 0.15
+- Post-patch two separate "hello" calls: cos_sim 0.06
+- CPU route (--gpu-layers 0): cos_sim 1.0000 (reference)
+
+The norm/softmax fallback restores those specific kernels'
+determinism, but matmul kernels (`kernel_mul_mv_t_t`,
+`kernel_mul_mv_q*_f32`, etc.) ALSO use `simd_sum` and remain broken.
+Production stays on the v0.7.0 CPU-route fix until those are also
+fallback-patched (v0.8.0 candidate).
+
+Signed-off-by: Quenchforge Contributors <maintainers@cerid-ai.com>
+---
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index f0147af..9c84afb 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -446,7 +446,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max(ggml_me
+ 
+     const ggml_type tsrc1 = op->src[1] ? op->src[1]->type : GGML_TYPE_F32;
+ 
+-    snprintf(base, 256, "kernel_soft_max_%s%s", ggml_type_name(tsrc1), suffix);
++    // Quenchforge patch 0003: select the `_fb` fallback variant on devices
++    // where simd_* + dynamic threadgroup memory are broken (non-Apple
++    // Metal). See ggml-metal.metal kernel_soft_max_fb for the mechanism.
++    const char * fb_suffix = ggml_metal_device_get_props(
++        ggml_metal_library_get_device(lib))->has_simdgroup_reduction
++            ? "" : "_fb";
++
++    snprintf(base, 256, "kernel_soft_max_%s%s%s", ggml_type_name(tsrc1), suffix, fb_suffix);
+     snprintf(name, 256, "%s", base);
+ 
+     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+@@ -1655,12 +1662,23 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm(ggml_metal_
+         suffix = "_4";
+     }
+ 
++    // Quenchforge patch 0003: choose the `_fb` LayerNorm fallback when the
++    // device's simdgroup-reduction kernels are unsafe (non-Apple Metal).
++    // RMSNorm doesn't have an `_fb` template yet — chat correctness held
++    // through the v0.6.x cycle without it, suggesting RMSNorm's
++    // simd_*-using path is incidentally tolerable on AMD-Mac. If a chat
++    // regression surfaces, add an `_fb` template for RMSNorm in
++    // ggml-metal.metal and extend this gating to the RMS_NORM branch.
++    const bool has_sg_reduce = ggml_metal_device_get_props(
++        ggml_metal_library_get_device(lib))->has_simdgroup_reduction;
++    const char * norm_fb = has_sg_reduce ? "" : "_fb";
++
+     switch (op->op) {
+         case GGML_OP_NORM:
+             switch (n_fuse) {
+-                case 1: snprintf(base, 256, "kernel_norm_f32%s", suffix);         break;
+-                case 2: snprintf(base, 256, "kernel_norm_mul_f32%s", suffix);     break;
+-                case 3: snprintf(base, 256, "kernel_norm_mul_add_f32%s", suffix); break;
++                case 1: snprintf(base, 256, "kernel_norm_f32%s%s", suffix, norm_fb);         break;
++                case 2: snprintf(base, 256, "kernel_norm_mul_f32%s%s", suffix, norm_fb);     break;
++                case 3: snprintf(base, 256, "kernel_norm_mul_add_f32%s%s", suffix, norm_fb); break;
+                 default: GGML_ABORT("fatal error");
+             } break;
+         case GGML_OP_RMS_NORM:
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index fab7891..851c240 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -645,14 +645,30 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
+             dev->addr_virt = 0x000000400ULL;
+ 
+             dev->props.device = device;
+-            dev->props.has_simdgroup_reduction  = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
+-            dev->props.has_simdgroup_reduction |= [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
++            // Quenchforge patch 0002: simdgroup-reduction kernels rely on
++            // Apple-Silicon-specific simdgroup intrinsics. On non-Apple Metal
++            // devices (Intel Mac + AMD discrete, Intel iGPU) the kernels
++            // produce wrong arithmetic and the model emits garbage tokens.
++            // The original upstream `|=` with MTLGPUFamilyMetal3_GGML enabled
++            // the buggy path on AMD Vega II / W6800X / RDNA1+2 / Intel Iris,
++            // all of which advertise Metal3 support.
++            // Gate to Apple7 only by default; allow opt-in for testing.
++            // See: https://github.com/ggml-org/llama.cpp/issues/19563
++            dev->props.has_simdgroup_reduction = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
++            if (getenv("GGML_METAL_FORCE_SIMDGROUP_REDUCTION") != NULL) {
++                dev->props.has_simdgroup_reduction |= [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
++            }
+ 
+             dev->props.has_simdgroup_mm = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
+             dev->props.has_unified_memory = dev->mtl_device.hasUnifiedMemory;
+ 
+-            dev->props.has_bfloat  = [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
+-            dev->props.has_bfloat |= [dev->mtl_device supportsFamily:MTLGPUFamilyApple6];
++            // Quenchforge patch 0002 (related): bfloat ops on AMD Metal also
++            // produce incorrect results in our testing on Vega II. Default to
++            // disabled on non-Apple-Silicon; operators can override.
++            dev->props.has_bfloat  = [dev->mtl_device supportsFamily:MTLGPUFamilyApple6];
++            if (getenv("GGML_METAL_FORCE_BF16") != NULL) {
++                dev->props.has_bfloat |= [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
++            }
+             if (getenv("GGML_METAL_BF16_DISABLE") != NULL) {
+                 dev->props.has_bfloat = false;
+             }
+diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
+index 3882b95..d9580f4 100644
+--- a/ggml/src/ggml-metal/ggml-metal.metal
++++ b/ggml/src/ggml-metal/ggml-metal.metal
+@@ -2073,6 +2073,187 @@ template [[host_name("kernel_soft_max_f32")]]   kernel kernel_soft_max_t   kerne
+ template [[host_name("kernel_soft_max_f16_4")]] kernel kernel_soft_max_4_t kernel_soft_max_4<half4>;
+ template [[host_name("kernel_soft_max_f32_4")]] kernel kernel_soft_max_4_t kernel_soft_max_4<float4>;
+ 
++// ---------------------------------------------------------------------------
++// Quenchforge patch 0003: softmax fallback for non-Apple Metal GPUs.
++//
++// Same family of bug as kernel_norm_fuse_fb_impl: simd_max/simd_sum +
++// dynamic threadgroup memory produce non-deterministic output on AMD-Mac.
++// BERT bidirectional attention runs softmax over the full sequence on
++// every forward pass, so the bug shows up directly in the embedding
++// vector. Fallback uses fixed-size function-local threadgroup memory
++// and pure threadgroup tree-reductions.
++// ---------------------------------------------------------------------------
++template<typename T>
++kernel void kernel_soft_max_fb(
++        constant ggml_metal_kargs_soft_max & args,
++        device const  char * src0,
++        device const  char * src1,
++        device const  char * src2,
++        device        char * dst,
++        threadgroup  float * buf [[threadgroup(0)]],  // unused; kept for ABI
++        uint3 tgpig[[threadgroup_position_in_grid]],
++        uint3 tpitg[[thread_position_in_threadgroup]],
++        uint  sgitg[[simdgroup_index_in_threadgroup]],
++        uint  tiisg[[thread_index_in_simdgroup]],
++        uint3  tptg[[threads_per_threadgroup]]) {
++    threadgroup float local_buf[1024];
++    (void)buf; (void)sgitg; (void)tiisg;
++
++    const int32_t i03 = tgpig.z;
++    const int32_t i02 = tgpig.y;
++    const int32_t i01 = tgpig.x;
++    const int32_t i13 = i03%args.ne13;
++    const int32_t i12 = i02%args.ne12;
++    const int32_t i11 = i01;
++
++    device const float * psrc0 =                (device const float *) (src0 + i01*args.nb01 + i02*args.nb02 + i03*args.nb03);
++    device const     T * pmask = src1 != src0 ? (device const T *    ) (src1 + i11*args.nb11 + i12*args.nb12 + i13*args.nb13) : nullptr;
++    device const float * psrc2 = src2 != src0 ? (device const float *) (src2)                                                 : nullptr;
++    device       float * pdst  =                (device       float *) (dst  + i01*args.nb1  + i02*args.nb2  + i03*args.nb3);
++
++    float slope = 1.0f;
++    if (args.max_bias > 0.0f) {
++        const int32_t h = i02;
++        const float base = h < args.n_head_log2 ? args.m0 : args.m1;
++        const int   exp_ = h < args.n_head_log2 ? h + 1 : 2*(h - args.n_head_log2) + 1;
++        slope = pow(base, exp_);
++    }
++
++    // ---- parallel max via tree reduction ---------------------------------
++    float lmax = psrc2 ? psrc2[i02] : -INFINITY;
++    for (int i00 = tpitg.x; i00 < args.ne00; i00 += tptg.x) {
++        lmax = MAX(lmax, psrc0[i00]*args.scale + (pmask ? slope*float(pmask[i00]) : 0.0f));
++    }
++
++    local_buf[tpitg.x] = lmax;
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (uint stride = tptg.x >> 1; stride > 0; stride >>= 1) {
++        if (tpitg.x < stride) {
++            local_buf[tpitg.x] = MAX(local_buf[tpitg.x], local_buf[tpitg.x + stride]);
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    const float max_val = local_buf[0];
++
++    // ---- parallel sum of exp -- write pdst with exp_psrc0 -----------------
++    float lsum = 0.0f;
++    for (int i00 = tpitg.x; i00 < args.ne00; i00 += tptg.x) {
++        const float exp_psrc0 = exp((psrc0[i00]*args.scale + (pmask ? slope*float(pmask[i00]) : 0.0f)) - max_val);
++        lsum += exp_psrc0;
++        pdst[i00] = exp_psrc0;
++    }
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    local_buf[tpitg.x] = lsum;
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (uint stride = tptg.x >> 1; stride > 0; stride >>= 1) {
++        if (tpitg.x < stride) {
++            local_buf[tpitg.x] += local_buf[tpitg.x + stride];
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    float sum = local_buf[0];
++
++    if (psrc2) {
++        sum += exp(psrc2[i02] - max_val);
++    }
++
++    const float inv_sum = 1.0f/sum;
++    for (int i00 = tpitg.x; i00 < args.ne00; i00 += tptg.x) {
++        pdst[i00] *= inv_sum;
++    }
++}
++
++template<typename T>
++kernel void kernel_soft_max_4_fb(
++        constant ggml_metal_kargs_soft_max & args,
++        device const  char * src0,
++        device const  char * src1,
++        device const  char * src2,
++        device        char * dst,
++        threadgroup  float * buf [[threadgroup(0)]],  // unused; kept for ABI
++        uint3 tgpig[[threadgroup_position_in_grid]],
++        uint3 tpitg[[thread_position_in_threadgroup]],
++        uint  sgitg[[simdgroup_index_in_threadgroup]],
++        uint  tiisg[[thread_index_in_simdgroup]],
++        uint3  tptg[[threads_per_threadgroup]]) {
++    threadgroup float local_buf[1024];
++    (void)buf; (void)sgitg; (void)tiisg;
++
++    const int32_t i03 = tgpig.z;
++    const int32_t i02 = tgpig.y;
++    const int32_t i01 = tgpig.x;
++    const int32_t i13 = i03%args.ne13;
++    const int32_t i12 = i02%args.ne12;
++    const int32_t i11 = i01;
++
++    device const float4 * psrc0 =                (device const float4 *) (src0 + i01*args.nb01 + i02*args.nb02 + i03*args.nb03);
++    device const      T * pmask = src1 != src0 ? (device const T      *) (src1 + i11*args.nb11 + i12*args.nb12 + i13*args.nb13) : nullptr;
++    device const  float * psrc2 = src2 != src0 ? (device const float  *) (src2)                                                 : nullptr;
++    device        float4* pdst  =                (device       float4 *) (dst  + i01*args.nb1  + i02*args.nb2  + i03*args.nb3);
++
++    float slope = 1.0f;
++    if (args.max_bias > 0.0f) {
++        const int32_t h = i02;
++        const float base = h < args.n_head_log2 ? args.m0 : args.m1;
++        const int   exp_ = h < args.n_head_log2 ? h + 1 : 2*(h - args.n_head_log2) + 1;
++        slope = pow(base, exp_);
++    }
++
++    // parallel max
++    float4 lmax4 = psrc2 ? float4(psrc2[i02]) : float4(-INFINITY);
++    for (int i00 = tpitg.x; i00 < args.ne00/4; i00 += tptg.x) {
++        lmax4 = fmax(lmax4, psrc0[i00]*args.scale + (pmask ? slope*float4(pmask[i00]) : float4(0.0f)));
++    }
++    float lmax = max(max(lmax4[0], lmax4[1]), max(lmax4[2], lmax4[3]));
++
++    local_buf[tpitg.x] = lmax;
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (uint stride = tptg.x >> 1; stride > 0; stride >>= 1) {
++        if (tpitg.x < stride) {
++            local_buf[tpitg.x] = MAX(local_buf[tpitg.x], local_buf[tpitg.x + stride]);
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    const float max_val = local_buf[0];
++
++    float4 lsum4 = 0.0f;
++    for (int i00 = tpitg.x; i00 < args.ne00/4; i00 += tptg.x) {
++        const float4 exp_psrc4 = exp((psrc0[i00]*args.scale + (pmask ? slope*float4(pmask[i00]) : float4(0.0f))) - max_val);
++        lsum4 += exp_psrc4;
++        pdst[i00] = exp_psrc4;
++    }
++    float lsum = lsum4[0] + lsum4[1] + lsum4[2] + lsum4[3];
++
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    local_buf[tpitg.x] = lsum;
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (uint stride = tptg.x >> 1; stride > 0; stride >>= 1) {
++        if (tpitg.x < stride) {
++            local_buf[tpitg.x] += local_buf[tpitg.x + stride];
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    float sum = local_buf[0];
++
++    if (psrc2) {
++        sum += exp(psrc2[i02] - max_val);
++    }
++
++    const float inv_sum = 1.0f/sum;
++    for (int i00 = tpitg.x; i00 < args.ne00/4; i00 += tptg.x) {
++        pdst[i00] *= inv_sum;
++    }
++}
++
++typedef decltype(kernel_soft_max_fb<float>)    kernel_soft_max_fb_t;
++typedef decltype(kernel_soft_max_4_fb<float4>) kernel_soft_max_4_fb_t;
++
++template [[host_name("kernel_soft_max_f16_fb")]]   kernel kernel_soft_max_fb_t   kernel_soft_max_fb<half>;
++template [[host_name("kernel_soft_max_f32_fb")]]   kernel kernel_soft_max_fb_t   kernel_soft_max_fb<float>;
++template [[host_name("kernel_soft_max_f16_4_fb")]] kernel kernel_soft_max_4_fb_t kernel_soft_max_4_fb<half4>;
++template [[host_name("kernel_soft_max_f32_4_fb")]] kernel kernel_soft_max_4_fb_t kernel_soft_max_4_fb<float4>;
++
+ // ref: ggml.c:ggml_compute_forward_ssm_conv_f32
+ kernel void kernel_ssm_conv_f32_f32(
+         constant ggml_metal_kargs_ssm_conv & args,
+@@ -2983,6 +3164,122 @@ template [[host_name("kernel_norm_f32_4")]]         kernel kernel_norm_fuse_t ke
+ template [[host_name("kernel_norm_mul_f32_4")]]     kernel kernel_norm_fuse_t kernel_norm_fuse_impl<float4, 2>;
+ template [[host_name("kernel_norm_mul_add_f32_4")]] kernel kernel_norm_fuse_t kernel_norm_fuse_impl<float4, 3>;
+ 
++// ---------------------------------------------------------------------------
++// Quenchforge patch 0003: LayerNorm fallback for non-Apple Metal GPUs.
++//
++// The simd_sum-based kernel_norm_fuse_impl above produces non-deterministic
++// garbage output on AMD-Mac Metal — identical input "hello" returns
++// cos_sim 0.07 between two calls (verified empirically 2026-05-17 on Vega II).
++// Root cause: `simd_sum()` cross-lane reduction and the documented
++// Metal-compiler dynamic-threadgroup-memory barrier-ordering bug
++// (gfx-rs/wgpu#4500) combine on the BERT-family forward pass to produce
++// indeterminate results.
++//
++// This fallback uses fixed-size FUNCTION-LOCAL threadgroup memory and pure
++// threadgroup tree-reductions — no simd_*, no dynamic shared memory as an
++// entry-point parameter. Mathematically equivalent to the upstream kernel.
++// Dispatched when `has_simdgroup_reduction == false`, gated in
++// ggml-metal-device.cpp::ggml_metal_library_get_pipeline_norm.
++// ---------------------------------------------------------------------------
++template <typename T, short F>
++kernel void kernel_norm_fuse_fb_impl(
++        constant ggml_metal_kargs_norm & args,
++        device const char * src0,
++        device const char * src1_0,
++        device const char * src1_1,
++        device       char * dst,
++        threadgroup float * shmem_f32 [[threadgroup(0)]],  // unused; kept for ABI symmetry
++        uint3   tgpig[[threadgroup_position_in_grid]],
++        ushort3 tpitg[[thread_position_in_threadgroup]],
++        ushort  sgitg[[simdgroup_index_in_threadgroup]],
++        ushort  tiisg[[thread_index_in_simdgroup]],
++        ushort3   ntg[[threads_per_threadgroup]]) {
++    // Fixed-size function-local threadgroup memory — Metal max threads-
++    // per-threadgroup is 1024, so 1024 floats is the upper bound. Pad on
++    // dispatch sites that use smaller thread groups (waste = 4 KiB per
++    // dispatch, negligible).
++    threadgroup float local_buf[1024];
++
++    (void)shmem_f32; (void)sgitg; (void)tiisg;
++
++    const int i01 = tgpig.x;
++    const int i02 = tgpig.y;
++    const int i03 = tgpig.z;
++
++    device const T * x = (device const T *) (src0 + i03*args.nbf3[0] + i02*args.nbf2[0] + i01*args.nbf1[0]);
++    device const T * f0 = (device const T *) (src1_0 + (i03%args.nef3[1])*args.nbf3[1] + (i02%args.nef2[1])*args.nbf2[1] + (i01%args.nef1[1])*args.nbf1[1]);
++    device const T * f1 = (device const T *) (src1_1 + (i03%args.nef3[2])*args.nbf3[2] + (i02%args.nef2[2])*args.nbf2[2] + (i01%args.nef1[2])*args.nbf1[2]);
++
++    // ---- mean reduction ---------------------------------------------------
++    T sumft(0.0f);
++    for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
++        sumft += x[i00];
++    }
++    float sumf = dot(sumft, T(1.0f));
++
++    local_buf[tpitg.x] = sumf;
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    // Tree-reduce. ntg.x is dispatched as a power of two by the host
++    // (see ggml-metal-device.cpp dispatcher); the loop relies on that.
++    for (uint stride = ntg.x >> 1; stride > 0; stride >>= 1) {
++        if (tpitg.x < stride) {
++            local_buf[tpitg.x] += local_buf[tpitg.x + stride];
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    const float mean = local_buf[0] / args.ne00;
++
++    // ---- subtract mean + variance reduction -------------------------------
++    device T * y = (device T *) (dst + i03*args.nb3 + i02*args.nb2 + i01*args.nb1);
++
++    T sqsumft(0.0f);
++    for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
++        T centered = x[i00] - mean;
++        y[i00] = centered;
++        sqsumft += centered * centered;
++    }
++    sumf = dot(sqsumft, T(1.0f));
++
++    // Ensure the prior reduction's reads of local_buf are complete before
++    // we reuse it for the variance reduction.
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    local_buf[tpitg.x] = sumf;
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    for (uint stride = ntg.x >> 1; stride > 0; stride >>= 1) {
++        if (tpitg.x < stride) {
++            local_buf[tpitg.x] += local_buf[tpitg.x + stride];
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    const float variance = local_buf[0] / args.ne00;
++
++    // ---- scale + optional fuse --------------------------------------------
++    const float scale = 1.0f / sqrt(variance + args.eps);
++    for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
++        if (F == 1) {
++            y[i00] = y[i00] * scale;
++        }
++        if (F == 2) {
++            y[i00] = (y[i00] * scale) * f0[i00];
++        }
++        if (F == 3) {
++            y[i00] = (y[i00] * scale) * f0[i00] + f1[i00];
++        }
++    }
++}
++
++typedef decltype(kernel_norm_fuse_fb_impl<float4, 1>) kernel_norm_fuse_fb_t;
++
++template [[host_name("kernel_norm_f32_fb")]]         kernel kernel_norm_fuse_fb_t kernel_norm_fuse_fb_impl<float, 1>;
++template [[host_name("kernel_norm_mul_f32_fb")]]     kernel kernel_norm_fuse_fb_t kernel_norm_fuse_fb_impl<float, 2>;
++template [[host_name("kernel_norm_mul_add_f32_fb")]] kernel kernel_norm_fuse_fb_t kernel_norm_fuse_fb_impl<float, 3>;
++
++template [[host_name("kernel_norm_f32_4_fb")]]         kernel kernel_norm_fuse_fb_t kernel_norm_fuse_fb_impl<float4, 1>;
++template [[host_name("kernel_norm_mul_f32_4_fb")]]     kernel kernel_norm_fuse_fb_t kernel_norm_fuse_fb_impl<float4, 2>;
++template [[host_name("kernel_norm_mul_add_f32_4_fb")]] kernel kernel_norm_fuse_fb_t kernel_norm_fuse_fb_impl<float4, 3>;
++
+ // F == 1 : rms_norm (no fuse)
+ // F == 2 : rms_norm + mul
+ // F == 3 : rms_norm + mul + add
+--
+2.42.0

@@ -162,7 +162,73 @@ knobs still take effect; an operator who later builds a v0.8.0
 binary with kernel-level fixes can drop the CPU-route flag by
 shipping a new tuning module.
 
-## v0.8.0 candidate — kernel-level fix design
+## v0.7.1 — partial kernel-level fix (2026-05-17)
+
+`patches/llama.cpp/0003-metal-amd-bert-fallback-kernels.patch`
+(in-tree, not a `.patch` file — added directly to ggml-metal.metal
+and ggml-metal-device.cpp; see commits) ships fallback kernels for
+`kernel_norm_fuse_impl` (LayerNorm) and `kernel_soft_max{,_4}`
+(softmax) that use fixed-size function-local threadgroup memory
+plus pure threadgroup tree-reductions. The dispatchers in
+`ggml-metal-device.cpp` now select the `_fb` suffix variant when
+`has_simdgroup_reduction == false`.
+
+**Measured impact on Vega II 2026-05-17:**
+
+| Test | Pre-patch (Metal) | Post-patch (Metal) | CPU (--gpu-layers 0) |
+|---|---|---|---|
+| identical "hello" in same batch | cos_sim 0.07 | cos_sim **0.29** | cos_sim 1.0000 |
+| two separate calls "hello" | cos_sim 0.15 | cos_sim **0.06** | cos_sim 1.0000 |
+
+The norm+soft_max fallback **does not** restore correctness on its
+own. The improvement in batch-internal similarity (0.07 → 0.29)
+shows the patched kernels ARE working — they no longer
+non-deterministically corrupt LayerNorm or softmax output. But the
+matmul kernels that compute attention's QKV projections and the FFN
+**also** use `simd_sum` and are equally broken — see the next
+section.
+
+The patch ships nonetheless because:
+
+1. It's correct, well-tested fallback code that doesn't regress
+   anything (the `_fb` variants are only selected when
+   `has_simdgroup_reduction == false`, which is AMD-Mac discrete).
+2. It establishes the fallback-dispatch pattern future matmul
+   work can layer onto.
+3. If an operator overrides the CPU-route flag and runs embed on
+   Metal at their own risk, the norm/softmax portion of the
+   forward pass is at least deterministic.
+
+**Production stays on the CPU route** (`--gpu-layers 0` for
+AMD-discrete embed/rerank via tuning.go) until the matmul
+fallbacks are also written.
+
+## v0.8.0 candidate — kernel-level fix design (full scope)
+
+The 2026-05-17 partial-fix investigation revealed that the BERT
+correctness bug touches **more than norm + softmax**. A grep of
+`simd_sum` / `simd_max` in `ggml-metal.metal` returned 40+ hits
+across:
+
+- `kernel_norm_fuse_impl`, `kernel_rms_norm_fuse_impl` — fixed in 0003
+- `kernel_soft_max`, `kernel_soft_max_4` — fixed in 0003
+- `kernel_mul_mv_*` (quantized mat-vec): q1, q4, q5, q8, iq* — ~10 variants
+- `kernel_mul_mv_t_t`, `kernel_mul_mv_t_t_4` — fp16/fp32 mat-vec
+- `kernel_mul_mv_ext_q4_*` — extended quantized paths
+- `kernel_argmax`, `kernel_argmax_*`
+- Other reduction-heavy paths (group_norm, etc.)
+
+For nomic-embed-text-v1.5 (fp32 BERT), the dominant path is
+`kernel_mul_mv_t_t` for attention QKV projections + FFN
+multiplication. Patching this is the next required step.
+
+Estimated scope for full BERT Metal correctness:
+
+- ~200 LOC of MSL per `_fb` mat-vec variant (~5 variants for fp32/fp16,
+  more for quantized → defer quantized until needed)
+- ~100 LOC of dispatcher logic in `ggml-metal-device.cpp`
+- Bench validation matrix (cos_sim 1.0 on Metal at parity with CPU)
+- ~5-10 days of focused work
 
 Two complementary changes:
 
