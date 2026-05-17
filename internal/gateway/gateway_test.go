@@ -367,7 +367,7 @@ func TestEmbedDispatchByModelName(t *testing.T) {
 	}
 
 	cases := []struct {
-		path, body         string
+		path, body          string
 		wantEmbed, wantCode int
 	}{
 		{"/api/embeddings", `{"model":"text-emb","prompt":"hi"}`, 1, 0},

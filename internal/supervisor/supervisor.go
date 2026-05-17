@@ -94,7 +94,7 @@ type Slot struct {
 	logFile     *os.File
 	pidPath     string
 	started     time.Time
-	respawnMu   sync.Mutex // serialises respawn attempts
+	respawnMu   sync.Mutex  // serialises respawn attempts
 	respawnHist []time.Time // crash timestamps within last 60s
 }
 

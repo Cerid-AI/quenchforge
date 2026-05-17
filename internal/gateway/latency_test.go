@@ -168,12 +168,12 @@ func TestClassify_TableDriven(t *testing.T) {
 	// Decouple threshold semantics from latency-sample plumbing so the
 	// thresholds are individually verifiable.
 	cases := []struct {
-		name   string
-		n      int
-		p50    float64
-		p99    float64
-		errs   float64
-		want   SlotStatus
+		name string
+		n    int
+		p50  float64
+		p99  float64
+		errs float64
+		want SlotStatus
 	}{
 		{"below-min-samples", 5, 10, 1000, 0, StatusOK},
 		{"healthy-ratio", 50, 10, 18, 0, StatusOK},

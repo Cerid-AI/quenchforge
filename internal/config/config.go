@@ -239,32 +239,32 @@ func Default() (Config, error) {
 		return Config{}, fmt.Errorf("config: resolve $HOME: %w", err)
 	}
 	return Config{
-		ListenAddr:   "127.0.0.1:11434",
-		LlamaBin:     "", // resolved lazily
-		ModelsDir:    filepath.Join(home, ".quenchforge", "models"),
-		LogDir:       filepath.Join(home, "Library", "Logs", "quenchforge"),
-		PIDDir:       filepath.Join(home, ".config", "quenchforge", "pids"),
-		DefaultModel: "qwen2.5:7b-instruct-q4_k_m",
-		ChatPort:     11500,
-		EmbedModel:     "", // opt-in
-		EmbedPort:      11501,
-		CodeEmbedModel: "", // opt-in
-		CodeEmbedPort:  11506,
-		RerankModel:    "", // opt-in
-		RerankPort:   11502,
-		WhisperModel: "", // opt-in
-		WhisperPort:  11503,
-		WhisperGPU:   false, // opt-in; see config docstring
-		SDModel:      "",    // opt-in
-		SDPort:       11504,
-		BarkModel:    "", // opt-in
-		BarkPort:     11505,
-		MaxContext:      8192,
-		MetalNCB:        2,
-		EmbedUbatchSize: 0, // 0 = inherit MaxContext (preserves v0.5.0 behaviour)
-		EmbedMetalNCB:   0, // 0 = inherit MetalNCB
-		RerankBatchSize: 0, // 0 = use llama.cpp's 512-token internal default
-		RerankMetalNCB:  0, // 0 = inherit MetalNCB
+		ListenAddr:         "127.0.0.1:11434",
+		LlamaBin:           "", // resolved lazily
+		ModelsDir:          filepath.Join(home, ".quenchforge", "models"),
+		LogDir:             filepath.Join(home, "Library", "Logs", "quenchforge"),
+		PIDDir:             filepath.Join(home, ".config", "quenchforge", "pids"),
+		DefaultModel:       "qwen2.5:7b-instruct-q4_k_m",
+		ChatPort:           11500,
+		EmbedModel:         "", // opt-in
+		EmbedPort:          11501,
+		CodeEmbedModel:     "", // opt-in
+		CodeEmbedPort:      11506,
+		RerankModel:        "", // opt-in
+		RerankPort:         11502,
+		WhisperModel:       "", // opt-in
+		WhisperPort:        11503,
+		WhisperGPU:         false, // opt-in; see config docstring
+		SDModel:            "",    // opt-in
+		SDPort:             11504,
+		BarkModel:          "", // opt-in
+		BarkPort:           11505,
+		MaxContext:         8192,
+		MetalNCB:           2,
+		EmbedUbatchSize:    0, // 0 = inherit MaxContext (preserves v0.5.0 behaviour)
+		EmbedMetalNCB:      0, // 0 = inherit MetalNCB
+		RerankBatchSize:    0, // 0 = use llama.cpp's 512-token internal default
+		RerankMetalNCB:     0, // 0 = inherit MetalNCB
 		AutoBackoffEnabled: false,
 	}, nil
 }

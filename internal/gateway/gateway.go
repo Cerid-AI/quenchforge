@@ -55,7 +55,7 @@ import (
 type SlotKind string
 
 const (
-	KindChat SlotKind = "chat"
+	KindChat  SlotKind = "chat"
 	KindEmbed SlotKind = "embed"
 	// KindCodeEmbed is a *second* embedding slot dedicated to code-tuned
 	// models. Requests arriving at /api/embeddings or /v1/embeddings whose
@@ -455,10 +455,10 @@ func (s *statusRecorder) Flush() {
 // resolveEmbedKind picks the embed slot kind for an inbound request by
 // matching the request's `model` field against Config.CodeEmbedModel.
 //
-// - Empty CodeEmbedModel  → always KindEmbed (legacy single-slot behavior).
-// - model == CodeEmbedModel and a KindCodeEmbed upstream is registered →
-//   KindCodeEmbed.
-// - Anything else → KindEmbed.
+//   - Empty CodeEmbedModel  → always KindEmbed (legacy single-slot behavior).
+//   - model == CodeEmbedModel and a KindCodeEmbed upstream is registered →
+//     KindCodeEmbed.
+//   - Anything else → KindEmbed.
 //
 // The fallback to KindEmbed is deliberate: if an operator typo'd the code
 // model name or the code-embed slot failed to register, callers still get
