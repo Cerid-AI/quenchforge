@@ -175,6 +175,23 @@ func embedParams(profile hardware.Profile, cfg config.Config) SlotTuning {
 	}
 	if profileIsAMDDiscrete(profile) {
 		t.AutoRespawn = true
+		// Force CPU for embed slots on AMD discrete. BERT-family embedding
+		// models (nomic-embed-text-v1.5, jina-embeddings-v2-base-code,
+		// snowflake-arctic, ...) produce non-deterministic garbage vectors
+		// when run on the AMD-Mac Metal backend, even with the patch 0001
+		// simdgroup_reduction + bfloat gates active. Verified empirically
+		// 2026-05-17 on Vega II: identical input "hello" returns cos_sim
+		// 0.07 between two separate requests through Metal; the same model
+		// on `--gpu-layers 0` returns cos_sim 1.0000. Chat (Llama-family)
+		// is unaffected — that's a different forward-pass shape. The bug
+		// is in BERT-specific kernels not covered by patch 0001 (likely
+		// LayerNorm or bidirectional self-attention reductions); kernel-
+		// level repair is tracked as v0.8.0 follow-up. Until then, CPU is
+		// the only correct path. On a 16-core Mac Pro 2019 the throughput
+		// hit is acceptable — ~100-500ms/call vs the broken-but-fast GPU
+		// path. Operator override: QUENCHFORGE_EMBED_GPU_LAYERS sets the
+		// flag explicitly (non-zero re-enables GPU at your own risk).
+		t.ExtraArgs = append(t.ExtraArgs, "--gpu-layers", "0")
 	}
 	return t
 }
@@ -205,6 +222,15 @@ func rerankParams(profile hardware.Profile, cfg config.Config) SlotTuning {
 	}
 	if profileIsAMDDiscrete(profile) {
 		t.AutoRespawn = true
+		// Same Metal-on-AMD BERT-family bug as embed. bge-reranker-v2-m3
+		// produces non-deterministic scores on AMD Metal: identical
+		// (query, docs) input returns different relevance numbers across
+		// calls. Relative ordering is partially preserved (which is why
+		// production-stack+qa got 0.133 not 0.0 in the morning eval — the
+		// reranker partially-masks broken embed garbage), but absolute
+		// scores are unreliable. See embedParams docstring for the full
+		// rationale.
+		t.ExtraArgs = append(t.ExtraArgs, "--gpu-layers", "0")
 	}
 	return t
 }

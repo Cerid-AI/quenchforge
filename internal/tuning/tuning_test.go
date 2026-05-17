@@ -132,6 +132,65 @@ func TestKernelParams_EmbedDefaultsByProfile(t *testing.T) {
 	}
 }
 
+func TestKernelParams_EmbedAMDForcesCPU(t *testing.T) {
+	// AMD discrete profiles must include `--gpu-layers 0` to route embed
+	// off the broken Metal-on-AMD path for BERT-family models. See the
+	// embedParams docstring for the empirical evidence (Vega II 2026-05-17:
+	// identical "hello" gives cos_sim 0.07 on Metal vs 1.0 on CPU). Apple
+	// Silicon and unknown profiles must NOT get this flag — the bug is
+	// structurally AMD-discrete-only and CPU on UMA hardware would be a
+	// large unnecessary throughput hit.
+	cfg := config.Config{MaxContext: 8192}
+	for _, p := range allProfiles {
+		for _, k := range []gateway.SlotKind{gateway.KindEmbed, gateway.KindCodeEmbed} {
+			t.Run(string(p)+"/"+string(k), func(t *testing.T) {
+				tn := KernelParams(p, k, cfg)
+				hasFlag := false
+				for i := 0; i+1 < len(tn.ExtraArgs); i++ {
+					if tn.ExtraArgs[i] == "--gpu-layers" && tn.ExtraArgs[i+1] == "0" {
+						hasFlag = true
+						break
+					}
+				}
+				if profileIsAMDDiscrete(p) && !hasFlag {
+					t.Errorf("%s %s missing --gpu-layers 0; ExtraArgs=%v",
+						p, k, tn.ExtraArgs)
+				}
+				if !profileIsAMDDiscrete(p) && hasFlag {
+					t.Errorf("%s %s should NOT force CPU; ExtraArgs=%v",
+						p, k, tn.ExtraArgs)
+				}
+			})
+		}
+	}
+}
+
+func TestKernelParams_RerankAMDForcesCPU(t *testing.T) {
+	// Same BERT-family bug applies to bge-reranker-v2-m3. AMD discrete
+	// must route rerank to CPU; non-AMD profiles must not.
+	cfg := config.Config{MaxContext: 8192}
+	for _, p := range allProfiles {
+		t.Run(string(p), func(t *testing.T) {
+			tn := KernelParams(p, gateway.KindRerank, cfg)
+			hasFlag := false
+			for i := 0; i+1 < len(tn.ExtraArgs); i++ {
+				if tn.ExtraArgs[i] == "--gpu-layers" && tn.ExtraArgs[i+1] == "0" {
+					hasFlag = true
+					break
+				}
+			}
+			if profileIsAMDDiscrete(p) && !hasFlag {
+				t.Errorf("%s rerank missing --gpu-layers 0; ExtraArgs=%v",
+					p, tn.ExtraArgs)
+			}
+			if !profileIsAMDDiscrete(p) && hasFlag {
+				t.Errorf("%s rerank should NOT force CPU; ExtraArgs=%v",
+					p, tn.ExtraArgs)
+			}
+		})
+	}
+}
+
 func TestKernelParams_RerankAMDGetsMetalNCBDefault(t *testing.T) {
 	// AMD rerank slots also inherit MetalNCB=1; non-AMD keeps 0
 	// (inherit global).

@@ -8,15 +8,84 @@ patch bumps fix bugs or polish without behaviour change.
 
 ---
 
-## v0.7.0 — kernel-level Metal staging-buffer pool (2026-05-17)
+## v0.7.0 — Metal-on-AMD BERT correctness: route embed + rerank to CPU (2026-05-17)
 
-Closes the third Metal-on-AMD failure class ("family-B") at the
-**kernel level**. v0.6.0 / v0.6.1 / v0.6.2 shipped the supervisor-side
-AutoRespawn mitigation that brought the slot back within ~30 seconds
-of a `GGML_ASSERT(buf_src)` SIGABRT under sustained embed / chat
-workloads on AMD discrete; the slot is back online but the caller
-sees a 502 + breaker open during the window. v0.7.0 makes those
-crashes impossible by replacing the underlying allocation pattern.
+**Closes the fourth Metal-on-AMD failure class** — BERT-family
+embedding and reranker models produce **non-deterministic garbage
+output** on AMD-discrete Metal even with patch 0001's
+`has_simdgroup_reduction` gate active. The bug was masked for the
+v0.6.x release cycle because cerid's eval harness used CPU ONNX
+embeddings; the cerid v0.96.0 quality uplift's switch to GPU embed
+exposed it. Identical input "hello" returns cos_sim 0.07 between
+two calls through the Metal path; the same model on CPU returns
+cos_sim 1.0000.
+
+Root cause (full design in
+[`docs/METAL_AMD_BERT_CORRECTNESS.md`](docs/METAL_AMD_BERT_CORRECTNESS.md)):
+the BERT forward pass hits `kernel_norm_fuse_impl` (LayerNorm) and
+`kernel_soft_max` (bidirectional attention) which unconditionally
+call `simd_sum()` / `simd_max()` AND use dynamic threadgroup memory
+as an entry-point parameter — combination hits both the AMD
+simd-reduction divergence AND the
+[documented Metal-compiler threadgroup-memory barrier-ordering bug](https://github.com/gfx-rs/wgpu/issues/4500).
+The Llama chat path takes a different route through the kernel
+dispatcher and is unaffected. Patch 0001's flag is checked at the
+device-capability level but the affected kernel dispatchers ignore
+it.
+
+### Operational fix
+
+`internal/tuning/tuning.go::embedParams` and `::rerankParams` now
+append `--gpu-layers 0` to per-slot args on AMD-discrete profiles.
+The chat slot stays on GPU (Llama path is correct + fast). Effect:
+
+- Embed identical "hello" → cos_sim **1.0000** ✓
+  (Metal path: 0.07; corrupt)
+- Rerank identical (query, docs) → identical scores across calls ✓
+  (Metal path: nondeterministic)
+- LongMemEval observed pace: ~1.6 min per 10 items on CPU embed
+  (vs ~1.7 min on broken GPU embed)
+
+### `0002-metal-staging-buffer-pool.patch` parked
+
+The hand-written staging-buffer-pool patch that briefly tagged
+v0.7.0 (`0b0e7fa`, now retagged) addressed family-B SIGABRTs at
+the kernel level. The 3-min HTTP bench validated 1597/0 calls
+without crashes, but the bench did not check **numerical
+correctness** — and when the BERT-bug investigation forced a hard
+revert, we lost the ability to attribute correctness issues to the
+patch vs. the underlying BERT bug. The patch lives at
+`patches/llama.cpp/drafts/0002-metal-staging-buffer-pool.patch.broken`
+as a starting point for a future re-evaluation; for now the
+v0.6.x AutoRespawn safety net is the family-B mitigation.
+
+### v0.8.0 candidate — kernel-level BERT fix
+
+`docs/METAL_AMD_BERT_CORRECTNESS.md` lays out the design:
+fallback kernels using fixed-size function-local threadgroup memory
++ pure threadgroup tree-reductions (no simd_sum), gated by the
+existing `has_simdgroup_reduction` flag at the dispatcher level.
+~400 LOC of MSL + ~50 LOC of dispatcher logic + bench acceptance
+criteria documented. Estimated 3-5 days of focused work.
+
+### Tests
+
+`internal/tuning/tuning_test.go` adds
+`TestKernelParams_EmbedAMDForcesCPU` and
+`TestKernelParams_RerankAMDForcesCPU` — assert `--gpu-layers 0`
+present on AMD-discrete profiles, absent on every other profile.
+Existing tests unchanged.
+
+---
+
+## v0.7.0-rc1 (retagged) — staging-buffer-pool experiment (DROPPED)
+
+Originally tagged 2026-05-17 on commit `0b0e7fa` based on a 3-min
+HTTP-status-only bench. Dropped after the per-component ablation
+exposed the unrelated BERT correctness bug that v0.7.0 (above)
+addresses. Notes preserved in
+[`patches/llama.cpp/drafts/README.md`](patches/llama.cpp/drafts/README.md)
+for any future re-evaluation.
 
 ### `0002-metal-staging-buffer-pool.patch`
 
