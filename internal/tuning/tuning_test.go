@@ -99,25 +99,55 @@ func TestKernelParams_ChatNonAMDIsEmpty(t *testing.T) {
 	}
 }
 
-func TestKernelParams_EmbedDefaultsMatchMaxContext(t *testing.T) {
-	// All profiles: embed/code-embed ubatch and batch default to
-	// cfg.MaxContext so any input that fits the context fits a single
-	// batch (preserves the v0.5.0 contextplus fix).
+func TestKernelParams_EmbedDefaultsByProfile(t *testing.T) {
+	// AMD-discrete profiles get the v0.6.2 bench-validated conservative
+	// default (ubatch=1024, MetalNCB=1). Apple Silicon / CPU / unknown
+	// profiles keep the v0.5.0 MaxContext default — the family-B crash
+	// is structurally impossible on shared-memory hosts.
 	cfg := config.Config{MaxContext: 8192}
 	for _, p := range allProfiles {
 		for _, k := range []gateway.SlotKind{gateway.KindEmbed, gateway.KindCodeEmbed} {
 			t.Run(string(p)+"/"+string(k), func(t *testing.T) {
 				tn := KernelParams(p, k, cfg)
-				if tn.UbatchSize != 8192 {
-					t.Errorf("%s %s UbatchSize = %d, want 8192",
-						p, k, tn.UbatchSize)
+				wantUbatch := 8192
+				wantNCB := 0
+				if profileIsAMDDiscrete(p) {
+					wantUbatch = amdEmbedUbatchDefault
+					wantNCB = amdEmbedMetalNCBDefault
 				}
-				if tn.BatchSize != 8192 {
-					t.Errorf("%s %s BatchSize = %d, want 8192",
-						p, k, tn.BatchSize)
+				if tn.UbatchSize != wantUbatch {
+					t.Errorf("%s %s UbatchSize = %d, want %d",
+						p, k, tn.UbatchSize, wantUbatch)
+				}
+				if tn.BatchSize != wantUbatch {
+					t.Errorf("%s %s BatchSize = %d, want %d",
+						p, k, tn.BatchSize, wantUbatch)
+				}
+				if tn.MetalNCB != wantNCB {
+					t.Errorf("%s %s MetalNCB = %d, want %d",
+						p, k, tn.MetalNCB, wantNCB)
 				}
 			})
 		}
+	}
+}
+
+func TestKernelParams_RerankAMDGetsMetalNCBDefault(t *testing.T) {
+	// AMD rerank slots also inherit MetalNCB=1; non-AMD keeps 0
+	// (inherit global).
+	cfg := config.Config{MaxContext: 8192}
+	for _, p := range allProfiles {
+		t.Run(string(p), func(t *testing.T) {
+			tn := KernelParams(p, gateway.KindRerank, cfg)
+			wantNCB := 0
+			if profileIsAMDDiscrete(p) {
+				wantNCB = amdEmbedMetalNCBDefault
+			}
+			if tn.MetalNCB != wantNCB {
+				t.Errorf("%s rerank MetalNCB = %d, want %d",
+					p, tn.MetalNCB, wantNCB)
+			}
+		})
 	}
 }
 
