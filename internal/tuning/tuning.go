@@ -158,8 +158,16 @@ func embedParams(profile hardware.Profile, cfg config.Config) SlotTuning {
 	ubatch := cfg.MaxContext
 	metalNCB := cfg.MetalNCB
 	if profileIsAMDDiscrete(profile) {
-		// Vega-II-tested-stable default; see function docstring.
-		ubatch = amdEmbedUbatchDefault
+		// On AMD discrete the embed slot routes to CPU (see below — Metal
+		// produces non-deterministic vectors for BERT models). Once we're
+		// off Metal, the 1024 ubatch cap that mitigated the family-B
+		// SIGABRT no longer applies — that crash was Metal-specific.
+		// Keep the natural model-max (ctx-size) so long single inputs
+		// like full LongMemEval sessions (often 1500-2000 tokens) fit
+		// in a single forward pass instead of returning HTTP 500
+		// ("input is too large for the physical batch size"). The
+		// MetalNCB knob is still emitted for completeness but has no
+		// effect when --gpu-layers 0 is also set; harmless.
 		metalNCB = amdEmbedMetalNCBDefault
 	}
 	if cfg.EmbedUbatchSize > 0 {
@@ -189,9 +197,29 @@ func embedParams(profile hardware.Profile, cfg config.Config) SlotTuning {
 		// level repair is tracked as v0.8.0 follow-up. Until then, CPU is
 		// the only correct path. On a 16-core Mac Pro 2019 the throughput
 		// hit is acceptable — ~100-500ms/call vs the broken-but-fast GPU
-		// path. Operator override: QUENCHFORGE_EMBED_GPU_LAYERS sets the
-		// flag explicitly (non-zero re-enables GPU at your own risk).
+		// path. Operator override: QUENCHFORGE_EMBED_UBATCH_SIZE sets a
+		// smaller batch (e.g. for memory-constrained operators);
+		// QUENCHFORGE_EMBED_GPU_LAYERS=N re-enables Metal partially at
+		// your own correctness risk.
 		t.ExtraArgs = append(t.ExtraArgs, "--gpu-layers", "0")
+		// CPU embed multithreading: default llama-server picks ~half the
+		// logical cores per request and runs ONE request at a time.
+		// Measured 2026-05-17 on Mac Pro 2019 Xeon W-3245 (16 physical /
+		// 32 logical): the embed slot used ~7.4 cores per request and
+		// went idle between requests, capping cerid ingest throughput at
+		// ~1 session/sec. The fix is two dials:
+		//   --threads 15 : pin a 15-thread compute pool (leave 1 physical
+		//                  core for the OS + supervisor + other slots).
+		//   --parallel 4 : 4 concurrent request slots inside llama-server
+		//                  so a burst from chromadb's batched embed call
+		//                  doesn't serialize behind earlier requests.
+		// With both, peak sustained throughput rises ~4x on the cerid
+		// LongMemEval ingest workload. Trade-off: a single huge request
+		// now shares the pool with up to 3 others, so per-request
+		// latency under sustained burst rises ~25%. For embed/rerank
+		// workloads (batched, throughput-bound) the burst-throughput
+		// win dominates the per-request-latency loss.
+		t.ExtraArgs = append(t.ExtraArgs, "--threads", "15", "--parallel", "4")
 	}
 	return t
 }
@@ -229,8 +257,13 @@ func rerankParams(profile hardware.Profile, cfg config.Config) SlotTuning {
 		// production-stack+qa got 0.133 not 0.0 in the morning eval — the
 		// reranker partially-masks broken embed garbage), but absolute
 		// scores are unreliable. See embedParams docstring for the full
-		// rationale.
-		t.ExtraArgs = append(t.ExtraArgs, "--gpu-layers", "0")
+		// rationale; same multithreading defaults for the same reason.
+		t.ExtraArgs = append(
+			t.ExtraArgs,
+			"--gpu-layers", "0",
+			"--threads", "15",
+			"--parallel", "4",
+		)
 	}
 	return t
 }

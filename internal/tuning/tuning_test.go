@@ -100,10 +100,15 @@ func TestKernelParams_ChatNonAMDIsEmpty(t *testing.T) {
 }
 
 func TestKernelParams_EmbedDefaultsByProfile(t *testing.T) {
-	// AMD-discrete profiles get the v0.6.2 bench-validated conservative
-	// default (ubatch=1024, MetalNCB=1). Apple Silicon / CPU / unknown
-	// profiles keep the v0.5.0 MaxContext default — the family-B crash
-	// is structurally impossible on shared-memory hosts.
+	// All profiles use MaxContext for ubatch/batch on embed slots —
+	// long single inputs (full LongMemEval sessions, multi-paragraph
+	// documents) need the full natural model context as a single
+	// forward pass, otherwise llama-server returns HTTP 500 "input is
+	// too large for the physical batch size". The 1024 ubatch
+	// mitigation that v0.6.2 used was Metal-family-B-specific; with
+	// AMD embed slots now routed to CPU via --gpu-layers 0, that
+	// crash mode is structurally impossible. MetalNCB stays at the
+	// AMD default for completeness but is a no-op on the CPU path.
 	cfg := config.Config{MaxContext: 8192}
 	for _, p := range allProfiles {
 		for _, k := range []gateway.SlotKind{gateway.KindEmbed, gateway.KindCodeEmbed} {
@@ -112,7 +117,6 @@ func TestKernelParams_EmbedDefaultsByProfile(t *testing.T) {
 				wantUbatch := 8192
 				wantNCB := 0
 				if profileIsAMDDiscrete(p) {
-					wantUbatch = amdEmbedUbatchDefault
 					wantNCB = amdEmbedMetalNCBDefault
 				}
 				if tn.UbatchSize != wantUbatch {
@@ -163,6 +167,51 @@ func TestKernelParams_EmbedAMDForcesCPU(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestKernelParams_EmbedAMDMultithreading(t *testing.T) {
+	// AMD discrete CPU-routed embed must also surface --threads 15
+	// --parallel 4 so the 16-physical-core Mac Pro 2019 doesn't bottle-
+	// neck on the default ~7-cores-per-request-one-at-a-time pattern.
+	// See embedParams docstring. Non-AMD profiles get neither flag.
+	cfg := config.Config{MaxContext: 8192}
+	for _, p := range allProfiles {
+		for _, k := range []gateway.SlotKind{gateway.KindEmbed, gateway.KindCodeEmbed, gateway.KindRerank} {
+			t.Run(string(p)+"/"+string(k), func(t *testing.T) {
+				tn := KernelParams(p, k, cfg)
+				hasThreads := containsArgPair(tn.ExtraArgs, "--threads", "15")
+				hasParallel := containsArgPair(tn.ExtraArgs, "--parallel", "4")
+				if profileIsAMDDiscrete(p) {
+					if !hasThreads {
+						t.Errorf("%s %s missing --threads 15; ExtraArgs=%v",
+							p, k, tn.ExtraArgs)
+					}
+					if !hasParallel {
+						t.Errorf("%s %s missing --parallel 4; ExtraArgs=%v",
+							p, k, tn.ExtraArgs)
+					}
+				} else {
+					if hasThreads {
+						t.Errorf("%s %s should NOT set --threads; ExtraArgs=%v",
+							p, k, tn.ExtraArgs)
+					}
+					if hasParallel {
+						t.Errorf("%s %s should NOT set --parallel; ExtraArgs=%v",
+							p, k, tn.ExtraArgs)
+					}
+				}
+			})
+		}
+	}
+}
+
+func containsArgPair(args []string, flag, value string) bool {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == flag && args[i+1] == value {
+			return true
+		}
+	}
+	return false
 }
 
 func TestKernelParams_RerankAMDForcesCPU(t *testing.T) {
