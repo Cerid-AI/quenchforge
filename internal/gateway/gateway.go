@@ -87,6 +87,7 @@ type Gateway struct {
 	server    *http.Server
 	upstreams map[SlotKind]upstreamEntry
 	version   string
+	latency   *latencyTracker
 }
 
 // New returns a Gateway bound to cfg. The server is not yet listening;
@@ -96,6 +97,7 @@ func New(cfg config.Config) *Gateway {
 		cfg:       cfg,
 		version:   "0.0.0-dev",
 		upstreams: make(map[SlotKind]upstreamEntry),
+		latency:   newLatencyTracker(),
 	}
 }
 
@@ -280,8 +282,54 @@ func (g *Gateway) handleRoot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// handleHealth returns the gateway's overall status plus a per-slot
+// breakdown of rolling-window latency and error rate. Always 200 while
+// the gateway is reachable — consumers parse the JSON to decide whether
+// to throttle. The opt-in QUENCHFORGE_AUTO_BACKOFF flag is the only
+// thing that turns a `critical` snapshot into an actual 503 on the
+// upstream proxy paths; /health itself never blocks.
+//
+// Schema:
+//
+//	{
+//	  "status": "ok",
+//	  "slots": {
+//	    "embed": {
+//	      "kind": "embed",
+//	      "samples": 312,
+//	      "p50_ms": 18.4,
+//	      "p99_ms": 41.2,
+//	      "error_rate": 0.0,
+//	      "status": "ok",
+//	      "window_secs": 60
+//	    },
+//	    ...
+//	  },
+//	  "auto_backoff_enabled": false
+//	}
 func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	snaps := g.latency.Snapshot()
+	slots := make(map[string]LatencySnapshot, len(snaps))
+	for k, v := range snaps {
+		slots[string(k)] = v
+	}
+	// Overall status is the worst per-slot status (so /health caller
+	// gets a one-glance answer to "is anything wrong").
+	overall := StatusOK
+	for _, v := range snaps {
+		if v.Status == StatusCritical {
+			overall = StatusCritical
+			break
+		}
+		if v.Status == StatusDegraded && overall == StatusOK {
+			overall = StatusDegraded
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":               string(overall),
+		"slots":                slots,
+		"auto_backoff_enabled": g.cfg.AutoBackoffEnabled,
+	})
 }
 
 func (g *Gateway) handleTags(w http.ResponseWriter, _ *http.Request) {
@@ -312,6 +360,13 @@ func (g *Gateway) handleTags(w http.ResponseWriter, _ *http.Request) {
 // to that value before being forwarded. Used to translate OpenAI-shaped
 // paths (e.g. /v1/audio/transcriptions, /v1/rerank) onto whisper-server's
 // /inference and llama-server's /rerank natives.
+//
+// Latency tracking: every upstream call records duration + error-flag in
+// the gateway's rolling per-kind tracker. /health surfaces the resulting
+// status (ok | degraded | critical). When QUENCHFORGE_AUTO_BACKOFF is on
+// and the slot is currently `critical`, the handler returns 503 +
+// Retry-After before forwarding — gives consumers a structured signal to
+// throttle before the family-B Metal crash tips the slot over.
 func (g *Gateway) proxyHandler(kind SlotKind, rewriteTo string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		g.mu.RLock()
@@ -322,6 +377,12 @@ func (g *Gateway) proxyHandler(kind SlotKind, rewriteTo string) http.HandlerFunc
 				fmt.Sprintf("no %s slot configured. Check `quenchforge doctor` for status.", kind))
 			return
 		}
+		if g.shouldBackoff(kind) {
+			w.Header().Set("Retry-After", "2")
+			writeJSONError(w, http.StatusServiceUnavailable,
+				fmt.Sprintf("%s slot is at critical latency — back off (Retry-After: 2s)", kind))
+			return
+		}
 		if rewriteTo != "" {
 			// Clone the request so concurrent handlers don't see our rewrite.
 			r2 := r.Clone(r.Context())
@@ -329,7 +390,65 @@ func (g *Gateway) proxyHandler(kind SlotKind, rewriteTo string) http.HandlerFunc
 			r2.URL.RawPath = ""
 			r = r2
 		}
-		entry.proxy.ServeHTTP(w, r)
+		g.serveAndTrack(kind, entry.proxy, w, r)
+	}
+}
+
+// shouldBackoff reports whether the gateway should preemptively 503 a
+// request to `kind`. Gated on cfg.AutoBackoffEnabled so the default
+// behaviour is observability-only.
+func (g *Gateway) shouldBackoff(kind SlotKind) bool {
+	if !g.cfg.AutoBackoffEnabled {
+		return false
+	}
+	return g.latency.SnapshotKind(kind).Status == StatusCritical
+}
+
+// serveAndTrack wraps ServeHTTP so the per-kind latency tracker sees
+// every upstream call. The response status is captured via a thin
+// ResponseWriter shim — bool flag for is-error (status >= 500 or write
+// failure) feeds the per-kind error rate.
+func (g *Gateway) serveAndTrack(kind SlotKind, proxy http.Handler, w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+	proxy.ServeHTTP(rec, r)
+	g.latency.Record(kind, time.Since(start), rec.status >= 500)
+}
+
+// statusRecorder is the minimal wrapper that captures the status code
+// the upstream proxy writes. Required because the latency tracker needs
+// to count "5xx as error" to compute the per-kind error rate. We don't
+// inspect the body — the goal is one bool per call, not a deep inspect.
+type statusRecorder struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	if !s.wroteHeader {
+		s.status = code
+		s.wroteHeader = true
+	}
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusRecorder) Write(b []byte) (int, error) {
+	if !s.wroteHeader {
+		// Per http.ResponseWriter contract, Write without WriteHeader
+		// implies 200.
+		s.wroteHeader = true
+	}
+	return s.ResponseWriter.Write(b)
+}
+
+// Flush forwards to the underlying writer if it supports streaming. Required
+// because httputil.ReverseProxy uses Flusher for SSE streaming responses;
+// without forwarding, /v1/chat/completions streams would buffer until the
+// upstream closed the connection.
+func (s *statusRecorder) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
 	}
 }
 
@@ -391,7 +510,13 @@ func (g *Gateway) handleOpenAIEmbeddings() http.HandlerFunc {
 		// Re-attach the consumed body so the reverse-proxy can forward it.
 		r.Body = io.NopCloser(bytes.NewReader(raw))
 		r.ContentLength = int64(len(raw))
-		entry.proxy.ServeHTTP(w, r)
+		if g.shouldBackoff(kind) {
+			w.Header().Set("Retry-After", "2")
+			writeJSONError(w, http.StatusServiceUnavailable,
+				fmt.Sprintf("%s slot is at critical latency — back off (Retry-After: 2s)", kind))
+			return
+		}
+		g.serveAndTrack(kind, entry.proxy, w, r)
 	}
 }
 

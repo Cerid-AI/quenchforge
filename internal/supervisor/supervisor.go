@@ -36,6 +36,28 @@ import (
 	"time"
 )
 
+// RestartPolicy controls whether the supervisor brings the slot back
+// after a non-zero exit (typically a Metal SIGABRT on AMD discrete
+// embed/rerank slots — the family-B sustained-load crash leaves the
+// slot dead and the gateway 503s every subsequent request until a
+// manual `launchctl kickstart`. With auto-respawn, the slot returns
+// within 30s and the gateway recovers without operator intervention).
+type RestartPolicy int
+
+const (
+	// PolicyNone disables auto-respawn. The slot exits and stays
+	// exited; callers see the death via Slot.Running() / PID().
+	// This is the default (zero value) for backward compatibility.
+	PolicyNone RestartPolicy = iota
+
+	// PolicyExpBackoff retries Start after 2s, 4s, 8s on each
+	// successive crash within a 60-second window. After 3 attempts
+	// without a successful 60-second run, the supervisor gives up
+	// and leaves the slot dead (logs a warning). Resets the attempt
+	// counter when a slot runs cleanly for >=60s.
+	PolicyExpBackoff
+)
+
 // Slot is a single supervised llama-protocol process. The zero value is not
 // valid; construct via NewSlot.
 type Slot struct {
@@ -62,12 +84,18 @@ type Slot struct {
 	//   ${PIDDir}/${Name}.pid
 	PIDDir string
 
+	// RestartPolicy controls whether the supervisor auto-respawns the
+	// slot on non-zero exit. Default PolicyNone (no respawn).
+	RestartPolicy RestartPolicy
+
 	// internal state — only valid after Start
-	mu      sync.Mutex
-	cmd     *exec.Cmd
-	logFile *os.File
-	pidPath string
-	started time.Time
+	mu          sync.Mutex
+	cmd         *exec.Cmd
+	logFile     *os.File
+	pidPath     string
+	started     time.Time
+	respawnMu   sync.Mutex // serialises respawn attempts
+	respawnHist []time.Time // crash timestamps within last 60s
 }
 
 // NewSlot returns an unstarted Slot. The caller is expected to set BinPath,
@@ -130,7 +158,88 @@ func (s *Slot) Start(ctx context.Context) error {
 		// hygiene issue. Log instead.
 		fmt.Fprintf(os.Stderr, "quenchforge: warn: write pidfile %q: %v\n", s.pidPath, err)
 	}
+
+	// If the caller asked for auto-respawn, spawn a watcher goroutine
+	// that waits for the process to exit and re-Starts it when policy
+	// allows. Without this, a SIGABRT on the embed slot (family-B Metal
+	// crash) would leave the slot dead until manual restart.
+	if s.RestartPolicy != PolicyNone {
+		go s.watchAndRespawn(ctx, cmd)
+	}
 	return nil
+}
+
+// watchAndRespawn blocks until the supervised process exits, then
+// applies the RestartPolicy to decide whether to bring it back. Runs
+// in its own goroutine; the goroutine exits when ctx is cancelled (the
+// supervisor is shutting down) or when policy gives up.
+//
+// Crash-storm protection: we accept at most 3 respawns within any
+// rolling 60-second window. On the 4th, we leave the slot dead and log
+// a warning — protects against tight loops on a permanently-wedged GPU.
+func (s *Slot) watchAndRespawn(ctx context.Context, cmd *exec.Cmd) {
+	err := cmd.Wait()
+
+	// If the parent context is done the supervisor is shutting down;
+	// don't respawn.
+	if ctx.Err() != nil {
+		return
+	}
+	// Clean exit (exit code 0) means an operator told the slot to stop;
+	// don't respawn that either.
+	if err == nil {
+		return
+	}
+
+	s.respawnMu.Lock()
+	defer s.respawnMu.Unlock()
+
+	// Trim crash history older than 60s.
+	now := time.Now()
+	cutoff := now.Add(-60 * time.Second)
+	keep := s.respawnHist[:0]
+	for _, t := range s.respawnHist {
+		if t.After(cutoff) {
+			keep = append(keep, t)
+		}
+	}
+	s.respawnHist = keep
+
+	if len(s.respawnHist) >= 3 {
+		fmt.Fprintf(os.Stderr,
+			"quenchforge: slot %s crashed %d times in last 60s — giving up "+
+				"(restart quenchforge to bring it back). Last error: %v\n",
+			s.Name, len(s.respawnHist), err)
+		return
+	}
+
+	// Exponential backoff: 2s on first crash this window, 4s on second,
+	// 8s on third. The cap is the 3-attempt limit above.
+	delay := time.Duration(2<<len(s.respawnHist)) * time.Second
+	s.respawnHist = append(s.respawnHist, now)
+
+	fmt.Fprintf(os.Stderr,
+		"quenchforge: slot %s exited (%v); respawn in %s (%d/3 in window)\n",
+		s.Name, err, delay, len(s.respawnHist))
+
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(delay):
+	}
+
+	// Reset state under the slot's mutex so the next Start() sees a
+	// clean slate.
+	s.mu.Lock()
+	s.cleanupLocked()
+	s.cmd = nil
+	s.logFile = nil
+	s.mu.Unlock()
+
+	if err := s.Start(ctx); err != nil {
+		fmt.Fprintf(os.Stderr,
+			"quenchforge: slot %s respawn failed: %v\n", s.Name, err)
+	}
 }
 
 // Stop sends SIGTERM, waits up to grace, then SIGKILLs and reaps. Returns

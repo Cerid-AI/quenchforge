@@ -68,7 +68,81 @@ LCP-similarity cache that runs during slot picking
 (`get_available_slot`).
 
 Embed and rerank slots don't touch either cache, so they keep the
-upstream defaults.
+upstream defaults for the LCP/prompt-cache surface. (They do, however,
+have a separate sustained-load failure mode — see section 3 below.)
+
+### 3. Sustained-load graph-compute buffer-corruption
+
+A third Metal-on-AMD failure surfaces on the embed and rerank slots
+under sustained batch workloads (eval suites, bulk KB ingest, sustained
+MCP retrieval). After ~50-200 successive forward passes the
+`ggml_metal_buffer_set_tensor` (or `_get_tensor`) call asserts on a
+NULL Metal buffer and the slot SIGABRTs:
+
+```
+ggml-metal-device.m:1665+: ggml_metal_buffer_set_tensor →
+                            ggml_abort → SIGABRT
+```
+
+Reading `~/Develop/quenchforge/llama.cpp/ggml/src/ggml-metal/ggml-metal-device.m:1665-1717`
+the mechanism is clear: `newBufferWithBytesNoCopy` with
+`MTLResourceStorageModeShared` requests a CPU-visible Metal buffer
+from the AMD discrete driver. On Apple Silicon this is trivial — unified
+memory means the `buf->is_shared` fast path uses plain `memcpy` and
+never enters the failing code at all (lines 1666-1668, 1720-1722). On
+AMD discrete, the driver maintains a finite PCIe staging-buffer pool;
+sustained sub-millisecond allocations exhaust it and the API returns
+NULL. The neighbouring `GGML_ASSERT(buf_src)` / `GGML_ASSERT(buf_dst)`
+calls then abort the process.
+
+The cascade extends past the slot: the `AMDRadeonX5000` kernel mutex
+that owned the failing allocation can stall WindowServer for tens of
+seconds (the userspace watchdog then resets the WindowServer process
+and the operator's UI session is interrupted, even though no kernel
+panic occurs).
+
+The existing chat-slot flags from sections 1 and 2 don't help. The
+LCP-prompt-save crash and the FA-CPU-fallback throttle are
+chat-decode-specific. The buffer-corruption family runs through the
+graph-compute path (`process_ubatch → encode → graph_compute →
+buffer_{set,get}_tensor`) which fires on every forward pass — chat,
+embed, rerank. Chat traffic in production is bursty enough that the
+staging-buffer pool drains between requests; eval-style workloads with
+gapless POSTs do not give it that recovery window.
+
+Supervisor mitigations (no llama.cpp patch — same "one patch per
+submodule" reasoning):
+
+- `--ubatch-size` and `--batch-size` are configurable per-slot via
+  `QUENCHFORGE_EMBED_UBATCH_SIZE` (default 0 → inherit MaxContext)
+  and `QUENCHFORGE_RERANK_BATCH_SIZE` (default 0 → llama.cpp's
+  512-token internal default). Smaller ubatch shrinks per-call Metal
+  staging allocations on AMD discrete.
+- `GGML_METAL_N_CB` is configurable per-slot via
+  `QUENCHFORGE_EMBED_METAL_N_CB` and `QUENCHFORGE_RERANK_METAL_N_CB`.
+  Lowering to 1 serialises Metal command-buffer submission so the
+  staging-buffer pool drains between commands instead of accumulating
+  pressure.
+- AMD-discrete embed/rerank slots auto-respawn on SIGABRT (2s / 4s /
+  8s exponential backoff, capped at 3 attempts/60s) so the gateway
+  recovers without manual `launchctl kickstart`.
+- The gateway's rolling-window latency tracker surfaces impending
+  family-B exhaustion via `/health` (per-slot status `ok | degraded |
+  critical`), so consumers can throttle before the SIGABRT. Opt-in
+  `QUENCHFORGE_AUTO_BACKOFF=true` turns `critical` into an automatic
+  503+`Retry-After` on the upstream proxy paths.
+
+Per-profile defaults will be tuned on the `[amd-gpu]` self-hosted
+runner in a follow-up PR; `quenchforge-bench sustained-embed` is the
+harness that finds the smallest stability-preserving overhead. Until
+then, defaults preserve current behaviour and operators on the affected
+hardware set the env knobs explicitly.
+
+A long-term patch in upstream llama.cpp / ggml-metal that pools the
+staging-buffer allocations across calls (instead of
+`newBufferWithBytesNoCopy` per call) would address this at the source.
+That work is out of scope for the supervisor layer and tracked
+separately.
 
 ### Why not a second patch?
 

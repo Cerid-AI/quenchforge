@@ -23,6 +23,7 @@ import (
 	"github.com/cerid-ai/quenchforge/internal/gateway"
 	"github.com/cerid-ai/quenchforge/internal/hardware"
 	"github.com/cerid-ai/quenchforge/internal/supervisor"
+	"github.com/cerid-ai/quenchforge/internal/tuning"
 )
 
 // Version is injected at build time via:
@@ -607,36 +608,11 @@ type slotSpec struct {
 // one supervised slot. Pure function (no I/O, no globals) so it can be
 // unit-tested without spawning llama-server.
 //
-// AMD-discrete chat-slot flags:
-//
-//	--flash-attn off     The default `--flash-attn auto` correctly
-//	                     determines FA can't run on AMD MTL0 (the
-//	                     simdgroup-reduction patch disables the ops
-//	                     FA needs) but instead of disabling FA
-//	                     outright it schedules the FA tensor on CPU
-//	                     each decode step, ferrying tensors GPU↔CPU
-//	                     per token. Forcing `off` uses standard
-//	                     (slower per kernel, but GPU-resident)
-//	                     attention.
-//
-//	--cache-ram 0        Disables the server-side LCP-similarity slot
-//	                     cache. The crash signature is in
-//	                     `prompt_save` → `state_seq_get_data` →
-//	                     `ggml_metal_buffer_get_tensor(buf_dst=NULL)`
-//	                     on the 2nd chat with LCP similarity > 10%.
-//	                     --cache-ram 0 disables the path entirely.
-//
-//	--no-cache-prompt    Companion to --cache-ram 0 — disables the
-//	                     per-slot prompt cache so the LCP-similarity
-//	                     path can't fire from a per-slot trigger in
-//	                     a future llama.cpp release. The two flags
-//	                     together belt-and-suspenders the entire
-//	                     prompt-cache surface.
-//
-// Embed / rerank slots don't decode autoregressively and don't touch
-// the server-side cache, so they keep the upstream defaults regardless
-// of profile. Apple Silicon and unknown profiles also keep the
-// upstream defaults across all slot kinds.
+// The per-(profile, kind) tuning logic — AMD chat safety flags, embed
+// batch overrides, rerank batch overrides, future per-profile knobs —
+// lives in `internal/tuning/tuning.go`. This function is responsible
+// only for the base arg shape plus the layering of the tuning result.
+// Move the per-profile decisions there when they change, not here.
 func buildSlotArgs(cfg config.Config, hwInfo hardware.Info, spec slotSpec, modelPath string) []string {
 	args := []string{
 		"--model", modelPath,
@@ -646,29 +622,33 @@ func buildSlotArgs(cfg config.Config, hwInfo hardware.Info, spec slotSpec, model
 	}
 	args = append(args, spec.ExtraArgs...)
 
-	// Embed-class slots need --batch-size / --ubatch-size raised to match
-	// --ctx-size. llama-server's default ubatch is 512, which means any
-	// single embedding input over 512 tokens hard-fails with
-	// "input (N tokens) is too large to process. increase the physical
-	// batch size". Code-search MCPs (contextplus) routinely send chunks
-	// in the 600-2000 token range and pre-2026-05 trip this without
-	// recourse. Setting both to MaxContext lets any input that fits the
-	// context fit a single batch; VRAM cost is small for embed models.
-	if spec.Kind == gateway.KindEmbed || spec.Kind == gateway.KindCodeEmbed {
-		args = append(args,
-			"--batch-size", fmt.Sprintf("%d", cfg.MaxContext),
-			"--ubatch-size", fmt.Sprintf("%d", cfg.MaxContext),
-		)
+	tn := tuning.KernelParams(hwInfo.Profile, spec.Kind, cfg)
+	if tn.BatchSize > 0 {
+		args = append(args, "--batch-size", fmt.Sprintf("%d", tn.BatchSize))
 	}
+	if tn.UbatchSize > 0 {
+		args = append(args, "--ubatch-size", fmt.Sprintf("%d", tn.UbatchSize))
+	}
+	args = append(args, tn.ExtraArgs...)
 
-	if spec.Kind == gateway.KindChat && hwInfo.IsAMDDiscrete() {
-		args = append(args,
-			"--flash-attn", "off",
-			"--cache-ram", "0",
-			"--no-cache-prompt",
-		)
-	}
 	return args
+}
+
+// slotEnv assembles the per-slot environment variable list. Returns the
+// list `Slot.Env` should be set to. Pure function for testability.
+//
+// GGML_METAL_N_CB is per-slot (tuning may override the global default
+// for an embed/rerank slot to serialise Metal command-buffer submission
+// on AMD discrete).
+func slotEnv(cfg config.Config, hwInfo hardware.Info, kind gateway.SlotKind) []string {
+	ncb := cfg.MetalNCB
+	tn := tuning.KernelParams(hwInfo.Profile, kind, cfg)
+	if tn.MetalNCB > 0 {
+		ncb = tn.MetalNCB
+	}
+	return []string{
+		fmt.Sprintf("GGML_METAL_N_CB=%d", ncb),
+	}
 }
 
 // startSlot launches one llama-server with the configured model + Metal
@@ -690,9 +670,17 @@ func startSlot(ctx context.Context, cfg config.Config, hwInfo hardware.Info, spe
 	slot.LogDir = cfg.LogDir
 	slot.PIDDir = cfg.PIDDir
 	slot.Args = args
-	slot.Env = []string{
-		fmt.Sprintf("GGML_METAL_N_CB=%d", cfg.MetalNCB),
+	slot.Env = slotEnv(cfg, hwInfo, spec.Kind)
+
+	// AMD-discrete embed/rerank slots need auto-respawn — the family-B
+	// graph-compute buffer-corruption crash is non-deterministic and the
+	// slot stays dead after SIGABRT until manual restart. Tuning module
+	// owns the decision; we just translate AutoRespawn → RestartPolicy.
+	tn := tuning.KernelParams(hwInfo.Profile, spec.Kind, cfg)
+	if tn.AutoRespawn {
+		slot.RestartPolicy = supervisor.PolicyExpBackoff
 	}
+
 	if err := slot.Start(ctx); err != nil {
 		return nil, err
 	}

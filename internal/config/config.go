@@ -56,6 +56,36 @@
 //	QUENCHFORGE_METAL_N_CB   — Metal command-buffer count. Default 2 — set as
 //	                            a launch env var on llama-server (issue surface
 //	                            of the would-be third patch).
+//	QUENCHFORGE_EMBED_UBATCH_SIZE  — physical ubatch (and batch) the embed and
+//	                            code-embed slots use. Zero (default) means
+//	                            fall back to MaxContext so single inputs ≤
+//	                            8192 tokens fit one batch. Lowering this
+//	                            (e.g. to 1024) shrinks per-call Metal
+//	                            staging allocations on AMD discrete —
+//	                            primary mitigation for the family-B
+//	                            sustained-load crash. See
+//	                            `patches/README.md` section 3.
+//	QUENCHFORGE_EMBED_METAL_N_CB   — per-slot GGML_METAL_N_CB for the embed
+//	                            and code-embed slots. Zero (default) falls
+//	                            back to the global QUENCHFORGE_METAL_N_CB.
+//	                            Set to 1 on AMD discrete to serialise Metal
+//	                            command-buffer submission and let the
+//	                            staging-buffer pool drain between calls.
+//	QUENCHFORGE_RERANK_BATCH_SIZE  — physical batch (and ubatch) the rerank
+//	                            slot uses. Zero (default) keeps llama.cpp's
+//	                            512-token default. Raise this when the
+//	                            reranker model + workload routinely produces
+//	                            (query, doc) pairs above 512 tokens
+//	                            (e.g. bge-reranker-v2-m3 with 1k-2k-token
+//	                            chunks). Subject to the same family-B
+//	                            constraints as the embed knobs on AMD.
+//	QUENCHFORGE_RERANK_METAL_N_CB  — per-slot GGML_METAL_N_CB for the rerank
+//	                            slot. Same semantics as EMBED_METAL_N_CB.
+//	QUENCHFORGE_AUTO_BACKOFF — opt-in: gateway returns 503 + Retry-After when
+//	                            a slot's rolling latency p99 is at the
+//	                            "critical" threshold (impending crash).
+//	                            Lets consumers throttle before the slot
+//	                            SIGABRTs. Default "off".
 //	QUENCHFORGE_TELEMETRY    — opt-in: "on" or "off". Default "off".
 //	QUENCHFORGE_ADVERTISE_MDNS — opt-in: advertise `_quenchforge._tcp.local.`
 //	                            via the system mDNSResponder. Default "off".
@@ -162,6 +192,36 @@ type Config struct {
 	// (issue #15228 thread).
 	MetalNCB int
 
+	// EmbedUbatchSize, when non-zero, overrides the embed and code-embed
+	// slots' --batch-size / --ubatch-size. Zero falls back to MaxContext
+	// (preserves the v0.5.0 contextplus single-batch behaviour). On AMD
+	// discrete, lowering this to 512-2048 caps per-call Metal staging
+	// allocations and prevents the family-B sustained-load crash.
+	EmbedUbatchSize int
+
+	// EmbedMetalNCB, when non-zero, overrides GGML_METAL_N_CB for the
+	// embed and code-embed slots only. Zero falls back to MetalNCB. On
+	// AMD discrete, setting this to 1 serialises Metal command-buffer
+	// submission and lets the staging-buffer pool drain.
+	EmbedMetalNCB int
+
+	// RerankBatchSize, when non-zero, sets --batch-size and --ubatch-size
+	// on the rerank slot. Zero (default) keeps llama.cpp's 512-token
+	// internal default — too small for modern rerankers fed > 510-token
+	// (query, doc) pairs. Operators with bge-reranker-v2-m3 or similar
+	// raise this; same family-B caveats as EmbedUbatchSize.
+	RerankBatchSize int
+
+	// RerankMetalNCB, when non-zero, overrides GGML_METAL_N_CB for the
+	// rerank slot. Same semantics as EmbedMetalNCB.
+	RerankMetalNCB int
+
+	// AutoBackoffEnabled is the opt-in flag for the gateway's
+	// 503+Retry-After response when a slot reaches the "critical"
+	// latency threshold. Default false — observability via /health
+	// works without this flag; only the back-pressure response is gated.
+	AutoBackoffEnabled bool
+
 	// TelemetryEnabled is opt-in. Wired in v0.2 once the consent screen ships.
 	TelemetryEnabled bool
 
@@ -199,8 +259,13 @@ func Default() (Config, error) {
 		SDPort:       11504,
 		BarkModel:    "", // opt-in
 		BarkPort:     11505,
-		MaxContext:   8192,
-		MetalNCB:     2,
+		MaxContext:      8192,
+		MetalNCB:        2,
+		EmbedUbatchSize: 0, // 0 = inherit MaxContext (preserves v0.5.0 behaviour)
+		EmbedMetalNCB:   0, // 0 = inherit MetalNCB
+		RerankBatchSize: 0, // 0 = use llama.cpp's 512-token internal default
+		RerankMetalNCB:  0, // 0 = inherit MetalNCB
+		AutoBackoffEnabled: false,
 	}, nil
 }
 
@@ -235,6 +300,11 @@ func Load() (Config, error) {
 	cfg.BarkPort = envIntOr("QUENCHFORGE_BARK_PORT", cfg.BarkPort)
 	cfg.MaxContext = envIntOr("QUENCHFORGE_MAX_CONTEXT", cfg.MaxContext)
 	cfg.MetalNCB = envIntOr("QUENCHFORGE_METAL_N_CB", cfg.MetalNCB)
+	cfg.EmbedUbatchSize = envIntOr("QUENCHFORGE_EMBED_UBATCH_SIZE", cfg.EmbedUbatchSize)
+	cfg.EmbedMetalNCB = envIntOr("QUENCHFORGE_EMBED_METAL_N_CB", cfg.EmbedMetalNCB)
+	cfg.RerankBatchSize = envIntOr("QUENCHFORGE_RERANK_BATCH_SIZE", cfg.RerankBatchSize)
+	cfg.RerankMetalNCB = envIntOr("QUENCHFORGE_RERANK_METAL_N_CB", cfg.RerankMetalNCB)
+	cfg.AutoBackoffEnabled = envBoolOr("QUENCHFORGE_AUTO_BACKOFF", cfg.AutoBackoffEnabled)
 	cfg.TelemetryEnabled = envBoolOr("QUENCHFORGE_TELEMETRY", false)
 	cfg.AdvertiseMDNS = envBoolOr("QUENCHFORGE_ADVERTISE_MDNS", false)
 
@@ -259,6 +329,18 @@ func (c Config) Validate() error {
 	}
 	if c.MetalNCB < 1 {
 		return fmt.Errorf("config: MetalNCB %d must be >= 1", c.MetalNCB)
+	}
+	if c.EmbedUbatchSize < 0 {
+		return fmt.Errorf("config: EmbedUbatchSize %d must be >= 0 (0 = inherit MaxContext)", c.EmbedUbatchSize)
+	}
+	if c.EmbedMetalNCB < 0 {
+		return fmt.Errorf("config: EmbedMetalNCB %d must be >= 0 (0 = inherit MetalNCB)", c.EmbedMetalNCB)
+	}
+	if c.RerankBatchSize < 0 {
+		return fmt.Errorf("config: RerankBatchSize %d must be >= 0 (0 = llama.cpp default)", c.RerankBatchSize)
+	}
+	if c.RerankMetalNCB < 0 {
+		return fmt.Errorf("config: RerankMetalNCB %d must be >= 0 (0 = inherit MetalNCB)", c.RerankMetalNCB)
 	}
 	if c.ChatPort < 1 || c.ChatPort > 65535 {
 		return fmt.Errorf("config: ChatPort %d outside valid TCP port range", c.ChatPort)
