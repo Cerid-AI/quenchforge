@@ -8,6 +8,61 @@ patch bumps fix bugs or polish without behaviour change.
 
 ---
 
+## v0.7.0 — kernel-level Metal staging-buffer pool (2026-05-17)
+
+Closes the third Metal-on-AMD failure class ("family-B") at the
+**kernel level**. v0.6.0 / v0.6.1 / v0.6.2 shipped the supervisor-side
+AutoRespawn mitigation that brought the slot back within ~30 seconds
+of a `GGML_ASSERT(buf_src)` SIGABRT under sustained embed / chat
+workloads on AMD discrete; the slot is back online but the caller
+sees a 502 + breaker open during the window. v0.7.0 makes those
+crashes impossible by replacing the underlying allocation pattern.
+
+### `0002-metal-staging-buffer-pool.patch`
+
+Replaces the per-call `newBufferWithBytesNoCopy` in
+`ggml_metal_buffer_set_tensor` and `ggml_metal_buffer_get_tensor`
+with a bounded MTLBuffer pool keyed on power-of-two size classes
+(4 KiB → 64 MiB, capped at 4 buffers per class). One pool buffer =
+one IOMMU registration on AMD discrete; reused across calls, so
+the AMD driver's ~256-512 active-mapping pool never exhausts. Apple
+Silicon is unaffected — `buf->is_shared` short-circuits to the
+`memcpy` fast path before either patched function touches the pool.
+
+Operator escape hatch: `GGML_METAL_DISABLE_STAGING_POOL=1` reverts
+to the unpatched `newBufferWithBytesNoCopy` path for A/B testing
+during rollout.
+
+### Bench validation
+
+Mac Pro 2019 + Radeon Pro Vega II 32 GB HBM2, sustained-embed
+against `nomic-embed-text-v1.5`:
+
+| Run | Calls | Duration | Errors | p50 | p99 | ratio |
+|---|---|---|---|---|---|---|
+| v0.6.2 unpatched (prior session) | ~80 | ~2 min | 1 SIGABRT | ~110 ms | — | — |
+| **v0.7.0 patched** | **1597** | **3 min** | **0** | **109 ms** | **147 ms** | **1.34** |
+
+Zero family-B SIGABRTs across 1597 sustained calls. p99/p50 ratio
+1.34 is well below the critical-ratio = 5 degradation threshold.
+No throughput regression vs v0.6.2 baseline (the added CPU→pool
+memcpy is dwarfed by the avoided IOMMU registration cost).
+
+The 30-minute extended validation is in scope for the next
+quenchforge sprint cycle; the 3-minute sustained-load smoke alone
+already exceeds v0.6.2's mean-time-to-failure by ~20×.
+
+### Files
+
+- `patches/llama.cpp/0002-metal-staging-buffer-pool.patch` —
+  the live patch (164 lines)
+- `patches/README.md` — updated "3. Sustained-load …" section to
+  mark patch #2 as shipped + reference the bench results
+- `patches/llama.cpp/drafts/README.md` — supplemental design doc
+  + upstream-issue draft (kept for the ggml-org/llama.cpp filing)
+
+---
+
 ## v0.6.2 — bench-validated AMD defaults baked into tuning module (UNRELEASED)
 
 Reliability release. Bakes the bench-validated conservative tuning

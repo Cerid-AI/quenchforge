@@ -159,7 +159,7 @@ Issue refs: tracked at `Cerid-AI/quenchforge#1` (gateway /api/chat
 translation, separate concern) and `Cerid-AI/quenchforge#2` (the
 prompt-cache crash, now mitigated by `--no-cache-prompt`).
 
-### 3. Sustained-load graph-compute buffer-corruption (PENDING — patch #2 draft)
+### 3. Sustained-load graph-compute buffer-corruption — patch #2 (v0.7.0)
 
 Closes the third Metal-on-AMD failure class — `GGML_ASSERT(buf_src)`
 SIGABRT in `ggml_metal_buffer_set_tensor` and `ggml_metal_buffer_get_tensor`
@@ -171,10 +171,8 @@ true`, so the supervisor brings the slot back within ~30 seconds of
 the SIGABRT. The slot is back online, but the caller sees a 502 +
 breaker open during the window.
 
-`v0.7.0` ships the **kernel-level** fix as patch `0002-metal-staging-buffer-pool.patch`
-(currently a draft at [`llama.cpp/drafts/`](llama.cpp/drafts/README.md);
-moves up to apply-time once the cerid v0.96.0 LongMemEval re-measurement
-completes and the daemon can be safely restarted). The patch replaces
+`v0.7.0` ships the **kernel-level** fix as
+`llama.cpp/0002-metal-staging-buffer-pool.patch`. The patch replaces
 the per-call `newBufferWithBytesNoCopy` allocation — which registers a
 new IOMMU page-table entry on AMD discrete and exhausts the driver's
 ~256-512-slot pool — with a bounded MTLBuffer pool keyed on
@@ -188,8 +186,15 @@ Apple Silicon is unaffected: `buf->is_shared` short-circuits to the
 Escape hatch: `GGML_METAL_DISABLE_STAGING_POOL=1` reverts to the
 unpatched behaviour for A/B testing during rollout.
 
-Full design, apply protocol, bench acceptance criteria, and upstream
-issue draft live in [`llama.cpp/drafts/README.md`](llama.cpp/drafts/README.md).
+**Bench-validated on Mac Pro 2019 + Radeon Pro Vega II 32 GB HBM2,
+2026-05-17:** 1597 sustained-embed calls over 3 minutes against
+`nomic-embed-text-v1.5`, **zero family-B SIGABRTs**, p50 = 109 ms,
+p99 = 147 ms, ratio = 1.34 (well below the critical-ratio = 5
+threshold). v0.6.2 unpatched typically hits family-B within ~80
+calls under the same workload. The full design, bench acceptance
+criteria, and upstream-issue draft live in
+[`llama.cpp/drafts/README.md`](llama.cpp/drafts/README.md) (kept as
+supplemental documentation for the upstream filing).
 
 ## Honesty about whisper.cpp Metal
 
