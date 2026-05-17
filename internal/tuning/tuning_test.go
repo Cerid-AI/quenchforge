@@ -65,14 +65,17 @@ func TestKernelParams_ChatAMDGetsCorrectnessFlags(t *testing.T) {
 				t.Errorf("chat AMD %s ExtraArgs = %v, want %v",
 					p, tn.ExtraArgs, wantExtra)
 			}
-			// Chat doesn't get embed-style ubatch / batch overrides
-			// or auto-respawn (sustained chat decode is bursty per
-			// request — operator restart is fine).
+			// Chat doesn't get embed-style ubatch / batch overrides,
+			// but DOES get AutoRespawn on AMD discrete — sustained
+			// chat workloads (cerid LongMemEval extraction, agent
+			// loops) hit family-B SIGABRT same as embed. v0.6.0
+			// shipped without this and the chat slot stayed dead;
+			// v0.6.1 fixed it.
 			if tn.UbatchSize != 0 || tn.BatchSize != 0 || tn.MetalNCB != 0 {
 				t.Errorf("chat AMD %s unexpected non-zero tuning: %+v", p, tn)
 			}
-			if tn.AutoRespawn {
-				t.Errorf("chat AMD %s should not request AutoRespawn (yet)", p)
+			if !tn.AutoRespawn {
+				t.Errorf("chat AMD %s should request AutoRespawn", p)
 			}
 		})
 	}
