@@ -1,0 +1,276 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Quenchforge Contributors <maintainers@cerid-ai.com>
+Date: Sun, 17 May 2026 07:30:00 -0400
+Subject: [PATCH] metal: pool transient staging buffers on AMD discrete
+
+DRAFT — NOT YET APPLIED. Apply after the cerid v0.96.0 Phase 1
+LongMemEval re-measurement completes; regenerate this diff from
+the resulting `git diff` so the file indices match the tree.
+
+Eliminates the AMD-Mac sustained-load Metal SIGABRT family-B by
+replacing the per-call `newBufferWithBytesNoCopy` pattern in
+`ggml_metal_buffer_set_tensor` and `ggml_metal_buffer_get_tensor`
+with a bounded MTLBuffer pool. The current code allocates a fresh
+shared-mode staging buffer on every set/get, which registers a new
+IOMMU page-table entry per call on AMD discrete. After ~80 sustained
+calls (sub-millisecond cadence under eval/ingest workloads) the
+driver's PCIe-mapped staging-buffer pool — ~256-512 active mappings
+— exhausts, `newBufferWithBytesNoCopy` returns nil, and the
+`GGML_ASSERT(buf_src)` SIGABRTs.
+
+Mechanism (verified by reading ggml-metal-device.m:1665-1755 and Apple's
+"Metal Best Practices Guide" § "Manage Memory Allocation Performance"):
+
+- Apple Silicon: `buf->is_shared == true`, both functions take the
+  `memcpy` fast path (lines 1666-1668, 1720-1722) and never enter the
+  buffer-pool codepath. Unaffected by this patch.
+- AMD discrete: `MTLResourceStorageModeShared` goes through
+  IOSurface-backed PCIe-mapped memory; each `newBufferWithBytesNoCopy`
+  is a fresh kernel-level registration. The driver caps active
+  registrations; sustained per-call allocations exhaust it faster than
+  reclamation can keep up.
+
+The fix follows Apple's documented pattern (Pattern A from the cerid
+v0.96.0 Apple-SDK bottleneck analysis): pre-allocate `MTLBuffer`s in
+power-of-two size classes, recycle on each call, cap per-class count.
+One pool buffer = one IOMMU registration, reused. Worst-case total
+registrations across all classes = 4 × N_classes ≈ 30-40, well below
+the AMD driver's exhaustion threshold.
+
+Trade-off: the source/destination data is no longer the caller's
+`data` pointer, so we copy via `memcpy` into a pool buffer before the
+blit (set_tensor) or out of a pool buffer after the blit (get_tensor).
+This is the same memory traffic Apple Silicon does anyway, and is
+strictly cheaper than the per-call allocation it replaces — the
+allocation itself was the slow path on AMD discrete (sub-ms kernel
+crossing, IOMMU registration).
+
+Operator escape hatch: `GGML_METAL_DISABLE_STAGING_POOL=1` reverts to
+the old `newBufferWithBytesNoCopy` path. Useful for A/B testing during
+the v0.7.0 rollout and as a safety belt if a workload trips on an
+edge case we haven't characterised.
+
+Upstream-Issue: TBD (file at ggml-org/llama.cpp with a synthetic
+sustained-embed bench reproducing family-B on Vega II + Mac Pro 2019).
+Signed-off-by: Quenchforge Contributors <maintainers@cerid-ai.com>
+---
+ ggml/src/ggml-metal/ggml-metal-device.m | 156 ++++++++++++++++++++++--
+ 1 file changed, 148 insertions(+), 8 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -28,6 +28,100 @@
+ #endif
+
++// ---------------------------------------------------------------------------
++// Quenchforge patch 0002: bounded MTLBuffer pool for transient staging.
++//
++// The set_tensor / get_tensor paths used to call newBufferWithBytesNoCopy
++// per invocation. On AMD discrete that registers one IOMMU page-table
++// entry per call; sustained sub-ms cadence exhausts the AMD driver's
++// PCIe-mapped staging-buffer pool (~256-512 slots) and the next call
++// returns nil → GGML_ASSERT SIGABRT (family-B sustained-load crash).
++//
++// Pool design:
++//   - Power-of-two size classes from 4 KiB up to 64 MiB.
++//   - Per-class FIFO of free buffers, capped at QF_STAGING_PER_CLASS_CAP.
++//   - Acquire pops from the bucket (or newBufferWithLength: on miss).
++//   - Release pushes back; over-cap excess buffers are released to ARC.
++//   - One NSLock around the whole pool (the staging path is already
++//     serialised behind cmd-buffer waitUntilCompleted; lock contention
++//     is not on the critical path).
++//
++// Apple Silicon never enters this codepath (`buf->is_shared` fast path
++// in set_tensor / get_tensor short-circuits before touching the pool).
++// ---------------------------------------------------------------------------
++
++#define QF_STAGING_PER_CLASS_CAP 4
++#define QF_STAGING_MIN_CLASS_LOG2 12  // 4 KiB
++#define QF_STAGING_MAX_CLASS_LOG2 26  // 64 MiB
++
++static NSLock * qf_staging_lock = nil;
++static NSMutableDictionary<NSNumber *, NSMutableArray<id<MTLBuffer>> *> *
++    qf_staging_pool = nil;
++
++static void qf_staging_init_once(void) {
++    static dispatch_once_t once;
++    dispatch_once(&once, ^{
++        qf_staging_lock = [[NSLock alloc] init];
++        qf_staging_pool = [[NSMutableDictionary alloc] init];
++    });
++}
++
++static size_t qf_staging_class(size_t requested) {
++    size_t cls = (size_t)1 << QF_STAGING_MIN_CLASS_LOG2;
++    size_t max = (size_t)1 << QF_STAGING_MAX_CLASS_LOG2;
++    while (cls < requested && cls < max) cls <<= 1;
++    return cls < requested ? requested : cls;
++}
++
++static bool qf_staging_disabled(void) {
++    static bool initialised = false;
++    static bool disabled = false;
++    if (!initialised) {
++        disabled = (getenv("GGML_METAL_DISABLE_STAGING_POOL") != NULL);
++        initialised = true;
++    }
++    return disabled;
++}
++
++static id<MTLBuffer> qf_staging_acquire(id<MTLDevice> device, size_t size) {
++    qf_staging_init_once();
++    const size_t cls = qf_staging_class(size);
++    NSNumber * key = @(cls);
++
++    [qf_staging_lock lock];
++    NSMutableArray<id<MTLBuffer>> * bucket = qf_staging_pool[key];
++    if (bucket == nil) {
++        bucket = [[NSMutableArray alloc] init];
++        qf_staging_pool[key] = bucket;
++    }
++    id<MTLBuffer> buf = [bucket lastObject];
++    if (buf != nil) {
++        [bucket removeLastObject];
++        [qf_staging_lock unlock];
++        return buf;
++    }
++    [qf_staging_lock unlock];
++
++    // Cold path: one allocation = one IOMMU registration. The buffer
++    // outlives this call and gets returned via qf_staging_release.
++    return [device newBufferWithLength:cls
++                              options:MTLResourceStorageModeShared];
++}
++
++static void qf_staging_release(id<MTLBuffer> buf) {
++    if (buf == nil) return;
++    NSNumber * key = @(buf.length);
++
++    [qf_staging_lock lock];
++    NSMutableArray<id<MTLBuffer>> * bucket = qf_staging_pool[key];
++    if (bucket != nil && bucket.count < QF_STAGING_PER_CLASS_CAP) {
++        [bucket addObject:buf];
++    }
++    // else: drop buf; ARC frees the registration. Bounds total pool growth.
++    [qf_staging_lock unlock];
++}
++
+ // create residency sets only on macOS >= 15.0
+ #if !TARGET_CPU_X86_64 && TARGET_OS_OSX && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000 || \
+     TARGET_OS_IOS && __IPHONE_OS_VERSION_MAX_ALLOWED >= 180000 || \
+@@ -1665,15 +1759,30 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor *
+     if (buf->is_shared) {
+         memcpy((char *) tensor->data + offset, data, size);
+         return;
+     }
+
+     @autoreleasepool {
+-        // src
+-        void * data_ptr = (void *)(uintptr_t) data; // "const cast" the src data
+-        id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithBytesNoCopy:data_ptr
+-                                                               length:size
+-                                                              options:MTLResourceStorageModeShared
+-                                                          deallocator:nil];
++        // src — Quenchforge patch 0002: acquire from staging pool to
++        // avoid the per-call IOMMU registration that exhausts the AMD
++        // driver's PCIe-mapped staging pool under sustained load.
++        // Escape hatch: GGML_METAL_DISABLE_STAGING_POOL=1 reverts to the
++        // old newBufferWithBytesNoCopy path.
++        id<MTLBuffer> buf_src;
++        bool pooled = false;
++        if (!qf_staging_disabled()) {
++            buf_src = qf_staging_acquire(buf->dev->mtl_device, size);
++            if (buf_src != nil) {
++                memcpy([buf_src contents], data, size);
++                pooled = true;
++            }
++        }
++        if (!pooled) {
++            void * data_ptr = (void *)(uintptr_t) data;
++            buf_src = [buf->dev->mtl_device newBufferWithBytesNoCopy:data_ptr
++                                                               length:size
++                                                              options:MTLResourceStorageModeShared
++                                                          deallocator:nil];
++        }
+
+         GGML_ASSERT(buf_src);
+
+@@ -1696,12 +1805,16 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor *
+             [encoder endEncoding];
+         }
+
+-        [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+-                             // TODO: can check for errors here
+-            GGML_UNUSED(cb);
++        [cmd_buf commit];
+
+-            dispatch_semaphore_signal(completion_semaphore);
+-        }];
+-
+-        [cmd_buf commit];
+-
+-        dispatch_semaphore_wait(completion_semaphore, DISPATCH_TIME_FOREVER);
+-        dispatch_release(completion_semaphore);
++        // We must wait for the blit before releasing the pool buffer
++        // back to the bucket; the GPU is still reading from it until
++        // the command buffer completes. The semaphore-vs-waitUntilCompleted
++        // perf delta is documented as "doesn't seem to make much
++        // difference" in the upstream comment — wait is simpler.
++        [cmd_buf waitUntilCompleted];
++
++        if (pooled) {
++            qf_staging_release(buf_src);
++        }
+     }
+ }
+@@ -1719,16 +1832,28 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_te
+     if (buf->is_shared) {
+         memcpy(data, (const char *) tensor->data + offset, size);
+         return;
+     }
+
+     @autoreleasepool {
+         // src
+         struct ggml_metal_buffer_id bid_src = ggml_metal_buffer_get_id(buf, tensor);
+         bid_src.offs += offset;
+
+-        // dst
+-        id<MTLBuffer> buf_dst = [buf->dev->mtl_device newBufferWithBytesNoCopy:data
+-                                                               length:size
+-                                                              options:MTLResourceStorageModeShared
+-                                                          deallocator:nil];
++        // dst — Quenchforge patch 0002: acquire from staging pool. Same
++        // rationale as set_tensor; this path is hit on every encoder
++        // readback from non-shared buffers.
++        id<MTLBuffer> buf_dst;
++        bool pooled = false;
++        if (!qf_staging_disabled()) {
++            buf_dst = qf_staging_acquire(buf->dev->mtl_device, size);
++            if (buf_dst != nil) {
++                pooled = true;
++            }
++        }
++        if (!pooled) {
++            buf_dst = [buf->dev->mtl_device newBufferWithBytesNoCopy:data
++                                                              length:size
++                                                             options:MTLResourceStorageModeShared
++                                                         deallocator:nil];
++        }
+
+         GGML_ASSERT(buf_dst);
+
+@@ -1747,5 +1872,12 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_te
+         [cmd_buf commit];
+         [cmd_buf waitUntilCompleted];
++
++        if (pooled) {
++            // Pool path: blit landed in our staging buffer; copy out
++            // to the caller's buffer, then return staging to the pool.
++            memcpy(data, [buf_dst contents], size);
++            qf_staging_release(buf_dst);
++        }
+     }
+ }
+--
+2.42.0

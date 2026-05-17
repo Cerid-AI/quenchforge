@@ -159,6 +159,38 @@ Issue refs: tracked at `Cerid-AI/quenchforge#1` (gateway /api/chat
 translation, separate concern) and `Cerid-AI/quenchforge#2` (the
 prompt-cache crash, now mitigated by `--no-cache-prompt`).
 
+### 3. Sustained-load graph-compute buffer-corruption (PENDING — patch #2 draft)
+
+Closes the third Metal-on-AMD failure class — `GGML_ASSERT(buf_src)`
+SIGABRT in `ggml_metal_buffer_set_tensor` and `ggml_metal_buffer_get_tensor`
+under sustained embed / chat workloads on AMD discrete.
+
+`v0.6.0` shipped a **supervisor-side** mitigation: AMD-discrete embed,
+code-embed, rerank, and (since v0.6.1) chat slots get `AutoRespawn:
+true`, so the supervisor brings the slot back within ~30 seconds of
+the SIGABRT. The slot is back online, but the caller sees a 502 +
+breaker open during the window.
+
+`v0.7.0` ships the **kernel-level** fix as patch `0002-metal-staging-buffer-pool.patch`
+(currently a draft at [`llama.cpp/drafts/`](llama.cpp/drafts/README.md);
+moves up to apply-time once the cerid v0.96.0 LongMemEval re-measurement
+completes and the daemon can be safely restarted). The patch replaces
+the per-call `newBufferWithBytesNoCopy` allocation — which registers a
+new IOMMU page-table entry on AMD discrete and exhausts the driver's
+~256-512-slot pool — with a bounded MTLBuffer pool keyed on
+power-of-two size classes. One pool buffer = one registration, reused;
+worst-case total registrations stays well below the exhaustion
+threshold.
+
+Apple Silicon is unaffected: `buf->is_shared` short-circuits to the
+`memcpy` fast path before either patched function reaches the pool.
+
+Escape hatch: `GGML_METAL_DISABLE_STAGING_POOL=1` reverts to the
+unpatched behaviour for A/B testing during rollout.
+
+Full design, apply protocol, bench acceptance criteria, and upstream
+issue draft live in [`llama.cpp/drafts/README.md`](llama.cpp/drafts/README.md).
+
 ## Honesty about whisper.cpp Metal
 
 The patch is necessary on both submodules but **not sufficient on whisper.cpp**. Even with `simdgroup_reduction` and `bfloat` both disabled, whisper-server on Vega II still produces garbage tokens — there's an additional Metal-on-AMD bug in whisper-specific kernels (likely the encoder's convolution or attention paths). The patch silences the obvious failure modes; the deeper issue is still being investigated.
