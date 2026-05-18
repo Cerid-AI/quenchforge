@@ -8,6 +8,76 @@ patch bumps fix bugs or polish without behaviour change.
 
 ---
 
+## v0.8.0-rc1 — matmul fallback kernels (2026-05-18, patch-staged)
+
+Completes the kernel-level fix series that v0.7.1 began. Adds
+fallback Metal kernels for `kernel_mul_mv_t_t` and
+`kernel_mul_mv_t_t_4` (fp32/fp16 mat-vec) that bypass
+`helper_mv_reduce_and_write`'s two `simd_sum` reductions with a pure
+threadgroup tree-reduction over fixed-size function-local memory.
+
+Combined with patch 0003, the four reduction-heavy kernels BERT
+forward passes exercise (LayerNorm, softmax, matmul reduce, matmul
+reduce vector) now have AMD-safe fallback variants. The dispatcher in
+`pipeline_mul_mv` selects the `_fb` suffix when both
+`has_simdgroup_reduction == false` AND the tensor type is fp32/fp16
+— quantized BERT paths fall through to the upstream (broken-on-AMD)
+kernel, so the dispatcher's predicate makes the coverage state
+explicit.
+
+### Status — patch staged, NOT yet activated in production
+
+`patches/llama.cpp/0004-metal-amd-bert-matmul-fallback.patch` lands
+this release. The patch is applied automatically at build time via
+`scripts/apply-patches.sh`. **Production still runs on the v0.7.0
+CPU route** (`--gpu-layers 0` in `internal/tuning/tuning.go` for the
+AMD-discrete embed/code-embed/rerank slots).
+
+Activation requires:
+
+1. Build with all four patches applied (automatic via apply-patches.sh).
+2. `scripts/bench-bert-correctness.py` PASSES (same-batch cos_sim,
+   separate-call cos_sim, semantic sanity, L2 norm bounds).
+3. `scripts/bench-bert-sustained-load.py --duration 1800` PASSES
+   (no SIGABRT, no HTTP 5xx burst, no catastrophic drift, no RSS
+   leak, no latency cliff).
+4. Operator edits `internal/tuning/tuning.go` to remove the
+   `--gpu-layers 0` arg from `embedParams` / `rerankParams` on
+   AMD-discrete profiles. Rebuild, restart.
+
+Reversible: add the flag back to `tuning.go`, rebuild, restart.
+
+### What's covered
+
+- `helper_mv_reduce_and_write_fb` — pure-threadgroup tree-reduce helper
+- `kernel_mul_mv_t_t_fb` (f32/f32, f16/f32, f16/f16)
+- `kernel_mul_mv_t_t_4_fb` (vector variants)
+- Dispatcher gating in `ggml_metal_library_get_pipeline_mul_mv`
+
+### What's deferred
+
+- Quantized mat-vec variants (Q4_0, Q5_0, Q8_0, MXFP4, K-quants,
+  IQ-quants). Not exercised by the fp32 embed/rerank models we run;
+  would be needed for a quantized BERT-family model.
+- `_short` variant (ne00 < 32). Not exercised by BERT shapes.
+- Other reduction-heavy kernels (`kernel_argmax`, `group_norm`).
+  Not exercised by BERT forward pass for embed.
+
+### New benchmarks
+
+Two operator-runnable safety benches that gate the activation step:
+
+- `scripts/bench-bert-correctness.py` — four-probe numeric
+  correctness harness (~30s wall on a healthy daemon). Catches the
+  specific class of failure that v0.7.0-rc1's staging-buffer-pool
+  patch slipped through (passed HTTP-200, broke recall).
+- `scripts/bench-bert-sustained-load.py` — 30-min concurrent load
+  test that watches for SIGABRT, HTTP 5xx burst, output drift, RSS
+  leak, and the latency-cliff IOSurface-exhaustion pattern that
+  caused the 2026-05-14 kernel panic.
+
+---
+
 ## v0.7.1 — partial kernel-level BERT correctness: norm + softmax fallbacks (2026-05-17)
 
 First foundation slice toward the v0.8.0 kernel-level fix. Ships

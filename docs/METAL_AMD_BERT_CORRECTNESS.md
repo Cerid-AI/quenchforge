@@ -203,6 +203,110 @@ The patch ships nonetheless because:
 AMD-discrete embed/rerank via tuning.go) until the matmul
 fallbacks are also written.
 
+## v0.8.0 candidate (in progress — patch 0004 staged)
+
+Patch `0004-metal-amd-bert-matmul-fallback.patch` adds the matmul
+fallback that v0.7.1 lacked. Shipped at the patch-staged level
+(2026-05-18) — applies at the next build via `apply-patches.sh` but
+stays dormant in production because `tuning.go` still routes embed
+to CPU. **Activation is a separate, deliberate operator step** —
+see "Activation protocol" below.
+
+### What 0004 ships
+
+- `helper_mv_reduce_and_write_fb` in `ggml-metal.metal` — a fallback
+  variant of the matmul reduce helper that replaces both `simd_sum`
+  cross-lane reductions with a pure threadgroup tree-reduction over
+  fixed-size function-local memory (matches the v0.7.1 norm/softmax
+  pattern).
+- `kernel_mul_mv_t_t_fb` and `kernel_mul_mv_t_t_4_fb` template
+  kernels — bodies are byte-identical to the upstream `_impl`
+  templates except for the final reduce call. Instantiated for the
+  fp32 and fp16 BERT paths:
+  `kernel_mul_mv_f32_f32_fb`, `kernel_mul_mv_f16_f32_fb`,
+  `kernel_mul_mv_f16_f16_fb`, plus the `_4` vector variants of each.
+- Dispatcher gating in
+  `ggml-metal-device.cpp::ggml_metal_library_get_pipeline_mul_mv` —
+  appends `_fb` to the kernel base name when both
+  `has_simdgroup_reduction == false` AND the type is fp32/fp16
+  (BERT-family). All other types and Apple-Silicon paths are
+  unchanged.
+
+### What 0004 does NOT ship (deferred follow-ups)
+
+- **Quantized mat-vec variants** (Q4_0, Q5_0, Q8_0, MXFP4, K-quants,
+  IQ-quants): not exercised by the embed/rerank models we run (all
+  fp32). A quantized BERT-family model would currently fall through
+  to the upstream simd_sum kernel and produce broken outputs on
+  AMD-Mac. The dispatcher's `has_fb_qf` predicate gates on
+  `tsrc0 == GGML_TYPE_F32 || tsrc0 == GGML_TYPE_F16` precisely to
+  make this state explicit — non-fp paths still use the upstream
+  (broken-on-AMD) kernel name, no false claim of correctness.
+- **`_short` variant** of mul_mv: only exercised when `ne00 < 32`,
+  which BERT shapes never hit. Fallback can be added if a future
+  model uses it.
+- **Other reduction-heavy kernels** (`kernel_argmax`,
+  `group_norm`, `kernel_mul_mv_ext_*`, attention-style fused
+  kernels): not exercised by BERT forward pass for the embed
+  workload, so deferred. Each is ~30 LOC of mechanical pattern
+  repetition once needed.
+
+### Activation protocol
+
+This patch lands the kernel-level fallback, but **production stays on
+the CPU route** until an operator deliberately flips the switch. The
+sequence:
+
+1. **Build** the quenchforge binary with all four patches applied.
+   `apply-patches.sh` runs automatically as part of `build-llama.sh`.
+2. **Run the numeric-correctness harness:**
+   ```sh
+   scripts/bench-bert-correctness.py --model nomic-embed-text-v1.5
+   ```
+   Must report:
+   - same-batch cos_sim 1.0000 (within 1e-4)
+   - separate-call cos_sim 1.0000 (within 1e-4)
+   - semantic paraphrase cos_sim > 0.50
+   - L2 norm within [0.5, 5.0]
+
+   If any probe fails: **do not proceed.** File a bug, keep the CPU
+   route in place. The harness fails in seconds, so iteration cost
+   is low.
+3. **Run the sustained-load bench** (release-gate: 30 minutes):
+   ```sh
+   scripts/bench-bert-sustained-load.py \
+     --model nomic-embed-text-v1.5 --duration 1800
+   ```
+   Must complete without:
+   - SIGABRT / daemon process disappearance
+   - HTTP 5xx burst (5+ 5xx in any 30-second window)
+   - catastrophic output drift (cos_sim < 0.95)
+   - RSS growth above 2× the initial value
+   - latency cliff (late p95 > 5× early p95 — the 2026-05-14
+     IOSurface-exhaustion pattern)
+
+   Sub-30s drift WARNs (cos_sim 0.99–0.999) are acceptable — fp
+   rounding noise from concurrent batching is expected on the
+   CPU-routed path too, and the FAIL floor (0.95) has 10× headroom
+   over the actual Metal-bug class (cos_sim ≈ 0.07).
+4. **Only if both benches pass:** edit
+   `internal/tuning/tuning.go::embedParams` and `rerankParams` to
+   drop the `--gpu-layers 0` arg from the AMD-discrete profile.
+   Rebuild, restart the daemon.
+5. **Watch the first ablation** that runs against the activated GPU
+   path. Compare per-type recall to the CPU-routed baseline. The
+   handoff at `cerid-ai-internal/tasks/2026-05-17-ablation-results.md`
+   names the reference numbers.
+
+The `--gpu-layers 0` removal is reversible: add it back to
+`tuning.go`, rebuild, restart. The CPU-route fix shipped in v0.7.0
+stays in place as the safety net until step 4 is taken.
+
+## v0.8.0 alternative paths considered
+
+The kernel-level fallback (patch 0004) is the targeted, low-blast-
+radius path. Two alternatives exist if it ever proves insufficient:
+
 ## v0.8.0 candidate — kernel-level fix design (full scope)
 
 The 2026-05-17 partial-fix investigation revealed that the BERT

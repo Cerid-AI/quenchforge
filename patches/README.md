@@ -1,15 +1,19 @@
 # Patch series
 
-Quenchforge carries **four** patches — one per submodule. All four fix the same root cause (Apple-Silicon-only Metal kernels incorrectly enabled on AMD Mac), in four independently-vendored copies of ggml-metal. Applied at build time by `scripts/apply-patches.sh`; submodule SHAs in `.gitmodules` stay clean.
+Quenchforge carries six patches across four submodules — all address Metal-on-AMD correctness. Applied at build time by `scripts/apply-patches.sh`; submodule SHAs in `.gitmodules` stay clean.
 
 | File | Submodule path | Target file | Upstream |
 |---|---|---|---|
 | `llama.cpp/0001-metal-correctness-on-non-apple-silicon.patch` | `llama.cpp/` | `ggml/src/ggml-metal/ggml-metal-device.m` | [`ggml-org/llama.cpp`](https://github.com/ggml-org/llama.cpp) |
+| `llama.cpp/0003-metal-amd-bert-fallback-kernels.patch` | `llama.cpp/` | `ggml/src/ggml-metal/ggml-metal.metal` + `ggml-metal-device.cpp` | in-tree (v0.7.1 — LayerNorm + softmax fallback) |
+| `llama.cpp/0004-metal-amd-bert-matmul-fallback.patch` | `llama.cpp/` | `ggml/src/ggml-metal/ggml-metal.metal` + `ggml-metal-device.cpp` | in-tree (v0.8.0 candidate — matmul fallback) |
 | `whisper.cpp/0001-metal-correctness-on-non-apple-silicon.patch` | `whisper.cpp/` | `ggml/src/ggml-metal/ggml-metal-device.m` | [`ggml-org/whisper.cpp`](https://github.com/ggml-org/whisper.cpp) |
 | `sd.cpp/0001-metal-correctness-on-non-apple-silicon.patch` | `sd.cpp/` | `ggml/src/ggml-metal/ggml-metal-device.m` (via nested `ggml-org/ggml` submodule) | [`leejet/stable-diffusion.cpp`](https://github.com/leejet/stable-diffusion.cpp) |
 | `bark.cpp/0001-metal-correctness-on-non-apple-silicon.patch` | `bark.cpp/` | `encodec.cpp/ggml/src/ggml-metal.m` (via two-level nested submodules; older single-file `ggml-metal.m` layout, different API: `support_*` not `has_*`) | [`PABannier/bark.cpp`](https://github.com/PABannier/bark.cpp) → [`PABannier/encodec.cpp`](https://github.com/PABannier/encodec.cpp) |
 
-All four patches address the **same upstream bug** ([ggml-org/llama.cpp#19563](https://github.com/ggml-org/llama.cpp/issues/19563)) — the `|= MTLGPUFamilyMetal3_GGML` line that enables Apple-Silicon-only kernels on AMD Mac. Each consumer of ggml has its own copy of the offending source, so we patch each copy.
+The `0001` patches all address the same upstream bug ([ggml-org/llama.cpp#19563](https://github.com/ggml-org/llama.cpp/issues/19563)) — the `|= MTLGPUFamilyMetal3_GGML` line that enables Apple-Silicon-only kernels on AMD Mac. Each consumer of ggml has its own copy of the offending source, so we patch each copy.
+
+The `0003` and `0004` patches go further: they add `_fb` (fallback) kernels for the LayerNorm, softmax, and matmul reductions that BERT-family models exercise on every forward pass. The `0001` gating alone leaves these reductions broken on AMD-Mac because the upstream dispatchers don't honour `has_simdgroup_reduction`. The new dispatchers route to the `_fb` variants when the device lacks safe simd reductions. See [`docs/METAL_AMD_BERT_CORRECTNESS.md`](../docs/METAL_AMD_BERT_CORRECTNESS.md) for the design + activation protocol.
 
 ## What the patch does
 

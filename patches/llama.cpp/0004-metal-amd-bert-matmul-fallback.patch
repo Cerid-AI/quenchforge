@@ -1,0 +1,360 @@
+From 8e18911a20f9664bc4d66b40e52a67c6f86b6897 Mon Sep 17 00:00:00 2001
+From: Quenchforge <maint@cerid-ai.com>
+Date: Mon, 18 May 2026 14:02:23 -0400
+Subject: [PATCH] metal: matmul fallback kernels for AMD-Mac BERT (v0.8.0
+ candidate)
+
+Adds fallback Metal kernels for kernel_mul_mv_t_t and kernel_mul_mv_t_t_4
+(fp32/fp16 mat-vec) that bypass the simd_sum-using
+helper_mv_reduce_and_write and instead use a pure threadgroup tree-
+reduction through fixed-size function-local threadgroup memory.
+
+Together with patch 0003 (norm + softmax fallbacks) this should restore
+full GPU embed correctness on AMD Vega II / W6800X for BERT-family
+models (nomic-embed-text-v1.5, bge-reranker-v2-m3,
+jina-embeddings-v2-base-code).
+
+Scope:
+- helper_mv_reduce_and_write_fb: pure-threadgroup tree-reduce helper
+- kernel_mul_mv_t_t_fb / kernel_mul_mv_t_t_4_fb: fp32/fp16 mat-vec fallback
+- pipeline_mul_mv: dispatcher gating on has_simdgroup_reduction
+
+Quantized variants and the _short variant are not covered (BERT models
+use fp32; quantized BERT can be added later if needed).
+
+The CPU-route v0.7.0 fix in internal/tuning/tuning.go stays the default
+production path. Operators must opt back into Metal embed AFTER passing:
+  scripts/bench-bert-correctness.py
+  scripts/bench-bert-sustained-load.py
+
+Signed-off-by: Quenchforge Contributors <maint@cerid-ai.com>
+---
+ ggml/src/ggml-metal/ggml-metal-device.cpp |  13 +-
+ ggml/src/ggml-metal/ggml-metal.metal      | 273 ++++++++++++++++++++++
+ 2 files changed, 285 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 9c84afb..4a5c0cf 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -910,7 +910,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
+     const int16_t r2 = (int16_t) (ne12 / ne02);
+     const int16_t r3 = (int16_t) (ne13 / ne03);
+ 
+-    snprintf(base, 256, "kernel_mul_mv_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
++    // Quenchforge patch 0004: select the `_fb` matmul fallback when the
++    // device cannot run simdgroup-reduction kernels correctly (non-Apple
++    // Metal). Only fp32/fp16 fallback variants exist today — patch 0004
++    // covers BERT-family models; quantized BERT and other surfaces are
++    // deferred. Falling through to the upstream name for types without
++    // `_fb` variants preserves current behaviour (still broken on AMD,
++    // but no new regression).
++    const bool has_sg_reduce_qf = ggml_metal_device_get_props(
++        ggml_metal_library_get_device(lib))->has_simdgroup_reduction;
++    const bool has_fb_qf = !has_sg_reduce_qf && (tsrc0 == GGML_TYPE_F32 || tsrc0 == GGML_TYPE_F16);
++    const char * mv_fb = has_fb_qf ? "_fb" : "";
++    snprintf(base, 256, "kernel_mul_mv_%s_%s%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix, mv_fb);
+     snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d", base, nsg, ne12, r2, r3);
+ 
+     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
+index d9580f4..54d87f9 100644
+--- a/ggml/src/ggml-metal/ggml-metal.metal
++++ b/ggml/src/ggml-metal/ggml-metal.metal
+@@ -3648,6 +3648,72 @@ static inline void helper_mv_reduce_and_write(
+     }
+ }
+ 
++// ---------------------------------------------------------------------------
++// Quenchforge patch 0004: matmul reduce-and-write fallback for non-Apple
++// Metal GPUs.
++//
++// The upstream `helper_mv_reduce_and_write` uses simd_sum() twice — once
++// across the 32 lanes of each simdgroup, once across the NSG simdgroups
++// of the threadgroup. On AMD-Mac discrete (Vega II / W6800X / RDNA) the
++// simd_sum cross-lane reduction is non-deterministic. Patch 0003 fixed
++// LayerNorm and softmax; this patch fixes the matmul reduction that
++// follows every QKV / FFN multiply.
++//
++// Same pattern as patch 0003 fallback kernels:
++//   - fixed-size function-local threadgroup memory (no dynamic shared
++//     memory as entry-point parameter; sidesteps gfx-rs/wgpu#4500)
++//   - pure threadgroup tree-reduction (no simd_sum / simd_max)
++//
++// Dispatched when has_simdgroup_reduction == false via the
++// pipeline_mul_mv gating in ggml-metal-device.cpp.
++// ---------------------------------------------------------------------------
++template<short NR0>
++static inline void helper_mv_reduce_and_write_fb(
++        device float * dst_f32,
++        float sumf[NR0],
++        const int r0,
++        const int ne01,
++        ushort tiisg,
++        ushort sgitg,
++        threadgroup char * shmem) {  // unused; kept for ABI symmetry
++    constexpr short NW = N_SIMDWIDTH;
++    const short NSG = FC_mul_mv_nsg;
++
++    // Max threadgroup size is 1024 threads; NR0 is at most 4 in the
++    // current dispatcher. Allocate the upper bound so the buffer fits
++    // any (NW, NSG, NR0) combination the dispatcher can produce.
++    threadgroup float local_buf[1024];
++
++    (void)shmem;
++
++    const ushort tid = sgitg*NW + tiisg;
++    const ushort tpg = NSG*NW;
++
++    // Write each thread's partial sums into the buffer, packed row-major:
++    // row 0 occupies [0, tpg), row 1 occupies [tpg, 2*tpg), etc.
++    for (short row = 0; row < NR0; ++row) {
++        local_buf[row*tpg + tid] = sumf[row];
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    // Tree-reduce each row's tpg-sized slice. tpg is dispatched as a
++    // power of two by the host (NSG*NW = 32, 64, 128, …).
++    for (ushort stride = tpg >> 1; stride > 0; stride >>= 1) {
++        if (tid < stride) {
++            for (short row = 0; row < NR0; ++row) {
++                local_buf[row*tpg + tid] += local_buf[row*tpg + tid + stride];
++            }
++        }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++
++    if (tid == 0) {
++        for (short row = 0; row < NR0 && r0 + row < ne01; ++row) {
++            dst_f32[r0 + row] = local_buf[row*tpg];
++        }
++    }
++}
++
+ constant short FC_mul_mv_nsg   [[function_constant(FC_MUL_MV + 0)]];
+ constant short FC_mul_mv_nxpsg [[function_constant(FC_MUL_MV + 1)]];
+ constant short FC_mul_mv_ne12  [[function_constant(FC_MUL_MV + 2)]];
+@@ -4399,6 +4465,108 @@ template [[host_name("kernel_mul_mv_bf16_f32")]]  kernel mul_mv_t_t kernel_mul_m
+ template [[host_name("kernel_mul_mv_bf16_bf16")]] kernel mul_mv_t_t kernel_mul_mv_t_t<bfloat, bfloat>;
+ #endif
+ 
++// ---------------------------------------------------------------------------
++// Quenchforge patch 0004: `_fb` matmul fallback templates. Body identical
++// to the upstream `_impl` except for the final reduce call.
++// ---------------------------------------------------------------------------
++template<typename T0, typename T1, short NR0, typename args_t>
++void kernel_mul_mv_t_t_fb_impl(
++        args_t args,
++        device const char * src0,
++        device const char * src1,
++        device       char * dst,
++        threadgroup  char * shmem,
++        uint3  tgpig,
++        ushort tiisg,
++        ushort sgitg) {
++    const short NSG = FC_mul_mv_nsg;
++    constexpr short NW = N_SIMDWIDTH;
++    constexpr short NB = 32;
++    constexpr short NF = 8;
++
++    const int nb = args.ne00/NB;
++    const int r0 = tgpig.x*NR0;
++    const int r1 = tgpig.y;
++    const int im = tgpig.z;
++
++    const uint i12 = im%FC_mul_mv_ne12;
++    const uint i13 = im/FC_mul_mv_ne12;
++
++    const uint64_t offset1 = r1*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
++    device const T1 * y = (device const T1 *) (src1 + offset1);
++
++    device const T0 * ax [NR0];
++    FOR_UNROLL (short row = 0; row < NR0; ++row) {
++        const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
++        ax[row] = (device const T0 *) ((device char *) src0 + offset0);
++    }
++
++    float sumf[NR0] = { 0.f };
++
++    const short ix = tiisg/(NW/NF);
++    const short il = tiisg%(NW/NF);
++    const int ib0 = sgitg*NF + ix;
++
++    T1 yl[NF];
++    device const T1 * yb = y + (ib0*NB + il*NF);
++
++    for (int ib = ib0; ib < nb; ib += NSG*NF) {
++        for (short i = 0; i < NF; ++i) {
++            yl[i] = yb[i];
++        }
++        for (short row = 0; row < NR0; row++) {
++            device const T0 * xb = ax[row] + (ib*NB + il*NF);
++            float sumq = 0.f;
++            FOR_UNROLL (short i = 0; i < NF; ++i) {
++                sumq += xb[i] * yl[i];
++            }
++            sumf[row] += sumq;
++        }
++        yb += NSG*NF*NW;
++    }
++
++    for (int i = nb*NB + sgitg*NW + tiisg; i < args.ne00; i += NW*NSG) {
++        for (short row = 0; row < NR0; row++) {
++            sumf[row] += ax[row][i] * y[i];
++        }
++    }
++
++    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
++    helper_mv_reduce_and_write_fb<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
++}
++
++template<typename T0, typename T1, typename args_t>
++void kernel_mul_mv_t_t_fb_disp(
++        args_t args,
++        device const char * src0,
++        device const char * src1,
++        device       char * dst,
++        threadgroup  char * shmem,
++        uint3  tgpig,
++        ushort tiisg,
++        ushort sgitg) {
++    switch (args.nr0) {
++        case 2: kernel_mul_mv_t_t_fb_impl<T0, T1, 2, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
++    }
++}
++
++template<typename T0, typename T1>
++kernel void kernel_mul_mv_t_t_fb(
++        constant ggml_metal_kargs_mul_mv & args,
++        device const char * src0,
++        device const char * src1,
++        device       char * dst,
++        threadgroup  char * shmem [[threadgroup(0)]],
++        uint3  tgpig[[threadgroup_position_in_grid]],
++        ushort tiisg[[thread_index_in_simdgroup]],
++        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
++    kernel_mul_mv_t_t_fb_disp<T0, T1, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
++}
++
++template [[host_name("kernel_mul_mv_f32_f32_fb")]] kernel mul_mv_t_t kernel_mul_mv_t_t_fb<float, float>;
++template [[host_name("kernel_mul_mv_f16_f32_fb")]] kernel mul_mv_t_t kernel_mul_mv_t_t_fb<half,  float>;
++template [[host_name("kernel_mul_mv_f16_f16_fb")]] kernel mul_mv_t_t kernel_mul_mv_t_t_fb<half,  half>;
++
+ template<typename T0, typename T04, typename T1, typename T14, short NR0, typename args_t>
+ void kernel_mul_mv_t_t_4_impl(
+         args_t args,
+@@ -4523,6 +4691,111 @@ template [[host_name("kernel_mul_mv_bf16_f32_4")]]  kernel mul_mv_t_t_4 kernel_m
+ template [[host_name("kernel_mul_mv_bf16_bf16_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<bfloat, bfloat4, bfloat, bfloat4>;
+ #endif
+ 
++// ---------------------------------------------------------------------------
++// Quenchforge patch 0004: `_4_fb` matmul fallback templates. Vector variant.
++// ---------------------------------------------------------------------------
++template<typename T0, typename T04, typename T1, typename T14, short NR0, typename args_t>
++void kernel_mul_mv_t_t_4_fb_impl(
++        args_t args,
++        device const char * src0,
++        device const char * src1,
++        device       char * dst,
++        threadgroup  char * shmem,
++        uint3  tgpig,
++        ushort tiisg,
++        ushort sgitg) {
++    const short NSG = FC_mul_mv_nsg;
++    constexpr short NW  = N_SIMDWIDTH;
++    constexpr short NB  = 32;
++    constexpr short NF  = 16;
++    constexpr short NF4 = NF/4;
++
++    const int nb = args.ne00/NB;
++    const int r0 = tgpig.x*NR0;
++    const int r1 = tgpig.y;
++    const int im = tgpig.z;
++
++    const uint i12 = im%FC_mul_mv_ne12;
++    const uint i13 = im/FC_mul_mv_ne12;
++
++    const uint64_t offset1 = r1*args.nb11 + (i12)*args.nb12 + (i13)*args.nb13;
++    device const T1  * y  = (device const T1  *) (src1 + offset1);
++    device const T14 * y4 = (device const T14 *) (src1 + offset1);
++
++    device const T0  * ax [NR0];
++    device const T04 * ax4[NR0];
++    FOR_UNROLL (short row = 0; row < NR0; ++row) {
++        const uint64_t offset0 = (r0 + row)*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
++        ax [row] = (device const T0  *) ((device char *) src0 + offset0);
++        ax4[row] = (device const T04 *) ((device char *) src0 + offset0);
++    }
++
++    float sumf[NR0] = { 0.f };
++
++    const short ix = tiisg/(NW/NF);
++    const short il = tiisg%(NW/NF);
++    const int ib0 = sgitg*NF + ix;
++
++    T14 yl4[NF4];
++    device const T14 * yb4 = y4 + (ib0*NB + il*NF)/4;
++
++    for (int ib = ib0; ib < nb; ib += NSG*NF) {
++        for (short i = 0; i < NF4; ++i) {
++            yl4[i] = yb4[i];
++        }
++        for (short row = 0; row < NR0; row++) {
++            device const T04 * xb4 = ax4[row] + (ib*NB + il*NF)/4;
++            float sumq = 0.f;
++            FOR_UNROLL (short i = 0; i < NF4; ++i) {
++                sumq += dot(float4(xb4[i]), float4(yl4[i]));
++            }
++            sumf[row] += sumq;
++        }
++        yb4 += NSG*NF*NW/4;
++    }
++
++    for (int i = nb*NB + sgitg*NW + tiisg; i < args.ne00; i += NW*NSG) {
++        for (short row = 0; row < NR0; row++) {
++            sumf[row] += ax[row][i] * y[i];
++        }
++    }
++
++    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
++    helper_mv_reduce_and_write_fb<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
++}
++
++template<typename T0, typename T04, typename T1, typename T14, typename args_t>
++void kernel_mul_mv_t_t_4_fb_disp(
++        args_t args,
++        device const char * src0,
++        device const char * src1,
++        device       char * dst,
++        threadgroup  char * shmem,
++        uint3  tgpig,
++        ushort tiisg,
++        ushort sgitg) {
++    switch (args.nr0) {
++        case 2: kernel_mul_mv_t_t_4_fb_impl<T0, T04, T1, T14, 2, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
++    };
++}
++
++template<typename T0, typename T04, typename T1, typename T14>
++kernel void kernel_mul_mv_t_t_4_fb(
++        constant ggml_metal_kargs_mul_mv & args,
++        device const char * src0,
++        device const char * src1,
++        device       char * dst,
++        threadgroup  char * shmem [[threadgroup(0)]],
++        uint3  tgpig[[threadgroup_position_in_grid]],
++        ushort tiisg[[thread_index_in_simdgroup]],
++        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
++    kernel_mul_mv_t_t_4_fb_disp<T0, T04, T1, T14, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
++}
++
++template [[host_name("kernel_mul_mv_f32_f32_4_fb")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4_fb<float, float4, float, float4>;
++template [[host_name("kernel_mul_mv_f16_f32_4_fb")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4_fb<half,  half4,  float, float4>;
++template [[host_name("kernel_mul_mv_f16_f16_4_fb")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4_fb<half,  half4,  half,  half4>;
++
+ template<typename T0, typename T1, typename args_t>
+ void kernel_mul_mv_t_t_short_impl(
+         args_t args,
+-- 
+2.50.1 (Apple Git-155)
+
