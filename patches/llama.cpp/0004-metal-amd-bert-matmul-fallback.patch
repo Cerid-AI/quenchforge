@@ -29,15 +29,15 @@ production path. Operators must opt back into Metal embed AFTER passing:
 
 Signed-off-by: Quenchforge Contributors <maint@cerid-ai.com>
 ---
- ggml/src/ggml-metal/ggml-metal-device.cpp |  13 +-
+ ggml/src/ggml-metal/ggml-metal-device.cpp |  21 +-
  ggml/src/ggml-metal/ggml-metal.metal      | 273 ++++++++++++++++++++++
- 2 files changed, 285 insertions(+), 1 deletion(-)
+ 2 files changed, 293 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
 index 9c84afb..4a5c0cf 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
-@@ -910,7 +910,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
+@@ -910,7 +910,27 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
      const int16_t r2 = (int16_t) (ne12 / ne02);
      const int16_t r3 = (int16_t) (ne13 / ne03);
  
@@ -49,9 +49,18 @@ index 9c84afb..4a5c0cf 100644
 +    // deferred. Falling through to the upstream name for types without
 +    // `_fb` variants preserves current behaviour (still broken on AMD,
 +    // but no new regression).
++    //
++    // The `ne00 >= 32` guard excludes the `_short` suffix path: when
++    // ne00 < 32 the dispatcher uses suffix="_short" which has no
++    // corresponding `_fb` instantiation, so falling through to the
++    // upstream `_short` kernel keeps the existing behaviour (broken on
++    // AMD but doesn't crash on a null pipeline lookup). BERT hidden
++    // dimensions (768/1024/1536) never trip this gate.
 +    const bool has_sg_reduce_qf = ggml_metal_device_get_props(
 +        ggml_metal_library_get_device(lib))->has_simdgroup_reduction;
-+    const bool has_fb_qf = !has_sg_reduce_qf && (tsrc0 == GGML_TYPE_F32 || tsrc0 == GGML_TYPE_F16);
++    const bool has_fb_qf = !has_sg_reduce_qf
++        && (tsrc0 == GGML_TYPE_F32 || tsrc0 == GGML_TYPE_F16)
++        && ne00 >= 32;
 +    const char * mv_fb = has_fb_qf ? "_fb" : "";
 +    snprintf(base, 256, "kernel_mul_mv_%s_%s%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix, mv_fb);
      snprintf(name, 256, "%s_nsg=%d_ne12=%d_r2=%d_r3=%d", base, nsg, ne12, r2, r3);
@@ -357,4 +366,5 @@ index d9580f4..54d87f9 100644
          args_t args,
 -- 
 2.50.1 (Apple Git-155)
-
+ 
+ 
