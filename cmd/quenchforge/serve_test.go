@@ -238,13 +238,14 @@ func TestSlotEnv_ChatKeepsGlobalNCB(t *testing.T) {
 	}
 }
 
-func TestBuildSlotArgs_EmbedKindsGetBatchOverride(t *testing.T) {
-	// Embed-class slots on AMD discrete get the v0.6.2 bench-validated
-	// conservative ubatch (1024) — the v0.5.0 contextplus 512-token-limit
-	// fix still applies, but at a smaller per-call batch that survives
-	// sustained Vega II load without family-B SIGABRT. Apple Silicon and
-	// other non-AMD profiles get the full MaxContext (8192) batch
-	// because they can't hit family-B.
+func TestBuildSlotArgs_EmbedKindsBatchSizing(t *testing.T) {
+	// Embed-class slots size their batch to MaxContext (the model's ctx-size)
+	// on every profile. The v0.5.x/v0.6.x conservative 1024 cap was a Metal-
+	// specific family-B SIGABRT mitigation; v0.7.0 routes AMD-discrete embed
+	// slots to CPU (--gpu-layers 0), which makes the cap unnecessary AND
+	// counterproductive (long single inputs like full LongMemEval sessions
+	// at 1500-2000 tokens would otherwise return HTTP 500 "input too large
+	// for physical batch size"). Apple Silicon was never family-B exposed.
 	cfg := config.Config{MaxContext: 8192}
 	infoAMD := hardware.Info{Profile: hardware.ProfileVegaPro}
 	infoApple := hardware.Info{Profile: hardware.ProfileAppleSilicon}
@@ -254,11 +255,13 @@ func TestBuildSlotArgs_EmbedKindsGetBatchOverride(t *testing.T) {
 			spec := slotSpec{Kind: kind, Name: string(kind), Port: 11501}
 			args := buildSlotArgs(cfg, infoAMD, spec, "/tmp/model.gguf")
 
-			if !containsArgPair(args, "--batch-size", "1024") {
-				t.Errorf("AMD %s slot missing --batch-size 1024: %v", kind, args)
+			if !containsArgPair(args, "--batch-size", "8192") {
+				t.Errorf("AMD %s slot expected --batch-size 8192 "+
+					"(CPU route post-v0.7.0): %v", kind, args)
 			}
-			if !containsArgPair(args, "--ubatch-size", "1024") {
-				t.Errorf("AMD %s slot missing --ubatch-size 1024: %v", kind, args)
+			if !containsArgPair(args, "--ubatch-size", "8192") {
+				t.Errorf("AMD %s slot expected --ubatch-size 8192 "+
+					"(CPU route post-v0.7.0): %v", kind, args)
 			}
 		})
 		t.Run("apple-"+string(kind), func(t *testing.T) {
@@ -270,6 +273,29 @@ func TestBuildSlotArgs_EmbedKindsGetBatchOverride(t *testing.T) {
 			}
 			if !containsArgPair(args, "--ubatch-size", "8192") {
 				t.Errorf("Apple %s slot missing --ubatch-size 8192: %v", kind, args)
+			}
+		})
+	}
+}
+
+func TestBuildSlotArgs_EmbedKindsBatchOverride(t *testing.T) {
+	// Operators can still pin a smaller ubatch via EmbedUbatchSize for
+	// environments where the natural MaxContext is too large (e.g. memory-
+	// constrained host). Pins both --batch-size and --ubatch-size to the
+	// same value.
+	cfg := config.Config{MaxContext: 8192, EmbedUbatchSize: 1024}
+	infoAMD := hardware.Info{Profile: hardware.ProfileVegaPro}
+
+	for _, kind := range []gateway.SlotKind{gateway.KindEmbed, gateway.KindCodeEmbed} {
+		t.Run("amd-"+string(kind)+"-override", func(t *testing.T) {
+			spec := slotSpec{Kind: kind, Name: string(kind), Port: 11501}
+			args := buildSlotArgs(cfg, infoAMD, spec, "/tmp/model.gguf")
+
+			if !containsArgPair(args, "--batch-size", "1024") {
+				t.Errorf("AMD %s slot with EmbedUbatchSize=1024 missing --batch-size 1024: %v", kind, args)
+			}
+			if !containsArgPair(args, "--ubatch-size", "1024") {
+				t.Errorf("AMD %s slot with EmbedUbatchSize=1024 missing --ubatch-size 1024: %v", kind, args)
 			}
 		})
 	}
