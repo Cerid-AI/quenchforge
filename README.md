@@ -37,7 +37,7 @@ Quenchforge carries a single load-bearing patch per submodule that gates the bug
 | Apple Silicon (M1/M2/M3/M4/M5) | Supported (non-degraded) | Patches runtime-gated; effectively stock on this arch |
 | Intel Mac, Intel iGPU only (Iris Plus, etc.) | Supported (CPU-class) | Metal available but very small VRAM — auto fallback to CPU |
 | Intel Mac Pro 2013 + AMD FirePro D300/D500/D700 | **Known incompatible** | Reported gibberish-output ([llama.cpp#20104](https://github.com/ggml-org/llama.cpp/issues/20104)); not Metal3 |
-| Linux / Windows | **Out of scope** | Use stock Ollama with CUDA / ROCm / DirectML; that path is already well-served |
+| Linux / Windows | **Out of scope** | Use stock llama.cpp/Ollama with Vulcan; that path is already well-served |
 | Hackintosh + AMD | Community best-effort | Tagged in telemetry as non-genuine; no SLA |
 
 ## Honesty about Metal in v0.3
