@@ -419,18 +419,3 @@ func readPIDFile(path string) (int, error) {
 	}
 	return n, nil
 }
-
-// AppendToLog is a convenience for tests that want to write to the slot's
-// log file without spawning a child. Returns the number of bytes written.
-func AppendToLog(logDir, name string, r io.Reader) (int64, error) {
-	if err := os.MkdirAll(logDir, 0o755); err != nil {
-		return 0, err
-	}
-	f, err := os.OpenFile(filepath.Join(logDir, name+".log"),
-		os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-	return io.Copy(f, r)
-}
