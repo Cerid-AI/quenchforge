@@ -68,7 +68,13 @@ HTTP_5XX_BURST_THRESHOLD = 5    # 5 5xx in a 30s window = early bail
 #     threshold has 10× headroom over any conceivable false-positive.)
 DRIFT_COSSIM_WARN = 0.999
 DRIFT_COSSIM_FAIL = 0.95
-RSS_GROWTH_FACTOR = 2.0         # 2× RSS growth over the run is a leak signal
+RSS_GROWTH_FACTOR = 4.0         # 4× RSS growth signals leak; accommodates
+                                # the staging-buffer pool's worst-case ~512 MB
+                                # footprint (15 size classes × 4 buffers/class,
+                                # 4 KiB to 64 MiB). Pre-pool baseline was 2.0×;
+                                # raised in v0.8.0 (patch 0002) to avoid false
+                                # leak alarms as the pool warms up across the
+                                # variety of tensor sizes seen in real workloads.
 LATENCY_CLIFF_FACTOR = 5.0      # mid-run p95 > 5× start-of-run p95 = IOSurface symptom
 
 # Sample synthetic workload — designed to vary chunk shape, context length,

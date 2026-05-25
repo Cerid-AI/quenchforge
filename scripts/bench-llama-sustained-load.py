@@ -30,7 +30,12 @@ import urllib.request
 
 HTTP_5XX_BURST_THRESHOLD = 5
 DRIFT_FAIL_THRESHOLD = 3
-RSS_GROWTH_FACTOR = 2.0
+# 4× RSS growth signals leak; accommodates the staging-buffer pool's
+# worst-case ~512 MB footprint (15 size classes × 4 buffers/class).
+# Pre-pool baseline was 2.0×; raised in v0.8.0 (patch 0002) to avoid
+# false leak alarms as the pool warms up. For chat (10 GB model resident)
+# this threshold is unreachable in normal operation; for completeness only.
+RSS_GROWTH_FACTOR = 4.0
 LATENCY_CLIFF_FACTOR = 5.0
 
 DETERMINISTIC_PROMPTS = [
