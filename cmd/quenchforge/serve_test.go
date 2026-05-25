@@ -254,14 +254,40 @@ func TestSlotEnv_ChatKeepsGlobalNCB(t *testing.T) {
 	}
 }
 
+// TestSlotEnv_AMDIncludesConcurrencyDisable verifies that AMD-discrete profiles
+// get the GGML_METAL_CONCURRENCY_DISABLE=1 env var on every llama-server slot
+// kind (chat, embed, code-embed, rerank). Required to disable the upstream
+// MTLDispatchTypeConcurrent path that's unreliable on non-UMA Metal.
+func TestSlotEnv_AMDIncludesConcurrencyDisable(t *testing.T) {
+	cfg := config.Config{}
+	hwInfo := hardware.Info{Profile: hardware.ProfileVegaPro}
+
+	for _, kind := range []gateway.SlotKind{
+		gateway.KindChat,
+		gateway.KindEmbed,
+		gateway.KindCodeEmbed,
+		gateway.KindRerank,
+	} {
+		env := slotEnv(cfg, hwInfo, kind)
+		want := "GGML_METAL_CONCURRENCY_DISABLE=1"
+		found := false
+		for _, e := range env {
+			if e == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("kind=%v: want env to contain %q; got %v", kind, want, env)
+		}
+	}
+}
+
 func TestBuildSlotArgs_EmbedKindsBatchSizing(t *testing.T) {
-	// Embed-class slots size their batch to MaxContext (the model's ctx-size)
-	// on every profile. The v0.5.x/v0.6.x conservative 1024 cap was a Metal-
-	// specific family-B SIGABRT mitigation; v0.7.0 routes AMD-discrete embed
-	// slots to CPU (--gpu-layers 0), which makes the cap unnecessary AND
-	// counterproductive (long single inputs like full LongMemEval sessions
-	// at 1500-2000 tokens would otherwise return HTTP 500 "input too large
-	// for physical batch size"). Apple Silicon was never family-B exposed.
+	// Non-AMD profiles size their batch to MaxContext (the model's ctx-size).
+	// AMD-discrete profiles cap at 1024 (amdEmbedUbatchDefault) — GPU mode
+	// re-enabled in v0.8.0 re-exposes Metal staging-buffer pressure that
+	// this cap bounds. Apple Silicon was never family-B exposed.
 	cfg := config.Config{MaxContext: 8192}
 	infoAMD := hardware.Info{Profile: hardware.ProfileVegaPro}
 	infoApple := hardware.Info{Profile: hardware.ProfileAppleSilicon}
@@ -271,13 +297,13 @@ func TestBuildSlotArgs_EmbedKindsBatchSizing(t *testing.T) {
 			spec := slotSpec{Kind: kind, Name: string(kind), Port: 11501}
 			args := buildSlotArgs(cfg, infoAMD, spec, "/tmp/model.gguf")
 
-			if !containsArgPair(args, "--batch-size", "8192") {
-				t.Errorf("AMD %s slot expected --batch-size 8192 "+
-					"(CPU route post-v0.7.0): %v", kind, args)
+			if !containsArgPair(args, "--batch-size", "1024") {
+				t.Errorf("AMD %s slot expected --batch-size 1024 "+
+					"(GPU mode + staging-buffer cap, v0.8.0): %v", kind, args)
 			}
-			if !containsArgPair(args, "--ubatch-size", "8192") {
-				t.Errorf("AMD %s slot expected --ubatch-size 8192 "+
-					"(CPU route post-v0.7.0): %v", kind, args)
+			if !containsArgPair(args, "--ubatch-size", "1024") {
+				t.Errorf("AMD %s slot expected --ubatch-size 1024 "+
+					"(GPU mode + staging-buffer cap, v0.8.0): %v", kind, args)
 			}
 		})
 		t.Run("apple-"+string(kind), func(t *testing.T) {

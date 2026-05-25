@@ -51,7 +51,7 @@ func TestProfileIsAMDDiscrete_MatchesHardwarePackage(t *testing.T) {
 	}
 }
 
-func TestKernelParams_ChatAMDGetsCorrectnessFlags(t *testing.T) {
+func TestKernelParams_ChatAMDGetsGPUWithConcurrencyDisable(t *testing.T) {
 	cfg := config.Config{MaxContext: 8192}
 	for _, p := range amdProfiles {
 		t.Run(string(p), func(t *testing.T) {
@@ -60,7 +60,7 @@ func TestKernelParams_ChatAMDGetsCorrectnessFlags(t *testing.T) {
 				"--flash-attn", "off",
 				"--cache-ram", "0",
 				"--no-cache-prompt",
-				"--gpu-layers", "0",
+				"--gpu-layers", "999",
 			}
 			if !slices.Equal(tn.ExtraArgs, wantExtra) {
 				t.Errorf("chat AMD %s ExtraArgs = %v, want %v",
@@ -74,6 +74,9 @@ func TestKernelParams_ChatAMDGetsCorrectnessFlags(t *testing.T) {
 			// v0.6.1 fixed it.
 			if tn.UbatchSize != 0 || tn.BatchSize != 0 || tn.MetalNCB != 0 {
 				t.Errorf("chat AMD %s unexpected non-zero tuning: %+v", p, tn)
+			}
+			if !tn.MetalConcurrencyDisable {
+				t.Errorf("chat AMD %s should have MetalConcurrencyDisable=true", p)
 			}
 			if !tn.AutoRespawn {
 				t.Errorf("chat AMD %s should request AutoRespawn", p)
@@ -101,15 +104,13 @@ func TestKernelParams_ChatNonAMDIsEmpty(t *testing.T) {
 }
 
 func TestKernelParams_EmbedDefaultsByProfile(t *testing.T) {
-	// All profiles use MaxContext for ubatch/batch on embed slots —
-	// long single inputs (full LongMemEval sessions, multi-paragraph
-	// documents) need the full natural model context as a single
+	// Non-AMD profiles use MaxContext for ubatch/batch on embed slots —
+	// long single inputs need the full natural model context as a single
 	// forward pass, otherwise llama-server returns HTTP 500 "input is
-	// too large for the physical batch size". The 1024 ubatch
-	// mitigation that v0.6.2 used was Metal-family-B-specific; with
-	// AMD embed slots now routed to CPU via --gpu-layers 0, that
-	// crash mode is structurally impossible. MetalNCB stays at the
-	// AMD default for completeness but is a no-op on the CPU path.
+	// too large for the physical batch size".
+	// AMD-discrete profiles cap at amdEmbedUbatchDefault (1024) — GPU
+	// mode re-enabled in v0.8.0 re-exposes the Metal staging-buffer
+	// pressure that this cap bounds. See embedParams docstring.
 	cfg := config.Config{MaxContext: 8192}
 	for _, p := range allProfiles {
 		for _, k := range []gateway.SlotKind{gateway.KindEmbed, gateway.KindCodeEmbed} {
@@ -118,6 +119,7 @@ func TestKernelParams_EmbedDefaultsByProfile(t *testing.T) {
 				wantUbatch := 8192
 				wantNCB := 0
 				if profileIsAMDDiscrete(p) {
+					wantUbatch = amdEmbedUbatchDefault
 					wantNCB = amdEmbedMetalNCBDefault
 				}
 				if tn.UbatchSize != wantUbatch {
@@ -137,33 +139,33 @@ func TestKernelParams_EmbedDefaultsByProfile(t *testing.T) {
 	}
 }
 
-func TestKernelParams_EmbedAMDForcesCPU(t *testing.T) {
-	// AMD discrete profiles must include `--gpu-layers 0` to route embed
-	// off the broken Metal-on-AMD path for BERT-family models. See the
-	// embedParams docstring for the empirical evidence (Vega II 2026-05-17:
-	// identical "hello" gives cos_sim 0.07 on Metal vs 1.0 on CPU). Apple
-	// Silicon and unknown profiles must NOT get this flag — the bug is
-	// structurally AMD-discrete-only and CPU on UMA hardware would be a
-	// large unnecessary throughput hit.
+func TestKernelParams_EmbedAMDGetsGPUWithConcurrencyDisable(t *testing.T) {
+	// AMD discrete profiles must include `--gpu-layers 999` (GPU mode,
+	// re-enabled v0.8.0) and MetalConcurrencyDisable=true. Apple Silicon
+	// and unknown profiles must NOT get either — the MTLDispatchTypeConcurrent
+	// race is AMD-discrete-only and the GPU-layers flag is unnecessary on UMA.
 	cfg := config.Config{MaxContext: 8192}
 	for _, p := range allProfiles {
 		for _, k := range []gateway.SlotKind{gateway.KindEmbed, gateway.KindCodeEmbed} {
 			t.Run(string(p)+"/"+string(k), func(t *testing.T) {
 				tn := KernelParams(p, k, cfg)
-				hasFlag := false
-				for i := 0; i+1 < len(tn.ExtraArgs); i++ {
-					if tn.ExtraArgs[i] == "--gpu-layers" && tn.ExtraArgs[i+1] == "0" {
-						hasFlag = true
-						break
+				hasGPUFlag := containsSubslice(tn.ExtraArgs, []string{"--gpu-layers", "999"})
+				if profileIsAMDDiscrete(p) {
+					if !hasGPUFlag {
+						t.Errorf("%s %s missing --gpu-layers 999; ExtraArgs=%v",
+							p, k, tn.ExtraArgs)
 					}
-				}
-				if profileIsAMDDiscrete(p) && !hasFlag {
-					t.Errorf("%s %s missing --gpu-layers 0; ExtraArgs=%v",
-						p, k, tn.ExtraArgs)
-				}
-				if !profileIsAMDDiscrete(p) && hasFlag {
-					t.Errorf("%s %s should NOT force CPU; ExtraArgs=%v",
-						p, k, tn.ExtraArgs)
+					if !tn.MetalConcurrencyDisable {
+						t.Errorf("%s %s should have MetalConcurrencyDisable=true", p, k)
+					}
+				} else {
+					if hasGPUFlag {
+						t.Errorf("%s %s should NOT set --gpu-layers 999; ExtraArgs=%v",
+							p, k, tn.ExtraArgs)
+					}
+					if tn.MetalConcurrencyDisable {
+						t.Errorf("%s %s should NOT have MetalConcurrencyDisable=true", p, k)
+					}
 				}
 			})
 		}
@@ -215,27 +217,51 @@ func containsArgPair(args []string, flag, value string) bool {
 	return false
 }
 
-func TestKernelParams_RerankAMDForcesCPU(t *testing.T) {
-	// Same BERT-family bug applies to bge-reranker-v2-m3. AMD discrete
-	// must route rerank to CPU; non-AMD profiles must not.
+// containsSubslice returns true if needle appears as a contiguous subsequence of haystack.
+func containsSubslice(haystack, needle []string) bool {
+	if len(needle) == 0 {
+		return true
+	}
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		match := true
+		for j := range needle {
+			if haystack[i+j] != needle[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+func TestKernelParams_RerankAMDGetsGPUWithConcurrencyDisable(t *testing.T) {
+	// Same BERT-family Metal concurrency fix applies to bge-reranker-v2-m3.
+	// AMD discrete must have --gpu-layers 999 and MetalConcurrencyDisable=true;
+	// non-AMD profiles must not.
 	cfg := config.Config{MaxContext: 8192}
 	for _, p := range allProfiles {
 		t.Run(string(p), func(t *testing.T) {
 			tn := KernelParams(p, gateway.KindRerank, cfg)
-			hasFlag := false
-			for i := 0; i+1 < len(tn.ExtraArgs); i++ {
-				if tn.ExtraArgs[i] == "--gpu-layers" && tn.ExtraArgs[i+1] == "0" {
-					hasFlag = true
-					break
+			hasGPUFlag := containsSubslice(tn.ExtraArgs, []string{"--gpu-layers", "999"})
+			if profileIsAMDDiscrete(p) {
+				if !hasGPUFlag {
+					t.Errorf("%s rerank missing --gpu-layers 999; ExtraArgs=%v",
+						p, tn.ExtraArgs)
 				}
-			}
-			if profileIsAMDDiscrete(p) && !hasFlag {
-				t.Errorf("%s rerank missing --gpu-layers 0; ExtraArgs=%v",
-					p, tn.ExtraArgs)
-			}
-			if !profileIsAMDDiscrete(p) && hasFlag {
-				t.Errorf("%s rerank should NOT force CPU; ExtraArgs=%v",
-					p, tn.ExtraArgs)
+				if !tn.MetalConcurrencyDisable {
+					t.Errorf("%s rerank should have MetalConcurrencyDisable=true", p)
+				}
+			} else {
+				if hasGPUFlag {
+					t.Errorf("%s rerank should NOT set --gpu-layers 999; ExtraArgs=%v",
+						p, tn.ExtraArgs)
+				}
+				if tn.MetalConcurrencyDisable {
+					t.Errorf("%s rerank should NOT have MetalConcurrencyDisable=true", p)
+				}
 			}
 		})
 	}

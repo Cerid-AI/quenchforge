@@ -940,9 +940,13 @@ func slotEnv(cfg config.Config, hwInfo hardware.Info, kind gateway.SlotKind) []s
 	if tn.MetalNCB > 0 {
 		ncb = tn.MetalNCB
 	}
-	return []string{
+	env := []string{
 		fmt.Sprintf("GGML_METAL_N_CB=%d", ncb),
 	}
+	if tn.MetalConcurrencyDisable {
+		env = append(env, "GGML_METAL_CONCURRENCY_DISABLE=1")
+	}
+	return env
 }
 
 // Per-slot log rotation defaults. An unattended embed.log on a Vega II
