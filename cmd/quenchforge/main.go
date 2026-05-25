@@ -249,6 +249,14 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 		return err
 	}
 
+	// Resolve per-slot log rotation parameters ONCE per cmdServe; we
+	// thread the values through every slot constructor so operators
+	// only pay one env-var lookup per process start. Previously each
+	// startSlot / inline imagegen|tts|whisper block re-parsed the env,
+	// and any drift in default values between callers would diverge
+	// silently.
+	maxLogBytes, logBackups := slotLogRotation()
+
 	// Hardware probe — gates per-profile slot tuning. Best-effort: a probe
 	// failure falls back to the unknown profile, which uses the default
 	// (Apple-Silicon-friendly) llama-server args. The slot is still
@@ -357,7 +365,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 			Model:     modelName,
 			Port:      cfg.ChatPort,
 			ExtraArgs: nil,
-		}, stderr)
+		}, maxLogBytes, logBackups, stderr)
 		if err != nil {
 			fmt.Fprintf(stderr,
 				"quenchforge: warning: chat slot not started: %v\n"+
@@ -384,7 +392,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 				// --pooling cls is the standard for most BERT-style embedders;
 				// callers using mean-pooling models can override via config.
 				ExtraArgs: []string{"--embedding", "--pooling", "cls"},
-			}, stderr)
+			}, maxLogBytes, logBackups, stderr)
 			if err != nil {
 				fmt.Fprintf(stderr,
 					"quenchforge: warning: embed slot not started: %v\n"+
@@ -411,7 +419,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 				Model:     cfg.CodeEmbedModel,
 				Port:      cfg.CodeEmbedPort,
 				ExtraArgs: []string{"--embedding", "--pooling", "cls"},
-			}, stderr)
+			}, maxLogBytes, logBackups, stderr)
 			if err != nil {
 				fmt.Fprintf(stderr,
 					"quenchforge: warning: code-embed slot not started: %v\n"+
@@ -435,7 +443,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 				Model:     cfg.RerankModel,
 				Port:      cfg.RerankPort,
 				ExtraArgs: []string{"--reranking"},
-			}, stderr)
+			}, maxLogBytes, logBackups, stderr)
 			if err != nil {
 				fmt.Fprintf(stderr,
 					"quenchforge: warning: rerank slot not started: %v\n"+
@@ -469,7 +477,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 					"--listen-port", fmt.Sprintf("%d", cfg.SDPort),
 				}
 				slot.Env = []string{fmt.Sprintf("GGML_METAL_N_CB=%d", cfg.MetalNCB)}
-				slot.MaxLogBytes, slot.LogBackups = slotLogRotation()
+				slot.MaxLogBytes, slot.LogBackups = maxLogBytes, logBackups
 				if err := slot.Start(ctx); err != nil {
 					fmt.Fprintf(stderr,
 						"quenchforge: warning: image-gen slot start failed: %v\n", err)
@@ -505,7 +513,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 					"-t", "8",
 				}
 				slot.Env = []string{fmt.Sprintf("GGML_METAL_N_CB=%d", cfg.MetalNCB)}
-				slot.MaxLogBytes, slot.LogBackups = slotLogRotation()
+				slot.MaxLogBytes, slot.LogBackups = maxLogBytes, logBackups
 				if err := slot.Start(ctx); err != nil {
 					fmt.Fprintf(stderr,
 						"quenchforge: warning: TTS slot start failed: %v\n", err)
@@ -548,7 +556,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 				slot.PIDDir = cfg.PIDDir
 				slot.Args = args
 				slot.Env = []string{fmt.Sprintf("GGML_METAL_N_CB=%d", cfg.MetalNCB)}
-				slot.MaxLogBytes, slot.LogBackups = slotLogRotation()
+				slot.MaxLogBytes, slot.LogBackups = maxLogBytes, logBackups
 				if err := slot.Start(ctx); err != nil {
 					fmt.Fprintf(stderr,
 						"quenchforge: warning: whisper slot start failed: %v\n", err)
@@ -700,7 +708,9 @@ func envInt(key string, def int) int {
 
 // startSlot launches one llama-server with the configured model + Metal
 // defaults. Wraps buildSlotArgs with the actual process supervision.
-func startSlot(ctx context.Context, cfg config.Config, hwInfo hardware.Info, spec slotSpec, stderr io.Writer) (*supervisor.Slot, error) {
+// maxLogBytes / logBackups come from the single slotLogRotation() call
+// at the top of cmdServe — startSlot does NOT re-read them.
+func startSlot(ctx context.Context, cfg config.Config, hwInfo hardware.Info, spec slotSpec, maxLogBytes int64, logBackups int, stderr io.Writer) (*supervisor.Slot, error) {
 	bin, err := resolveLlamaBin(cfg.LlamaBin)
 	if err != nil {
 		return nil, err
@@ -711,8 +721,6 @@ func startSlot(ctx context.Context, cfg config.Config, hwInfo hardware.Info, spe
 	}
 
 	args := buildSlotArgs(cfg, hwInfo, spec, modelPath)
-
-	maxLogBytes, logBackups := slotLogRotation()
 
 	slot := supervisor.NewSlot(spec.Name)
 	slot.BinPath = bin
@@ -735,8 +743,9 @@ func startSlot(ctx context.Context, cfg config.Config, hwInfo hardware.Info, spe
 	if err := slot.Start(ctx); err != nil {
 		return nil, err
 	}
-	fmt.Fprintf(stderr, "quenchforge: spawned %s [%s] pid=%d log=%s\n",
-		bin, spec.Kind, slot.PID(), filepath.Join(cfg.LogDir, spec.Name+".log"))
+	fmt.Fprintf(stderr, "quenchforge: spawned %s [%s] pid=%d log=%s maxBytes=%d backups=%d\n",
+		bin, spec.Kind, slot.PID(),
+		filepath.Join(cfg.LogDir, spec.Name+".log"), maxLogBytes, logBackups)
 	return slot, nil
 }
 

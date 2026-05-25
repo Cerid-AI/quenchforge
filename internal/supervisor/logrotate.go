@@ -99,13 +99,51 @@ func (w *RotatingWriter) Close() error {
 // Backup naming: file.log → file.log.1 → file.log.2 → ... → file.log.N.
 // The oldest is dropped on overflow. If backups == 0, the primary is
 // truncated with no backup preserved.
-func (w *RotatingWriter) rotateLocked() error {
+//
+// Recovery contract: w.f MUST never be left nil on any error return
+// path. The caller in Write expects to dereference w.f on the next
+// call; leaving it nil produces a silently-broken writer (every
+// subsequent Write returns ErrInvalid from the nil *os.File receiver,
+// or panics on the receiver dereference depending on the call shape).
+//
+// Strategy on partial-failure: reopen the primary path in append mode
+// before returning. The new file may be at a stale rotation state
+// (e.g. shift partially completed) but the writer stays functionally
+// usable — operators get the rotation error in their slot log and the
+// process keeps writing. We deliberately do NOT reset w.curSize on
+// the recovery path so the next Write re-attempts rotation if the
+// file is still over threshold — letting the rotation chain self-heal
+// once whatever blocked the rename clears up.
+func (w *RotatingWriter) rotateLocked() (rerr error) {
 	if w.f != nil {
 		if err := w.f.Close(); err != nil {
 			return fmt.Errorf("logrotate: close before rotate: %w", err)
 		}
 		w.f = nil
 	}
+
+	// Recovery deferred: if we hit any error mid-rotation, reopen the
+	// primary in append mode so w.f is never nil on return. We honour
+	// whatever state the primary file ended up in (still original,
+	// already renamed away, partially shifted) — the next Write will
+	// re-attempt rotation if curSize is still over threshold.
+	defer func() {
+		if rerr == nil || w.f != nil {
+			return
+		}
+		f, openErr := os.OpenFile(w.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if openErr != nil {
+			// Cannot recover; the original rotation error is what the
+			// caller sees, but w.f stays nil. Wrap the recovery failure
+			// so operators can diagnose both layers.
+			rerr = fmt.Errorf("%w; recovery reopen also failed: %v", rerr, openErr)
+			return
+		}
+		w.f = f
+		if info, statErr := f.Stat(); statErr == nil {
+			w.curSize = info.Size()
+		}
+	}()
 
 	// Walk from oldest to newest, shifting each up one slot.
 	// e.g., backups=3: drop .3, rename .2→.3, .1→.2, primary→.1.
@@ -125,7 +163,7 @@ func (w *RotatingWriter) rotateLocked() error {
 		// primary → .1
 		if _, err := os.Stat(w.path); err == nil {
 			if err := os.Rename(w.path, w.path+".1"); err != nil {
-				return fmt.Errorf("logrotate: rename %s -> %s.1: %w", w.path, w.path, err)
+				return fmt.Errorf("logrotate: rename %s -> %s: %w", w.path, w.path+".1", err)
 			}
 		}
 	} else {
