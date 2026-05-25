@@ -413,7 +413,10 @@ func checkSlotLogSizes() []string {
 	dir := filepath.Join(home, "Library", "Logs", "quenchforge")
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return []string{fmt.Sprintf("no log dir at %s: %v", dir, err)}
+		if os.IsNotExist(err) {
+			return []string{"(no slot logs yet)"}
+		}
+		return []string{fmt.Sprintf("could not read %s: %v", dir, err)}
 	}
 	type entry struct {
 		name string
