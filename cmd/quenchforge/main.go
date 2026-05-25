@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -120,6 +121,7 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	redacted := fs.Bool("redacted", false, "produce a paste-safe report (no usernames, no paths beyond ~)")
+	explain := fs.Bool("explain", false, "append a Remediation block with per-finding action steps")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -215,8 +217,218 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) error {
 	}
 	fmt.Fprintln(stdout)
 
+	// ------------------------------------------------------------------
+	// v0.7.2 Layer 1b additions. Each new section is additive (appended
+	// after the existing report) so existing bug-report parsers continue
+	// to work. Renaming any of the four section headers below is a
+	// breaking change for the .github/ISSUE_TEMPLATE/bug.yml triage
+	// contract (see CLAUDE.md absolute rule 4).
+	// ------------------------------------------------------------------
+
+	// Ollama LaunchAgent — surfaces the single most common public-install
+	// conflict: the com.ollama.ollama login agent racing quenchforge for
+	// port 11434 at every login.
+	fmt.Fprintln(stdout, "Ollama LaunchAgent")
+	fmt.Fprintln(stdout, "------------------")
+	fmt.Fprintf(stdout, "  status: %s\n", checkOllamaLaunchAgent())
+	fmt.Fprintln(stdout)
+
+	// Disk space — the 2026-05-24 freeze cascaded out of a disk-full
+	// state that prevented APFS from writing kernel panic reports. WARN
+	// at 20 GB, CRITICAL at 10 GB, on /System/Volumes/Data (the actual
+	// writable APFS volume on macOS, distinct from the read-only system
+	// volume).
+	fmt.Fprintln(stdout, "Disk space")
+	fmt.Fprintln(stdout, "----------")
+	fmt.Fprintln(stdout, "  "+checkDiskFree("/System/Volumes/Data"))
+	fmt.Fprintln(stdout)
+
+	// Slot log sizes — Layer 1c rotation should keep these bounded, but
+	// pre-rotation installs (or installs that set QUENCHFORGE_LOG_MAX_BYTES=0)
+	// can still drift unbounded. Sorted by size desc so the worst offender
+	// is the first line operators see.
+	fmt.Fprintln(stdout, "Slot log sizes")
+	fmt.Fprintln(stdout, "--------------")
+	for _, line := range checkSlotLogSizes() {
+		fmt.Fprintln(stdout, "  "+line)
+	}
+	fmt.Fprintln(stdout)
+
+	// Port 11434 — uses the Phase 2 portcheck package. The classification
+	// is identical to what cmdServe uses pre-bind, so doctor output and
+	// the runtime behavior stay in sync.
+	fmt.Fprintln(stdout, "Port 11434")
+	fmt.Fprintln(stdout, "----------")
+	{
+		pcCtx, pcCancel := context.WithTimeout(context.Background(), 3*time.Second)
+		res, err := portcheck.Check(pcCtx, "127.0.0.1:11434")
+		pcCancel()
+		if err != nil {
+			fmt.Fprintf(stdout, "  could not probe: %v\n", err)
+		} else {
+			switch res.Verdict {
+			case portcheck.VerdictFree:
+				fmt.Fprintln(stdout, "  free — quenchforge will bind on next start")
+			case portcheck.VerdictHeldByOllama:
+				fmt.Fprintf(stdout, "  held by Ollama (pid %d, %s) — CRITICAL\n",
+					res.Holder.PID, res.Holder.ExecPath)
+			case portcheck.VerdictHeldByStaleQuenchforge:
+				fmt.Fprintf(stdout, "  held by quenchforge (pid %d) — OK\n", res.Holder.PID)
+			case portcheck.VerdictHeldByOther:
+				fmt.Fprintf(stdout, "  held by pid %d (%s, %s) — WARN\n",
+					res.Holder.PID, res.Holder.CommandName, res.Holder.ExecPath)
+			case portcheck.VerdictUnknown:
+				fmt.Fprintln(stdout, "  in use but holder could not be identified — WARN")
+			}
+		}
+	}
+	fmt.Fprintln(stdout)
+
+	// --explain — per-finding remediation steps, so a bug-report triage
+	// reply can quote the doctor output AND the next action in one paste.
+	// Kept as a single block (not inlined per-finding) to minimise the
+	// diff; future polish can move each line next to its check.
+	if *explain {
+		fmt.Fprintln(stdout, "Remediation")
+		fmt.Fprintln(stdout, "-----------")
+		fmt.Fprintln(stdout, `  - Ollama LaunchAgent loaded:    launchctl bootout gui/$(id -u)/com.ollama.ollama`)
+		fmt.Fprintln(stdout, `  - Disk space CRITICAL:          docker system prune -a --volumes && truncate slot logs`)
+		fmt.Fprintln(stdout, `  - Slot log CRITICAL:            : > <path-to-log>  (Layer 1c rotation should prevent recurrence)`)
+		fmt.Fprintln(stdout, `  - Port 11434 held by Ollama:    see "Ollama LaunchAgent" remediation`)
+		fmt.Fprintln(stdout, `  - Port 11434 unknown holder:    lsof -i :11434 -sTCP:LISTEN  (resolve manually)`)
+		fmt.Fprintln(stdout)
+	}
+
 	fmt.Fprintln(stdout, "Paste this output verbatim into bug reports.")
 	return nil
+}
+
+// checkOllamaLaunchAgent reports whether com.ollama.ollama is loaded
+// in the user's GUI launchd domain. Returns one of:
+//   - "not installed"      (Ollama.app not present)
+//   - "disabled"           (plist present but launchctl bootout has been
+//     applied, OR app present but agent never loaded)
+//   - "loaded (PID N) — DISARM with: ..." (currently running)
+//   - "loaded but stopped" (loaded, no PID — exited cleanly)
+//
+// Implementation uses `launchctl list com.ollama.ollama`: exit 0 with
+// output if loaded, exit nonzero if not. The PID lives in launchctl's
+// list-output as the `"PID" = N;` line.
+func checkOllamaLaunchAgent() string {
+	// Is Ollama.app even installed?
+	if _, err := os.Stat("/Applications/Ollama.app"); os.IsNotExist(err) {
+		return "not installed"
+	}
+
+	out, err := exec.Command("launchctl", "list", "com.ollama.ollama").Output()
+	if err != nil {
+		return "disabled"
+	}
+	for _, ln := range strings.Split(string(out), "\n") {
+		ln = strings.TrimSpace(ln)
+		if !strings.HasPrefix(ln, "\"PID\"") {
+			continue
+		}
+		// "PID" = 1253;
+		parts := strings.SplitN(ln, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		v := strings.TrimSpace(parts[1])
+		v = strings.TrimSuffix(v, ";")
+		if pid, err := strconv.Atoi(v); err == nil && pid > 0 {
+			return fmt.Sprintf("loaded (PID %d) — DISARM with: launchctl bootout gui/$(id -u)/com.ollama.ollama", pid)
+		}
+	}
+	return "loaded but stopped"
+}
+
+// checkDiskFree returns a human-readable line for the given mount
+// point with a PASS/WARN/CRITICAL hint. Uses `df -k` so we avoid
+// syscall.Statfs CGo complications across macOS versions. WARN at
+// < 20 GB, CRITICAL at < 10 GB — the thresholds that map to "kernel
+// panic reports can no longer be written" in the 2026-05-24 RCA.
+func checkDiskFree(mount string) string {
+	out, err := exec.Command("df", "-k", mount).Output()
+	if err != nil {
+		return fmt.Sprintf("could not read disk usage for %s: %v", mount, err)
+	}
+	// df -k output:
+	//   Filesystem  1024-blocks  Used  Available  Capacity  Mounted on
+	//   /dev/disk4s2  847249000  799000000  48000000  95%  /System/Volumes/Data
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) < 2 {
+		return "df returned unexpected output"
+	}
+	fields := strings.Fields(lines[1])
+	if len(fields) < 5 {
+		return "df row has fewer than 5 fields"
+	}
+	availKB, err := strconv.ParseInt(fields[3], 10, 64)
+	if err != nil {
+		return fmt.Sprintf("could not parse df Available column: %q", fields[3])
+	}
+	availGB := availKB / 1024 / 1024
+	capacity := fields[4]
+	status := "PASS"
+	switch {
+	case availGB < 10:
+		status = "CRITICAL"
+	case availGB < 20:
+		status = "WARN"
+	}
+	return fmt.Sprintf("%s: %d GB available (%s used) — %s", mount, availGB, capacity, status)
+}
+
+// checkSlotLogSizes returns one line per file under
+// ~/Library/Logs/quenchforge/, sorted by size desc. Each line carries
+// a PASS/WARN/CRITICAL marker:
+//   - PASS:     < 50 MB
+//   - WARN:     50–500 MB
+//   - CRITICAL: > 500 MB
+func checkSlotLogSizes() []string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return []string{fmt.Sprintf("could not resolve home dir: %v", err)}
+	}
+	dir := filepath.Join(home, "Library", "Logs", "quenchforge")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return []string{fmt.Sprintf("no log dir at %s: %v", dir, err)}
+	}
+	type entry struct {
+		name string
+		size int64
+	}
+	var es []entry
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		es = append(es, entry{e.Name(), info.Size()})
+	}
+	sort.Slice(es, func(i, j int) bool { return es[i].size > es[j].size })
+
+	var out []string
+	for _, e := range es {
+		mb := e.size / 1024 / 1024
+		status := "PASS"
+		switch {
+		case mb > 500:
+			status = "CRITICAL"
+		case mb > 50:
+			status = "WARN"
+		}
+		out = append(out, fmt.Sprintf("%-40s %6d MB  %s", e.name, mb, status))
+	}
+	if len(out) == 0 {
+		return []string{"(no slot logs yet)"}
+	}
+	return out
 }
 
 // ---------------------------------------------------------------------------

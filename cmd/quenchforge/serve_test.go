@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 
@@ -317,6 +318,66 @@ func TestBuildSlotArgs_NonEmbedKindsSkipBatchOverride(t *testing.T) {
 				t.Errorf("%s slot must not pass --batch-size 8192: %v", kind, args)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// doctor — Phase 3 extension tests.
+// Each test asserts cmdDoctor's stdout contains the new section header.
+// The header strings are part of the bug-report-triage paste contract;
+// renaming them is a breaking change for the .github/ISSUE_TEMPLATE/bug.yml
+// downstream consumers (see CLAUDE.md absolute rule 4).
+// ---------------------------------------------------------------------------
+
+func TestDoctor_IncludesOllamaLaunchAgentCheck(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if err := cmdDoctor(nil, &stdout, &stderr); err != nil {
+		t.Fatalf("cmdDoctor: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "Ollama LaunchAgent") {
+		t.Errorf("doctor output missing 'Ollama LaunchAgent' section.\nGot:\n%s", out)
+	}
+}
+
+func TestDoctor_IncludesDiskFreeCheck(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if err := cmdDoctor(nil, &stdout, &stderr); err != nil {
+		t.Fatalf("cmdDoctor: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "Disk space") {
+		t.Errorf("doctor output missing 'Disk space' section")
+	}
+}
+
+func TestDoctor_IncludesLogSizeCheck(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if err := cmdDoctor(nil, &stdout, &stderr); err != nil {
+		t.Fatalf("cmdDoctor: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "Slot log sizes") {
+		t.Errorf("doctor output missing 'Slot log sizes' section")
+	}
+}
+
+func TestDoctor_IncludesPortCheck(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if err := cmdDoctor(nil, &stdout, &stderr); err != nil {
+		t.Fatalf("cmdDoctor: %v", err)
+	}
+	if !strings.Contains(stdout.String(), "Port 11434") {
+		t.Errorf("doctor output missing 'Port 11434' section")
+	}
+}
+
+func TestDoctor_ExplainModeAddsRemediation(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if err := cmdDoctor([]string{"--explain"}, &stdout, &stderr); err != nil {
+		t.Fatalf("cmdDoctor --explain: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "Remediation") {
+		t.Errorf("--explain output missing 'Remediation' section")
 	}
 }
 
