@@ -469,6 +469,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 					"--listen-port", fmt.Sprintf("%d", cfg.SDPort),
 				}
 				slot.Env = []string{fmt.Sprintf("GGML_METAL_N_CB=%d", cfg.MetalNCB)}
+				slot.MaxLogBytes, slot.LogBackups = slotLogRotation()
 				if err := slot.Start(ctx); err != nil {
 					fmt.Fprintf(stderr,
 						"quenchforge: warning: image-gen slot start failed: %v\n", err)
@@ -504,6 +505,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 					"-t", "8",
 				}
 				slot.Env = []string{fmt.Sprintf("GGML_METAL_N_CB=%d", cfg.MetalNCB)}
+				slot.MaxLogBytes, slot.LogBackups = slotLogRotation()
 				if err := slot.Start(ctx); err != nil {
 					fmt.Fprintf(stderr,
 						"quenchforge: warning: TTS slot start failed: %v\n", err)
@@ -546,6 +548,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 				slot.PIDDir = cfg.PIDDir
 				slot.Args = args
 				slot.Env = []string{fmt.Sprintf("GGML_METAL_N_CB=%d", cfg.MetalNCB)}
+				slot.MaxLogBytes, slot.LogBackups = slotLogRotation()
 				if err := slot.Start(ctx); err != nil {
 					fmt.Fprintf(stderr,
 						"quenchforge: warning: whisper slot start failed: %v\n", err)
@@ -651,6 +654,50 @@ func slotEnv(cfg config.Config, hwInfo hardware.Info, kind gateway.SlotKind) []s
 	}
 }
 
+// Per-slot log rotation defaults. An unattended embed.log on a Vega II
+// install reached 3.73 GB in 7 days of uptime before bounded rotation
+// landed; combined with Docker.raw growth that's how the dev machine
+// reached 97% full and stopped being able to write kernel panic dumps.
+// 100 MB × 5 backups caps each slot at ≈600 MB total on disk.
+const (
+	defaultSlotLogMaxBytes = 100 * 1024 * 1024 // 100 MB
+	defaultSlotLogBackups  = 5
+)
+
+// slotLogRotation returns the rotation parameters every slot uses,
+// resolved from QUENCHFORGE_LOG_MAX_BYTES / QUENCHFORGE_LOG_BACKUPS
+// env vars with the defaults above. Setting QUENCHFORGE_LOG_MAX_BYTES=0
+// disables rotation entirely (preserves any prior install that relied
+// on unbounded logs + external rotation).
+func slotLogRotation() (maxBytes int64, backups int) {
+	return envInt64("QUENCHFORGE_LOG_MAX_BYTES", defaultSlotLogMaxBytes),
+		envInt("QUENCHFORGE_LOG_BACKUPS", defaultSlotLogBackups)
+}
+
+func envInt64(key string, def int64) int64 {
+	s := os.Getenv(key)
+	if s == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || n < 0 {
+		return def
+	}
+	return n
+}
+
+func envInt(key string, def int) int {
+	s := os.Getenv(key)
+	if s == "" {
+		return def
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 0 {
+		return def
+	}
+	return n
+}
+
 // startSlot launches one llama-server with the configured model + Metal
 // defaults. Wraps buildSlotArgs with the actual process supervision.
 func startSlot(ctx context.Context, cfg config.Config, hwInfo hardware.Info, spec slotSpec, stderr io.Writer) (*supervisor.Slot, error) {
@@ -665,12 +712,16 @@ func startSlot(ctx context.Context, cfg config.Config, hwInfo hardware.Info, spe
 
 	args := buildSlotArgs(cfg, hwInfo, spec, modelPath)
 
+	maxLogBytes, logBackups := slotLogRotation()
+
 	slot := supervisor.NewSlot(spec.Name)
 	slot.BinPath = bin
 	slot.LogDir = cfg.LogDir
 	slot.PIDDir = cfg.PIDDir
 	slot.Args = args
 	slot.Env = slotEnv(cfg, hwInfo, spec.Kind)
+	slot.MaxLogBytes = maxLogBytes
+	slot.LogBackups = logBackups
 
 	// AMD-discrete embed/rerank slots need auto-respawn — the family-B
 	// graph-compute buffer-corruption crash is non-deterministic and the

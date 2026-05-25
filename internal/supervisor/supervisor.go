@@ -88,10 +88,23 @@ type Slot struct {
 	// slot on non-zero exit. Default PolicyNone (no respawn).
 	RestartPolicy RestartPolicy
 
+	// MaxLogBytes bounds the per-slot log file. When a write would
+	// push the file past this threshold, the rotator closes the
+	// current file, renames it to ${Name}.log.1 (shifting older
+	// backups by one), and reopens a fresh ${Name}.log.
+	// Zero (the default) disables rotation — writes append forever,
+	// preserving prior unbounded-log behaviour for callers that
+	// haven't opted in.
+	MaxLogBytes int64
+
+	// LogBackups is the number of rotated backups to retain (.1 …
+	// .LogBackups). Ignored when MaxLogBytes is zero.
+	LogBackups int
+
 	// internal state — only valid after Start
 	mu          sync.Mutex
 	cmd         *exec.Cmd
-	logFile     *os.File
+	logFile     io.WriteCloser
 	pidPath     string
 	started     time.Time
 	respawnMu   sync.Mutex  // serialises respawn attempts
@@ -131,7 +144,7 @@ func (s *Slot) Start(ctx context.Context) error {
 	}
 
 	logPath := filepath.Join(s.LogDir, s.Name+".log")
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	logFile, err := NewRotatingWriter(logPath, s.MaxLogBytes, s.LogBackups)
 	if err != nil {
 		return fmt.Errorf("supervisor: open log: %w", err)
 	}
