@@ -282,10 +282,17 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 					cfg.ListenAddr, res.Holder.PID, res.Holder.CommandName, res.Holder.ExecPath)
 				return nil
 			case portcheck.VerdictUnknown:
+				// Build a valid `lsof -i :PORT` hint — cfg.ListenAddr is
+				// "host:port" and lsof's -i syntax wants the port alone.
+				// Fall back to the raw addr if SplitHostPort fails.
+				lsofTarget := cfg.ListenAddr
+				if _, port, err := net.SplitHostPort(cfg.ListenAddr); err == nil {
+					lsofTarget = port
+				}
 				fmt.Fprintf(stderr,
 					"quenchforge: port %s is in use but holder could not be identified "+
 						"(lsof + netstat both failed). Check `lsof -i :%s` manually.\n",
-					cfg.ListenAddr, cfg.ListenAddr)
+					cfg.ListenAddr, lsofTarget)
 				return nil
 			}
 		}

@@ -19,9 +19,11 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -123,14 +125,23 @@ func tryListen(addr string) (net.Listener, error) {
 }
 
 // isAddrInUse reports whether err is a syscall-level "address in use".
+//
+// Preferred path: unwrap into *net.OpError → *os.SyscallError →
+// syscall.EADDRINUSE. That's stable against Go-runtime and macOS
+// error-string changes. Substring fallback covers unusual wrapping
+// (e.g. errors wrapped past the OpError boundary).
 func isAddrInUse(err error) bool {
 	if err == nil {
 		return false
 	}
-	// Fastest portable check: substring match. The structured-error
-	// path requires syscall.EADDRINUSE comparison, which is a noisy
-	// import for one predicate; the strings.Contains is reliable
-	// across all macOS Go versions we target.
+	var opErr *net.OpError
+	if errors.As(err, &opErr) {
+		if se, ok := opErr.Err.(*os.SyscallError); ok {
+			if se.Err == syscall.EADDRINUSE {
+				return true
+			}
+		}
+	}
 	s := err.Error()
 	return strings.Contains(s, "address already in use") ||
 		strings.Contains(s, "EADDRINUSE")
@@ -203,8 +214,11 @@ func identifyViaLsof(ctx context.Context, port int) (Holder, bool) {
 }
 
 // identifyViaNetstat is a fallback for sandboxed environments where
-// lsof is unavailable. macOS netstat doesn't directly report PID, so
-// this is a softer signal — best-effort.
+// lsof is unavailable. macOS netstat -anv does not expose PID columns
+// reliably (the BSD netstat output has no stable PID field), so we
+// cannot identify the holder here — we can only confirm SOMETHING is
+// listening. Returning (Holder{}, false) routes the caller to
+// VerdictUnknown, which is honest about the lack of identification.
 func identifyViaNetstat(ctx context.Context, port int) (Holder, bool) {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
@@ -215,31 +229,12 @@ func identifyViaNetstat(ctx context.Context, port int) (Holder, bool) {
 		return Holder{}, false
 	}
 
-	// Look for a LISTEN line on the port. macOS netstat -anv columns
-	// vary; we only need to confirm presence and grab the PID column
-	// if it's there.
 	needle := fmt.Sprintf(".%d ", port)
 	for _, line := range strings.Split(string(out), "\n") {
-		if !strings.Contains(line, "LISTEN") {
-			continue
+		if strings.Contains(line, "LISTEN") && strings.Contains(line, needle) {
+			// Confirmed in use; identity unknown.
+			return Holder{}, false
 		}
-		if !strings.Contains(line, needle) {
-			continue
-		}
-		fields := strings.Fields(line)
-		// macOS netstat -anv ends with: rxbytes txbytes ... uid pid
-		if len(fields) < 2 {
-			continue
-		}
-		// Try the last field as PID.
-		if pid, err := strconv.Atoi(fields[len(fields)-1]); err == nil && pid > 0 {
-			return Holder{
-				PID:         pid,
-				CommandName: resolveExecPath(ctx, pid), // we don't have a separate command name here
-			}, true
-		}
-		// We saw the listener but can't name it.
-		return Holder{}, false
 	}
 	return Holder{}, false
 }
@@ -275,7 +270,3 @@ const CanonicalOllamaMessage = `quenchforge: port %s is held by Ollama.app (pid 
 func FormatOllamaMessage(addr string, pid int) string {
 	return fmt.Sprintf(CanonicalOllamaMessage, addr, pid)
 }
-
-// ErrUnresolvedHolder is returned only by helpers that explicitly
-// signal "saw a holder, couldn't name it" — Check never returns it.
-var ErrUnresolvedHolder = errors.New("port held but holder unidentified")

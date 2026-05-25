@@ -65,6 +65,8 @@ func TestCheck_PortHeld_ReturnsIdentifiedHolder(t *testing.T) {
 		if r.Verdict != VerdictUnknown {
 			t.Errorf("verdict = %v, want VerdictHeldByOther or VerdictUnknown",
 				r.Verdict)
+		} else {
+			t.Logf("VerdictUnknown accepted — lsof may be restricted in this environment")
 		}
 	}
 }
