@@ -125,11 +125,21 @@ func chatParams(profile hardware.Profile) SlotTuning {
 	if !profileIsAMDDiscrete(profile) {
 		return SlotTuning{}
 	}
+	// AMD-discrete chat slot routes to CPU pending the quantized-matmul
+	// fallback patch (planned as patch 0005). Patches 0001/0003/0004
+	// cover fp32/fp16 BERT shapes only; chat-slot Q4_K_M / Q5_K_M
+	// models still SIGABRT on Vega II Metal under sustained load —
+	// 257 abort traps observed across a 7-day uptime window
+	// (2026-05-17 → 2026-05-24) contributing to the 2026-05-17 panic
+	// and the 2026-05-24 system freeze. Mirror of the v0.7.0
+	// embed/rerank CPU routing — remove this `--gpu-layers 0` pair
+	// when patch 0005 lands and bench-llama-sustained-load passes.
 	return SlotTuning{
 		ExtraArgs: []string{
 			"--flash-attn", "off",
 			"--cache-ram", "0",
 			"--no-cache-prompt",
+			"--gpu-layers", "0",
 		},
 		AutoRespawn: true,
 	}

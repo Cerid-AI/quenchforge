@@ -60,6 +60,7 @@ func TestKernelParams_ChatAMDGetsCorrectnessFlags(t *testing.T) {
 				"--flash-attn", "off",
 				"--cache-ram", "0",
 				"--no-cache-prompt",
+				"--gpu-layers", "0",
 			}
 			if !slices.Equal(tn.ExtraArgs, wantExtra) {
 				t.Errorf("chat AMD %s ExtraArgs = %v, want %v",
