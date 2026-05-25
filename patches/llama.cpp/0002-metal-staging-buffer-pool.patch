@@ -1,63 +1,14 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 39db7657d40f1faaa827786af675decfe344450e Mon Sep 17 00:00:00 2001
 From: Quenchforge Contributors <maintainers@cerid-ai.com>
-Date: Sat, 17 May 2026 08:50:00 -0400
+Date: Mon, 25 May 2026 16:40:29 -0400
 Subject: [PATCH] metal: pool transient staging buffers on AMD discrete
 
-Eliminates the AMD-Mac sustained-load Metal SIGABRT family-B by
-replacing the per-call `newBufferWithBytesNoCopy` pattern in
-`ggml_metal_buffer_set_tensor` and `ggml_metal_buffer_get_tensor`
-with a bounded MTLBuffer pool. The current code allocates a fresh
-shared-mode staging buffer on every set/get, which registers a new
-IOMMU page-table entry per call on AMD discrete. After ~80 sustained
-calls (sub-millisecond cadence under eval/ingest workloads) the
-driver's PCIe-mapped staging-buffer pool — ~256-512 active mappings
-— exhausts, `newBufferWithBytesNoCopy` returns nil, and the
-`GGML_ASSERT(buf_src)` SIGABRTs the process.
-
-Mechanism (verified by reading ggml-metal-device.m and Apple's
-"Metal Best Practices Guide" § "Manage Memory Allocation Performance"):
-
-- Apple Silicon: `buf->is_shared == true`, both functions take the
-  `memcpy` fast path and never enter the buffer-pool codepath.
-  Unaffected by this patch.
-- AMD discrete: `MTLResourceStorageModeShared` goes through
-  IOSurface-backed PCIe-mapped memory; each `newBufferWithBytesNoCopy`
-  is a fresh kernel-level registration. Sustained per-call allocations
-  exhaust the driver's bounded mapping pool faster than reclamation
-  can keep up.
-
-The fix follows Apple's documented pattern: pre-allocate `MTLBuffer`s
-in power-of-two size classes, recycle on each call, cap per-class
-count. One pool buffer = one IOMMU registration, reused. Worst-case
-total registrations across all classes = 4 × N_classes ≈ 30-40, well
-below the AMD driver's exhaustion threshold.
-
-Trade-off: the source/destination data is no longer the caller's
-`data` pointer, so we copy via `memcpy` into a pool buffer before
-the blit (set_tensor) or out of a pool buffer after the blit
-(get_tensor). On AMD discrete this is strictly cheaper than the
-per-call allocation it replaces — the allocation itself was the
-slow path (sub-ms kernel crossing, IOMMU registration).
-
-Bench validated on Mac Pro 2019 + Radeon Pro Vega II 32 GB HBM2,
-2026-05-17: 1597 sustained-embed calls over 3 minutes against
-`nomic-embed-text-v1.5`, zero family-B SIGABRTs, p50=109ms,
-p99=147ms, ratio=1.34 (well below the critical-ratio=5 threshold).
-v0.6.2 unpatched typically hits family-B within ~80 calls under the
-same workload.
-
-Operator escape hatch: `GGML_METAL_DISABLE_STAGING_POOL=1` reverts
-to the old `newBufferWithBytesNoCopy` path for A/B testing during
-rollout and as a safety belt if a workload trips on an edge case
-we haven't characterised.
-
-Signed-off-by: Quenchforge Contributors <maintainers@cerid-ai.com>
 ---
- ggml/src/ggml-metal/ggml-metal-device.m | 168 +++++++++++++++++++++++-
- 1 file changed, 161 insertions(+), 7 deletions(-)
+ ggml/src/ggml-metal/ggml-metal-device.m | 167 ++++++++++++++++++++----
+ 1 file changed, 145 insertions(+), 22 deletions(-)
 
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
-index fab7891..4529784 100644
+index 851c240..4529784 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.m
 +++ b/ggml/src/ggml-metal/ggml-metal-device.m
 @@ -25,6 +25,99 @@
@@ -160,42 +111,7 @@ index fab7891..4529784 100644
  #if !GGML_METAL_EMBED_LIBRARY
  // Here to assist with NSBundle Path Hack
  @interface GGMLMetalClass : NSObject
-@@ -645,14 +738,30 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
-             dev->addr_virt = 0x000000400ULL;
- 
-             dev->props.device = device;
--            dev->props.has_simdgroup_reduction  = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
--            dev->props.has_simdgroup_reduction |= [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
-+            // Quenchforge patch 0002: simdgroup-reduction kernels rely on
-+            // Apple-Silicon-specific simdgroup intrinsics. On non-Apple Metal
-+            // devices (Intel Mac + AMD discrete, Intel iGPU) the kernels
-+            // produce wrong arithmetic and the model emits garbage tokens.
-+            // The original upstream `|=` with MTLGPUFamilyMetal3_GGML enabled
-+            // the buggy path on AMD Vega II / W6800X / RDNA1+2 / Intel Iris,
-+            // all of which advertise Metal3 support.
-+            // Gate to Apple7 only by default; allow opt-in for testing.
-+            // See: https://github.com/ggml-org/llama.cpp/issues/19563
-+            dev->props.has_simdgroup_reduction = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
-+            if (getenv("GGML_METAL_FORCE_SIMDGROUP_REDUCTION") != NULL) {
-+                dev->props.has_simdgroup_reduction |= [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
-+            }
- 
-             dev->props.has_simdgroup_mm = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
-             dev->props.has_unified_memory = dev->mtl_device.hasUnifiedMemory;
- 
--            dev->props.has_bfloat  = [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
--            dev->props.has_bfloat |= [dev->mtl_device supportsFamily:MTLGPUFamilyApple6];
-+            // Quenchforge patch 0002 (related): bfloat ops on AMD Metal also
-+            // produce incorrect results in our testing on Vega II. Default to
-+            // disabled on non-Apple-Silicon; operators can override.
-+            dev->props.has_bfloat  = [dev->mtl_device supportsFamily:MTLGPUFamilyApple6];
-+            if (getenv("GGML_METAL_FORCE_BF16") != NULL) {
-+                dev->props.has_bfloat |= [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
-+            }
-             if (getenv("GGML_METAL_BF16_DISABLE") != NULL) {
-                 dev->props.has_bfloat = false;
-             }
-@@ -1653,12 +1762,27 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor *
+@@ -1669,12 +1762,27 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor *
      }
  
      @autoreleasepool {
@@ -226,7 +142,7 @@ index fab7891..4529784 100644
  
          GGML_ASSERT(buf_src);
  
-@@ -1666,10 +1790,6 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor *
+@@ -1682,10 +1790,6 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor *
          struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(buf, tensor);
          bid_dst.offs += offset;
  
@@ -237,7 +153,7 @@ index fab7891..4529784 100644
          id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
  
          {
-@@ -1684,19 +1804,19 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor *
+@@ -1700,19 +1804,19 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor *
              [encoder endEncoding];
          }
  
@@ -267,7 +183,7 @@ index fab7891..4529784 100644
      }
  }
  
-@@ -1711,11 +1831,23 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
+@@ -1727,11 +1831,23 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
          struct ggml_metal_buffer_id bid_src = ggml_metal_buffer_get_id(buf, tensor);
          bid_src.offs += offset;
  
@@ -296,7 +212,7 @@ index fab7891..4529784 100644
  
          GGML_ASSERT(buf_dst);
  
-@@ -1735,6 +1867,13 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
+@@ -1751,6 +1867,13 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
  
          [cmd_buf commit];
          [cmd_buf waitUntilCompleted];
@@ -310,5 +226,6 @@ index fab7891..4529784 100644
      }
  }
  
---
-2.42.0
+-- 
+2.50.1 (Apple Git-155)
+
