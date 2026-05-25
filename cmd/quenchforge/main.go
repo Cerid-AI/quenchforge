@@ -286,11 +286,17 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) error {
 
 	// --explain — per-finding remediation steps, so a bug-report triage
 	// reply can quote the doctor output AND the next action in one paste.
-	// Kept as a single block (not inlined per-finding) to minimise the
-	// diff; future polish can move each line next to its check.
+	// Framed as a "Common remediations" reference (not "Remediation") so
+	// a user with a healthy system reading the section understands these
+	// are conditional steps, not actions they should take unconditionally.
+	// Gating per-line on each helper's status would require threading
+	// structured status through every check — a larger refactor — and
+	// this framing keeps the diff small while removing the misleading
+	// "fix this" framing.
 	if *explain {
-		fmt.Fprintln(stdout, "Remediation")
-		fmt.Fprintln(stdout, "-----------")
+		fmt.Fprintln(stdout, "Common remediations")
+		fmt.Fprintln(stdout, "-------------------")
+		fmt.Fprintln(stdout, "  (Reference — apply only those matching non-PASS findings above.)")
 		fmt.Fprintln(stdout, `  - Ollama LaunchAgent loaded:    launchctl bootout gui/$(id -u)/com.ollama.ollama`)
 		fmt.Fprintln(stdout, `  - Disk space CRITICAL:          docker system prune -a --volumes && truncate slot logs`)
 		fmt.Fprintln(stdout, `  - Slot log CRITICAL:            : > <path-to-log>  (Layer 1c rotation should prevent recurrence)`)
@@ -320,13 +326,21 @@ func checkOllamaLaunchAgent() string {
 		return "not installed"
 	}
 
-	out, err := exec.Command("launchctl", "list", "com.ollama.ollama").Output()
+	// Bounded so a hung launchd doesn't make `quenchforge doctor` itself
+	// hang — diagnostic tools must always return quickly.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "launchctl", "list", "com.ollama.ollama").Output()
 	if err != nil {
 		return "disabled"
 	}
 	for _, ln := range strings.Split(string(out), "\n") {
 		ln = strings.TrimSpace(ln)
-		if !strings.HasPrefix(ln, "\"PID\"") {
+		// Apple's launchctl list output has used both `"PID" = N;` (quoted)
+		// and `PID = N;` (unquoted) depending on macOS version + launchd
+		// domain. Tolerate either. Trailing space on the unquoted form
+		// avoids matching unrelated keys like `PIDProcess`.
+		if !strings.HasPrefix(ln, `"PID"`) && !strings.HasPrefix(ln, "PID ") {
 			continue
 		}
 		// "PID" = 1253;
@@ -349,7 +363,12 @@ func checkOllamaLaunchAgent() string {
 // < 20 GB, CRITICAL at < 10 GB — the thresholds that map to "kernel
 // panic reports can no longer be written" in the 2026-05-24 RCA.
 func checkDiskFree(mount string) string {
-	out, err := exec.Command("df", "-k", mount).Output()
+	// Bounded so a hung volume mount (e.g. an unresponsive network share
+	// in the filesystem table) doesn't make `quenchforge doctor` itself
+	// hang — diagnostic tools must always return quickly.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "df", "-k", mount).Output()
 	if err != nil {
 		return fmt.Sprintf("could not read disk usage for %s: %v", mount, err)
 	}
@@ -377,7 +396,7 @@ func checkDiskFree(mount string) string {
 	case availGB < 20:
 		status = "WARN"
 	}
-	return fmt.Sprintf("%s: %d GB available (%s used) — %s", mount, availGB, capacity, status)
+	return fmt.Sprintf("%s: %d GB available (%s capacity) — %s", mount, availGB, capacity, status)
 }
 
 // checkSlotLogSizes returns one line per file under

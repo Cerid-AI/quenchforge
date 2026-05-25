@@ -5,6 +5,7 @@ package main
 
 import (
 	"bytes"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -338,6 +339,20 @@ func TestDoctor_IncludesOllamaLaunchAgentCheck(t *testing.T) {
 	if !strings.Contains(out, "Ollama LaunchAgent") {
 		t.Errorf("doctor output missing 'Ollama LaunchAgent' section.\nGot:\n%s", out)
 	}
+	// The Ollama LaunchAgent line must emit a recognisable status string
+	// (one of the four checkOllamaLaunchAgent return shapes). A buggy
+	// helper that always returned "" would still pass the header check
+	// above — this assertion catches that.
+	matched, err := regexp.MatchString(
+		`(?m)Ollama LaunchAgent\n-+\n\s+status:.*(not installed|disabled|loaded \(PID|loaded but stopped)`,
+		out,
+	)
+	if err != nil {
+		t.Fatalf("regex: %v", err)
+	}
+	if !matched {
+		t.Errorf("Ollama LaunchAgent section missing recognisable status verdict.\nGot:\n%s", out)
+	}
 }
 
 func TestDoctor_IncludesDiskFreeCheck(t *testing.T) {
@@ -345,8 +360,19 @@ func TestDoctor_IncludesDiskFreeCheck(t *testing.T) {
 	if err := cmdDoctor(nil, &stdout, &stderr); err != nil {
 		t.Fatalf("cmdDoctor: %v", err)
 	}
-	if !strings.Contains(stdout.String(), "Disk space") {
+	out := stdout.String()
+	if !strings.Contains(out, "Disk space") {
 		t.Errorf("doctor output missing 'Disk space' section")
+	}
+	matched, err := regexp.MatchString(
+		`(?m)Disk space\n-+\n\s+/System/Volumes/Data:.*\b(PASS|WARN|CRITICAL)\b`,
+		out,
+	)
+	if err != nil {
+		t.Fatalf("regex: %v", err)
+	}
+	if !matched {
+		t.Errorf("Disk space section missing classification (PASS/WARN/CRITICAL).\nGot:\n%s", out)
 	}
 }
 
@@ -355,8 +381,23 @@ func TestDoctor_IncludesLogSizeCheck(t *testing.T) {
 	if err := cmdDoctor(nil, &stdout, &stderr); err != nil {
 		t.Fatalf("cmdDoctor: %v", err)
 	}
-	if !strings.Contains(stdout.String(), "Slot log sizes") {
+	out := stdout.String()
+	if !strings.Contains(out, "Slot log sizes") {
 		t.Errorf("doctor output missing 'Slot log sizes' section")
+	}
+	// On a CI box with no slot logs yet, the section emits the
+	// "(no slot logs yet)" sentinel. On a developer machine with logs,
+	// each row carries a PASS/WARN/CRITICAL verdict. Either shape proves
+	// the helper did real work.
+	matched, err := regexp.MatchString(
+		`(?m)Slot log sizes\n-+\n\s+(\(no slot logs yet\)|.*\b(PASS|WARN|CRITICAL)\b)`,
+		out,
+	)
+	if err != nil {
+		t.Fatalf("regex: %v", err)
+	}
+	if !matched {
+		t.Errorf("Slot log sizes section missing classification or empty-state sentinel.\nGot:\n%s", out)
 	}
 }
 
@@ -365,8 +406,22 @@ func TestDoctor_IncludesPortCheck(t *testing.T) {
 	if err := cmdDoctor(nil, &stdout, &stderr); err != nil {
 		t.Fatalf("cmdDoctor: %v", err)
 	}
-	if !strings.Contains(stdout.String(), "Port 11434") {
+	out := stdout.String()
+	if !strings.Contains(out, "Port 11434") {
 		t.Errorf("doctor output missing 'Port 11434' section")
+	}
+	// Port check verdicts don't map to the PASS/WARN/CRITICAL string set;
+	// they're worded ("free", "held by", "in use"). Assert one of those
+	// phrases shows up so we know the section did real work.
+	matched, err := regexp.MatchString(
+		`(?m)Port 11434\n-+\n\s+.*\b(free|held by|in use|could not probe)\b`,
+		out,
+	)
+	if err != nil {
+		t.Fatalf("regex: %v", err)
+	}
+	if !matched {
+		t.Errorf("Port 11434 section missing verdict (free|held by|in use).\nGot:\n%s", out)
 	}
 }
 
@@ -376,8 +431,8 @@ func TestDoctor_ExplainModeAddsRemediation(t *testing.T) {
 		t.Fatalf("cmdDoctor --explain: %v", err)
 	}
 	out := stdout.String()
-	if !strings.Contains(out, "Remediation") {
-		t.Errorf("--explain output missing 'Remediation' section")
+	if !strings.Contains(out, "Common remediations") {
+		t.Errorf("--explain output missing 'Common remediations' section.\nGot:\n%s", out)
 	}
 }
 
