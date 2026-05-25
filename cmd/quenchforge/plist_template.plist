@@ -70,12 +70,18 @@
     <true/>
 
     <!--
-      Unconditional restart. The supervisor itself manages its slots;
-      a clean exit usually means the operator unloaded the job, which
-      removes it from launchd's supervision before KeepAlive fires.
+      Restart only on crashes (non-zero exit), never on clean exits.
+      The pre-bind port-check path in cmdServe exits 0 with an actionable
+      message when the port is held by Ollama or a stale quenchforge —
+      KeepAlive=<true/> would respawn-loop on that, defeating the
+      operator-friendly error. SuccessfulExit=false keeps the supervisor
+      restart-on-crash semantics while letting clean exits stick.
     -->
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
 
     <!-- Don't thrash if the binary crash-loops; back off 10s between starts. -->
     <key>ThrottleInterval</key>

@@ -22,6 +22,7 @@ import (
 	"github.com/cerid-ai/quenchforge/internal/discovery"
 	"github.com/cerid-ai/quenchforge/internal/gateway"
 	"github.com/cerid-ai/quenchforge/internal/hardware"
+	"github.com/cerid-ai/quenchforge/internal/portcheck"
 	"github.com/cerid-ai/quenchforge/internal/supervisor"
 	"github.com/cerid-ai/quenchforge/internal/tuning"
 )
@@ -247,6 +248,47 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 	}
 	if err := cfg.EnsureDirs(); err != nil {
 		return err
+	}
+
+	// Pre-bind port check. Identifies common conflicts (Ollama, stale
+	// quenchforge) and exits cleanly with actionable guidance so the
+	// LaunchAgent's KeepAlive=<dict><SuccessfulExit false/></dict>
+	// (post-Layer-2 plist) does not respawn-loop.
+	{
+		pcCtx, pcCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		res, err := portcheck.Check(pcCtx, cfg.ListenAddr)
+		pcCancel()
+		if err != nil {
+			fmt.Fprintf(stderr, "quenchforge: port probe failed for %s: %v\n", cfg.ListenAddr, err)
+			// Probe failure is not fatal — fall through to bind and let
+			// the real error surface if there is one.
+		} else {
+			switch res.Verdict {
+			case portcheck.VerdictFree:
+				// No-op.
+			case portcheck.VerdictHeldByOllama:
+				fmt.Fprint(stderr, portcheck.FormatOllamaMessage(cfg.ListenAddr, res.Holder.PID))
+				return nil // clean exit so launchd does not respawn
+			case portcheck.VerdictHeldByStaleQuenchforge:
+				fmt.Fprintf(stderr,
+					"quenchforge: stale quenchforge process (pid %d) is holding %s. "+
+						"Try: kill %d && launchctl kickstart -k gui/$(id -u)/com.cerid.quenchforge\n",
+					res.Holder.PID, cfg.ListenAddr, res.Holder.PID)
+				return nil
+			case portcheck.VerdictHeldByOther:
+				fmt.Fprintf(stderr,
+					"quenchforge: port %s is held by pid %d (%s, %s). "+
+						"Resolve the conflict and re-run.\n",
+					cfg.ListenAddr, res.Holder.PID, res.Holder.CommandName, res.Holder.ExecPath)
+				return nil
+			case portcheck.VerdictUnknown:
+				fmt.Fprintf(stderr,
+					"quenchforge: port %s is in use but holder could not be identified "+
+						"(lsof + netstat both failed). Check `lsof -i :%s` manually.\n",
+					cfg.ListenAddr, cfg.ListenAddr)
+				return nil
+			}
+		}
 	}
 
 	// Resolve per-slot log rotation parameters ONCE per cmdServe; we
