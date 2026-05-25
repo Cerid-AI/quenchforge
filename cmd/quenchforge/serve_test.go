@@ -6,6 +6,7 @@ package main
 import (
 	"bytes"
 	"regexp"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -13,6 +14,19 @@ import (
 	"github.com/cerid-ai/quenchforge/internal/gateway"
 	"github.com/cerid-ai/quenchforge/internal/hardware"
 )
+
+// skipIfNotDarwin short-circuits doctor extension tests on non-Darwin
+// platforms. cmdDoctor emits its "UNSUPPORTED (quenchforge is macOS-only)"
+// banner and returns early on Linux/Windows per CLAUDE.md's macOS-only
+// rule, so the Phase 3 sections (Ollama LaunchAgent, Disk space, Slot
+// log sizes, Port 11434) only render on darwin. Tests covering those
+// sections must skip elsewhere.
+func skipIfNotDarwin(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS != "darwin" {
+		t.Skipf("cmdDoctor extensions are macOS-only (GOOS=%s)", runtime.GOOS)
+	}
+}
 
 // containsArgPair returns true when `flag` appears at args[i] and `value`
 // at args[i+1] for some i.
@@ -331,6 +345,7 @@ func TestBuildSlotArgs_NonEmbedKindsSkipBatchOverride(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDoctor_IncludesOllamaLaunchAgentCheck(t *testing.T) {
+	skipIfNotDarwin(t)
 	var stdout, stderr bytes.Buffer
 	if err := cmdDoctor(nil, &stdout, &stderr); err != nil {
 		t.Fatalf("cmdDoctor: %v", err)
@@ -356,6 +371,7 @@ func TestDoctor_IncludesOllamaLaunchAgentCheck(t *testing.T) {
 }
 
 func TestDoctor_IncludesDiskFreeCheck(t *testing.T) {
+	skipIfNotDarwin(t)
 	var stdout, stderr bytes.Buffer
 	if err := cmdDoctor(nil, &stdout, &stderr); err != nil {
 		t.Fatalf("cmdDoctor: %v", err)
@@ -377,6 +393,7 @@ func TestDoctor_IncludesDiskFreeCheck(t *testing.T) {
 }
 
 func TestDoctor_IncludesLogSizeCheck(t *testing.T) {
+	skipIfNotDarwin(t)
 	var stdout, stderr bytes.Buffer
 	if err := cmdDoctor(nil, &stdout, &stderr); err != nil {
 		t.Fatalf("cmdDoctor: %v", err)
@@ -402,6 +419,7 @@ func TestDoctor_IncludesLogSizeCheck(t *testing.T) {
 }
 
 func TestDoctor_IncludesPortCheck(t *testing.T) {
+	skipIfNotDarwin(t)
 	var stdout, stderr bytes.Buffer
 	if err := cmdDoctor(nil, &stdout, &stderr); err != nil {
 		t.Fatalf("cmdDoctor: %v", err)
@@ -426,6 +444,7 @@ func TestDoctor_IncludesPortCheck(t *testing.T) {
 }
 
 func TestDoctor_ExplainModeAddsRemediation(t *testing.T) {
+	skipIfNotDarwin(t)
 	var stdout, stderr bytes.Buffer
 	if err := cmdDoctor([]string{"--explain"}, &stdout, &stderr); err != nil {
 		t.Fatalf("cmdDoctor --explain: %v", err)
