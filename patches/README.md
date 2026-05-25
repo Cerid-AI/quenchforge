@@ -148,6 +148,19 @@ staging-buffer allocations across calls (instead of
 That work is out of scope for the supervisor layer and tracked
 separately.
 
+**Chat slot inherits the same Metal-stability concern.** The quantized
+chat models cerid runs (Q4_K_M llama3.1-8b, Q5_K_M variants) traverse
+the same matmul kernels patches 0003/0004 patch for fp32/fp16, but the
+fallback dispatcher in `pipeline_mul_mv` selects the upstream
+(broken-on-AMD) kernel for any non-fp32/fp16 tensor type. Empirically:
+257 chat-slot SIGABRTs observed across one 7-day uptime window on Vega
+II, contributing to the 2026-05-17 vm_page_wire panic.
+
+Mitigation in v0.7.2: chat slot routes to CPU via `--gpu-layers 0`
+(see `internal/tuning/tuning.go::chatParams`). Mirrors the embed/rerank
+CPU policy. Reversal trigger: planned patch 0005 (quantized matmul
+fallback) + a `scripts/bench-llama-sustained-load.py` regression test.
+
 ### Why not a second patch?
 
 The "one patch per submodule" rule (`CLAUDE.md` absolute rule #3)

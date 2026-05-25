@@ -8,6 +8,59 @@ patch bumps fix bugs or polish without behaviour change.
 
 ---
 
+## v0.7.2 — stability hardening + Ollama deconfliction (2026-05-25)
+
+Driven by a 2026-05-24 system freeze on the dev Mac Pro requiring two
+hard reboots. RCA traced the failure to a multi-day cascade rooted in
+quenchforge's gateway crash-spamming when Ollama.app's login agent won
+the race for 127.0.0.1:11434, combined with unbounded slot log growth
+and continued chat-slot SIGABRT on Vega II Metal.
+
+### Stability fixes
+
+- **Pre-bind port check** (`internal/portcheck`). Before binding 11434,
+  identify any existing listener via `lsof` (netstat fallback).
+  Verdict-specific exits: Ollama → canonical actionable error + exit 0;
+  stale quenchforge → graceful takeover; other → log + exit 0. The
+  clean exit pairs with the plist KeepAlive dict (below) so launchd
+  does not crash-spam.
+
+- **LaunchAgent plist hardening** (`plist_template.plist`). KeepAlive
+  changes from `<true/>` to `<dict><SuccessfulExit><false/></dict>`,
+  suppressing respawn on the new clean-exit path. ThrottleInterval=10
+  stays as belt-and-suspenders for real crashes.
+
+- **Slot log rotation** (`internal/supervisor/logrotate.go`). 100 MB
+  per file, 5 backups by default. Overridable via
+  QUENCHFORGE_LOG_MAX_BYTES / QUENCHFORGE_LOG_BACKUPS. Eliminates the
+  3.73 GB unbounded embed.log class.
+
+- **Chat slot routes to CPU on AMD-discrete** (`internal/tuning/
+  tuning.go::chatParams`). Quantized chat models hit the same
+  family-B SIGABRT pattern as embed/rerank pre-v0.7.0 (patch 0003/0004
+  cover fp32/fp16 only). Mirror of the existing embed/rerank CPU
+  policy. Reversal: planned patch 0005.
+
+### Diagnostics
+
+- **`quenchforge doctor` extended** with four new sections: Ollama
+  LaunchAgent state, disk free on /System/Volumes/Data, per-slot log
+  file sizes, port 11434 holder. `--explain` flag appends per-finding
+  remediation guidance for bug-report triage.
+
+### Documentation
+
+- README: new "Coexistence with Ollama" section under Installation.
+- patches/README.md Section 3: extended to cover chat-slot symmetry.
+
+### No upstream patches added or removed
+
+The single llama.cpp patch (0001-metal-correctness-on-non-apple-silicon)
+remains the only load-bearing patch; 0003/0004 stay staged but
+inactive in production (per v0.8.0-rc1 changelog).
+
+---
+
 ## v0.8.0-rc1 — matmul fallback kernels (2026-05-18, patch-staged)
 
 Completes the kernel-level fix series that v0.7.1 began. Adds

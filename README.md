@@ -114,6 +114,45 @@ curl -X POST http://127.0.0.1:11434/v1/audio/transcriptions \
 
 Signed + notarized bottles depend on Apple Developer ID configuration in CI.
 
+### Coexistence with Ollama.app
+
+Quenchforge listens on `127.0.0.1:11434` — the same port as Ollama. If
+`/Applications/Ollama.app` is also installed, its login agent
+(`com.ollama.ollama`) races quenchforge to bind the port at every
+login. The pre-bind check (added in this release) detects the conflict
+and exits cleanly with guidance; the `KeepAlive=<dict><SuccessfulExit
+false/></dict>` plist setting prevents launchd from respawning on the
+clean exit.
+
+To resolve:
+
+**Option A — use quenchforge only** (recommended for cerid AI workloads):
+
+```sh
+osascript -e 'tell application "Ollama" to quit' 2>/dev/null || true
+launchctl bootout gui/$(id -u)/com.ollama.ollama
+launchctl kickstart -k gui/$(id -u)/com.cerid.quenchforge
+```
+
+The Ollama.app stays installed; you can run `open -a Ollama` manually
+if you ever need it.
+
+**Option B — coexist on different ports**:
+
+Edit `~/Library/LaunchAgents/com.cerid.quenchforge.plist` and add to
+the `<EnvironmentVariables>` dict:
+
+```xml
+<key>QUENCHFORGE_LISTEN_ADDR</key>
+<string>:11435</string>
+```
+
+Then `launchctl kickstart -k gui/$(id -u)/com.cerid.quenchforge`.
+Quenchforge is now on `11435` and Ollama owns `11434`. Update any
+clients that point at quenchforge to use the new port.
+
+Run `quenchforge doctor` to verify either resolution.
+
 ## First-launch prompts to expect
 
 - **"Quenchforge would like to find and connect to devices on your local network"** — Sonoma+ TCC prompt for mDNS / Bonjour advertisement (`_quenchforge._tcp.local.`). Only shown when `QUENCHFORGE_ADVERTISE_MDNS=true`. Allowing this lets cerid-ai and other LAN clients auto-discover the service.
