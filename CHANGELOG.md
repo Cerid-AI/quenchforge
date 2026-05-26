@@ -8,6 +8,129 @@ patch bumps fix bugs or polish without behaviour change.
 
 ---
 
+## v0.8.0-rc2 — AMD-discrete GPU mode revival (2026-05-25)
+
+The Mac Pro 7,1 + Radeon Pro Vega II 32 GB configuration now runs all
+four production slot types (chat, embed, code-embed, rerank) on GPU
+by default. The Xeon W's 16 cores are freed for the gateway and the
+OS. v0.7.0 through v0.7.2.x ran AMD-discrete slots on CPU as a safety
+fallback after two distinct Metal-on-AMD bugs were discovered; both
+are now addressed.
+
+7-day production observation window in progress; tag `v0.8.0` (final)
+will land at the end of that window pending zero kernel panics and
+AutoRespawn count ≤ 10/week.
+
+### Two-layer fix
+
+**Kernel layer:** new patch `0002-metal-staging-buffer-pool` replaces
+the per-call `newBufferWithBytesNoCopy` allocation in
+`ggml_metal_buffer_set_tensor` and `_get_tensor` with a bounded
+MTLBuffer pool (15 power-of-two size classes from 4 KiB to 64 MiB,
+per-class FIFO cap of 4). Eliminates the AMD-discrete IOMMU
+registration churn that exhausts the driver's mapping pool under
+sustained load and triggers the `GGML_ASSERT(buf)` family-B SIGABRT
+documented in `patches/README.md` Section 3.
+
+**Supervisor layer:** `internal/tuning/tuning.go::chatParams /
+embedParams / rerankParams` AMD-discrete branches flip `--gpu-layers`
+from `0` (CPU route) to `999` (GPU) and set the new
+`SlotTuning.MetalConcurrencyDisable: true` field. `slotEnv` in
+`cmd/quenchforge/main.go` injects `GGML_METAL_CONCURRENCY_DISABLE=1`
+in the slot's environment, disabling the upstream
+`MTLDispatchTypeConcurrent` path that produced cross-call
+non-determinism in BERT embeddings on non-UMA Macs (llama.cpp
+[issue #19563](https://github.com/ggml-org/llama.cpp/issues/19563)).
+
+`embedParams` additionally re-enables the 1024 ubatch cap
+(`amdEmbedUbatchDefault`) — CLAUDE.md operational gotcha #2 caps
+per-call Metal staging-buffer pressure even with patch 0002's pool
+in place. `AutoRespawn: true` retained on all three slot kinds as
+defense in depth for unknown crash classes.
+
+### Bench results
+
+Validated on Mac Pro 2019 + Vega II 32 GB HBM2, 2026-05-25:
+
+| Bench | Result | Throughput / latency |
+|---|---|---|
+| `bench-bert-correctness.py` (nomic) | PASS | cos_sim 1.000000 |
+| `bench-bert-correctness.py` (jina) | PASS | cos_sim 1.000000 |
+| `bench-bert-correctness.py --rerank` (bge) | PASS | identical scores |
+| `bench-llama-correctness.py` (llama3.1-8b) | PASS | 10 identical responses |
+| `bench-bert-sustained-load.py --duration 1800` (nomic) | PASS | 2227 reqs / 1.24 req/s / p50=2.66s / p95=4.80s / RSS 1.03× |
+| `bench-bert-sustained-load.py --duration 1800` (jina) | PASS | 1571 reqs / 0.87 req/s / p50=3.03s / p95=11.37s / RSS 1.03× |
+| `bench-llama-sustained-load.py --duration 1800` (chat) | PASS | 157 reqs / 0.09 req/s / p50=29.4s / p95=36.0s / RSS 1.00× |
+| Escape-hatch (`GGML_METAL_DISABLE_STAGING_POOL=1`) | PASS (fails as expected) | Process DIED at ~4 min / 212 reqs with family-B SIGABRT |
+
+Combined 3955 sustained requests across 90 min wall-clock, zero
+family-B SIGABRTs, zero kernel panics. Throughput speedup vs CPU
+baseline: ~2.5× for nomic embed (1.24 vs ~0.5 req/s), ~1.7× for
+jina code-embed (0.87 vs ~0.5 req/s).
+
+The escape-hatch test confirms patch 0002 is empirically what's
+preventing the family-B class: with the pool bypassed via the env
+var, the SIGABRT returns within minutes.
+
+### Operator escape hatches
+
+- `GGML_METAL_DISABLE_STAGING_POOL=1` — disables the pool, reverts
+  to upstream per-call allocation. Family-B SIGABRT returns within
+  ~5 min under sustained load.
+- Downgrade to v0.7.2 binary — full CPU route restored.
+
+### Apple Silicon
+
+Unaffected. The pool code is short-circuited by `buf->is_shared` on
+UMA devices; the env var is only injected when
+`SlotTuning.MetalConcurrencyDisable` is true, which is only set on
+AMD-discrete branches.
+
+### Bench harness additions
+
+- `scripts/bench-llama-sustained-load.py` (new) — chat counterpart of
+  `bench-bert-sustained-load.py`. 30-min hammer with deterministic
+  drift probes interleaved.
+- `scripts/bench-llama-correctness.py` (new) — short determinism +
+  semantic-keyword probes for chat slots. Mirrors
+  `bench-bert-correctness.py` exit-code contract.
+- `bench-bert-sustained-load.py` `RSS_GROWTH_FACTOR` raised from 2.0
+  to 4.0 to accommodate the pool's worst-case ~512 MB working set
+  without false leak alarms.
+
+### Scope reduction
+
+Patches `0003-metal-amd-bert-fallback-kernels.patch` and
+`0004-metal-amd-bert-matmul-fallback.patch` parked back to
+`patches/llama.cpp/drafts/.broken` pending a Metal kernel template
+signature fix (`helper_mv_reduce_and_write_fb<NR0=2>` doesn't
+compile). The critical path validated above does NOT depend on those
+patches; the _fb fallback kernels remain future optimization work,
+not a correctness gate.
+
+The bbbe40a commit en route fixed a pre-existing bug in 0003 (the
+patch had a duplicate-of-0001 hunk silently rejected at apply-time);
+the underlying template bug surfaced once 0003 actually applied,
+hence the parking decision.
+
+### Files changed
+
+- `patches/llama.cpp/0002-metal-staging-buffer-pool.patch` (new — promoted from drafts)
+- `patches/llama.cpp/drafts/0003-metal-amd-bert-fallback-kernels.patch.broken` (parked from active)
+- `patches/llama.cpp/drafts/0004-metal-amd-bert-matmul-fallback.patch.broken` (parked from active)
+- `internal/tuning/tuning.go` (new `MetalConcurrencyDisable` field; three AMD branches updated)
+- `internal/tuning/tuning_test.go` (three tests renamed + updated; +1 `containsSubslice` helper)
+- `cmd/quenchforge/main.go` (`slotEnv` extension)
+- `cmd/quenchforge/serve_test.go` (+1 test: `TestSlotEnv_AMDIncludesConcurrencyDisable`)
+- `scripts/bench-llama-{correctness,sustained-load}.py` (new chat benches)
+- `scripts/bench-bert-sustained-load.py` (RSS threshold raised to 4.0×)
+- `patches/README.md` (Section 3 updated to SHIPPED v0.8.0)
+- `docs/superpowers/specs/2026-05-25-amd-metal-staging-buffer-pool-revival-design.md` (new — the design spec)
+- `docs/superpowers/specs/2026-05-25-amd-metal-acceleration-design.md` (marked superseded)
+- `docs/superpowers/plans/2026-05-25-amd-metal-staging-buffer-pool-revival.md` (the implementation plan)
+
+---
+
 ## v0.7.2 — stability hardening + Ollama deconfliction (2026-05-25)
 
 Driven by a 2026-05-24 system freeze on the dev Mac Pro requiring two

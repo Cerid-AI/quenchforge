@@ -77,6 +77,17 @@ have a separate sustained-load failure mode — see section 3 below.)
 
 ### 3. Sustained-load graph-compute buffer-corruption
 
+> **v0.8.0 ships the kernel-level fix** as
+> [`llama.cpp/0002-metal-staging-buffer-pool.patch`](llama.cpp/0002-metal-staging-buffer-pool.patch)
+> paired with the `MetalConcurrencyDisable` env-var routing in
+> `internal/tuning/tuning.go`. See the "Sustained-load
+> graph-compute buffer-corruption — patch #2 (v0.8.0)" section
+> further down for the design + bench results. The supervisor-side
+> mitigations described in this section are retained as defense
+> in depth (AutoRespawn, ubatch caps, MetalNCB knobs) but the
+> family-B SIGABRT is no longer the expected operating mode under
+> sustained load on Vega II.
+
 A third Metal-on-AMD failure surfaces on the embed and rerank slots
 under sustained batch workloads (eval suites, bulk KB ingest, sustained
 MCP retrieval). After ~50-200 successive forward passes the
@@ -176,11 +187,12 @@ Issue refs: tracked at `Cerid-AI/quenchforge#1` (gateway /api/chat
 translation, separate concern) and `Cerid-AI/quenchforge#2` (the
 prompt-cache crash, now mitigated by `--no-cache-prompt`).
 
-### 3. Sustained-load graph-compute buffer-corruption — patch #2 (v0.7.0)
+### 3. Sustained-load graph-compute buffer-corruption — patch #2 (v0.8.0)
 
-Closes the third Metal-on-AMD failure class — `GGML_ASSERT(buf_src)`
-SIGABRT in `ggml_metal_buffer_set_tensor` and `ggml_metal_buffer_get_tensor`
-under sustained embed / chat workloads on AMD discrete.
+Closes the third Metal-on-AMD failure class — `GGML_ASSERT(buf_src)` /
+`GGML_ASSERT(buf_dst)` SIGABRT in `ggml_metal_buffer_set_tensor` and
+`ggml_metal_buffer_get_tensor` under sustained embed / chat workloads
+on AMD discrete.
 
 `v0.6.0` shipped a **supervisor-side** mitigation: AMD-discrete embed,
 code-embed, rerank, and (since v0.6.1) chat slots get `AutoRespawn:
@@ -188,30 +200,59 @@ true`, so the supervisor brings the slot back within ~30 seconds of
 the SIGABRT. The slot is back online, but the caller sees a 502 +
 breaker open during the window.
 
-`v0.7.0` ships the **kernel-level** fix as
+`v0.8.0` ships the **kernel-level** fix as
 `llama.cpp/0002-metal-staging-buffer-pool.patch`. The patch replaces
-the per-call `newBufferWithBytesNoCopy` allocation — which registers a
-new IOMMU page-table entry on AMD discrete and exhausts the driver's
+the per-call `newBufferWithBytesNoCopy` allocation — which registers
+a new IOMMU page-table entry on AMD discrete and exhausts the driver's
 ~256-512-slot pool — with a bounded MTLBuffer pool keyed on
-power-of-two size classes. One pool buffer = one registration, reused;
-worst-case total registrations stays well below the exhaustion
-threshold.
+power-of-two size classes (4 KiB → 64 MiB, per-class FIFO cap of 4).
+One pool buffer = one registration, reused; worst-case total
+registrations stays well below the exhaustion threshold.
 
 Apple Silicon is unaffected: `buf->is_shared` short-circuits to the
 `memcpy` fast path before either patched function reaches the pool.
 
-Escape hatch: `GGML_METAL_DISABLE_STAGING_POOL=1` reverts to the
-unpatched behaviour for A/B testing during rollout.
+Paired with `internal/tuning/tuning.go::chatParams/embedParams/
+rerankParams` setting `MetalConcurrencyDisable: true` for AMD-discrete
+profiles. The supervisor injects `GGML_METAL_CONCURRENCY_DISABLE=1`
+in slot env, disabling the upstream `MTLDispatchTypeConcurrent` path
+that produced non-deterministic output on non-UMA Macs
+([llama.cpp issue #19563](https://github.com/ggml-org/llama.cpp/issues/19563)).
+
+Operator escape hatch: `GGML_METAL_DISABLE_STAGING_POOL=1` reverts to
+the unpatched per-call allocation path. Empirically, setting this env
+var brings the family-B SIGABRT back within ~4 min / ~212 requests
+under sustained load — confirms the patch is what's preventing the
+crash, not coincidence.
 
 **Bench-validated on Mac Pro 2019 + Radeon Pro Vega II 32 GB HBM2,
-2026-05-17:** 1597 sustained-embed calls over 3 minutes against
-`nomic-embed-text-v1.5`, **zero family-B SIGABRTs**, p50 = 109 ms,
-p99 = 147 ms, ratio = 1.34 (well below the critical-ratio = 5
-threshold). v0.6.2 unpatched typically hits family-B within ~80
-calls under the same workload. The full design, bench acceptance
-criteria, and upstream-issue draft live in
-[`llama.cpp/drafts/README.md`](llama.cpp/drafts/README.md) (kept as
-supplemental documentation for the upstream filing).
+2026-05-25 (v0.8.0-rc2):**
+
+| Bench | Result | Notes |
+|---|---|---|
+| `bench-bert-correctness.py` (nomic) | PASS | cos_sim 1.000000 across 4 probes |
+| `bench-bert-correctness.py` (jina) | PASS | same |
+| `bench-bert-correctness.py --rerank` (bge) | PASS | 10 identical scores |
+| `bench-llama-correctness.py` (llama3.1-8b) | PASS | 10 identical responses at temp=0 |
+| `bench-bert-sustained-load.py --duration 1800` (nomic) | PASS | 2227 reqs, 1.24 req/s, p50=2.66s p95=4.80s, RSS 1.03× |
+| `bench-bert-sustained-load.py --duration 1800` (jina) | PASS | 1571 reqs, 0.87 req/s, p50=3.03s p95=11.37s, RSS 1.03× |
+| `bench-llama-sustained-load.py --duration 1800` (chat) | PASS | 157 reqs, 0.09 req/s, p50=29.4s p95=36.0s, RSS 1.00× |
+| Escape-hatch test (`GGML_METAL_DISABLE_STAGING_POOL=1`) | PASS | Process DIED within ~4 min / 212 reqs with family-B SIGABRT — confirms patch is doing the work |
+
+Combined 3955 sustained requests across 90 min wall-clock, zero
+family-B SIGABRTs, zero kernel panics. Throughput speedup vs CPU
+baseline: ~2.5× for nomic embed, ~1.7× for jina code-embed.
+
+The full design lives at `docs/superpowers/specs/2026-05-25-amd-metal-staging-buffer-pool-revival-design.md`.
+
+**Scope note — patches 0003 + 0004 parked.** The originally-planned
+`_fb` BERT fallback kernels (LayerNorm/softmax/matmul) parked to
+`patches/llama.cpp/drafts/.broken` pending a Metal kernel template
+signature fix (`helper_mv_reduce_and_write_fb<NR0=2>` doesn't
+compile). The critical path validated by the bench table above does
+NOT depend on those patches — patch 0001 (gates) + patch 0002 (pool)
++ the env-var routing in `tuning.go` are sufficient. The `_fb`
+fallback kernels remain future optimization work.
 
 ## Honesty about whisper.cpp Metal
 

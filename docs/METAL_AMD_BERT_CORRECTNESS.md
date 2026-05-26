@@ -1,5 +1,40 @@
 # Metal-on-AMD BERT correctness — root-cause analysis + remediation roadmap
 
+> **v0.8.0 correction (2026-05-25):** the root-cause analysis below is
+> partially incorrect. This document was written when BERT
+> non-determinism on AMD-Mac Metal was thought to be a kernel-level
+> reduction race (the wave-width hypothesis: `simd_sum` / `simd_max`
+> hitting AMD's 64-wide waves with code assuming 32-wide simdgroups).
+> Empirical work on 2026-05-25 isolated the actual cause to
+> `MTLDispatchTypeConcurrent` — upstream ggml-metal uses concurrent
+> command-buffer ordering by default, and that ordering is unreliable
+> on non-UMA Macs. The fix is a single env var,
+> `GGML_METAL_CONCURRENCY_DISABLE=1`, shipped in upstream llama.cpp
+> ([issue #19563](https://github.com/ggml-org/llama.cpp/issues/19563))
+> and routed to AMD-discrete slots in v0.8.0 via
+> `SlotTuning.MetalConcurrencyDisable`. See
+> [`docs/superpowers/specs/2026-05-25-amd-metal-staging-buffer-pool-revival-design.md`](superpowers/specs/2026-05-25-amd-metal-staging-buffer-pool-revival-design.md)
+> for the actual v0.8.0 design.
+>
+> The wave-width / `N_SIMDWIDTH=32` issue described below is a real
+> architectural mismatch per Apple MSL Spec §4.4.2 — but it is **not**
+> the cause of the observed embedding non-determinism. The kernel-level
+> wave-width hypothesis (the original 4-patch `_fb` fallback kernel
+> rewrite plan) is retired. Patches 0003 + 0004 (which implemented
+> some of those `_fb` kernels) were parked back to
+> `patches/llama.cpp/drafts/.broken` pending a separate Metal kernel
+> template signature fix; the v0.8.0 critical path (patch 0001 +
+> patch 0002 staging-buffer-pool + the env var) is sufficient without
+> them.
+>
+> Sections below preserved as a historical record of the analytical
+> path that led to the empirical isolation. The original analysis of
+> *what* was broken under sustained load (staging-buffer pool
+> exhaustion) was correct; the analysis of *why embeddings were
+> non-deterministic* was wrong.
+
+---
+
 > Sister document to [`patches/README.md`](../patches/README.md).
 > Captures the 2026-05-17 finding that the patch 0001 `simdgroup_reduction`
 > gate is **necessary but not sufficient** for full correctness on

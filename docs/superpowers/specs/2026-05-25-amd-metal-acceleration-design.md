@@ -1,3 +1,7 @@
+> ⚠️ **SUPERSEDED (2026-05-25)** — This spec is preserved as a historical research artifact. The wave-width hypothesis (`N_SIMDWIDTH=32` vs AMD's 64-wide waves) identified a real architectural mismatch per Apple MSL Spec §4.4.2, but empirical work later that day isolated the operational bug to `MTLDispatchTypeConcurrent` (a separate code path) plus the family-B staging-buffer-pool exhaustion. The v0.8.0 implementation followed [`2026-05-25-amd-metal-staging-buffer-pool-revival-design.md`](2026-05-25-amd-metal-staging-buffer-pool-revival-design.md) instead — a two-layer fix (patch 0002 staging-buffer pool + `GGML_METAL_CONCURRENCY_DISABLE=1` env-var routing in `tuning.go`) that does NOT require the wave-width kernel rewrite proposed below. The prior-art survey, MSL Spec citations, AMD GCN5 architecture documentation, and llama.cpp Metal backend code references in this spec remain useful reference material.
+
+---
+
 # 2026-05-25 — AMD Vega II Metal acceleration: kernel-level repair design
 
 **Status:** approved 2026-05-25 (technical attack + Phase-0-diagnostic skip).
