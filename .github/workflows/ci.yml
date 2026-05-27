@@ -3,13 +3,21 @@ name: ci
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'LICENSE'
 
 # Cancel superseded runs on the same branch (saves CI minutes when several
-# pushes land back-to-back).
+# pushes land back-to-back). Canonical form per global GH Actions cost policy.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -58,6 +66,7 @@ jobs:
   # Test — go test ./... on Linux (CPU-stub paths, no GPU work).
   # ------------------------------------------------------------------
   test-linux:
+    needs: [lint]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -74,6 +83,12 @@ jobs:
   # tags compile clean and the macOS-only paths exercise their stubs.
   # ------------------------------------------------------------------
   test-macos:
+    needs: [lint]
+    # macos runners cost 10× ubuntu — skip on dependabot PRs unless explicitly
+    # labelled `dependabot-full-ci`. Per global GH Actions cost policy (Rule 6).
+    if: >-
+      github.actor != 'dependabot[bot]' ||
+      contains(github.event.pull_request.labels.*.name, 'dependabot-full-ci')
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -90,6 +105,11 @@ jobs:
   # We don't run them, just verify they link.
   # ------------------------------------------------------------------
   build-matrix:
+    needs: [lint]
+    # macos build matrix — gate on dependabot per Rule 6.
+    if: >-
+      github.actor != 'dependabot[bot]' ||
+      contains(github.event.pull_request.labels.*.name, 'dependabot-full-ci')
     runs-on: macos-latest
     strategy:
       fail-fast: false
@@ -133,6 +153,14 @@ jobs:
   # hard gate against this same test path.
   # ------------------------------------------------------------------
   amd-gpu-integration:
+    needs: [lint]
+    # Fork PRs MUST NOT trigger self-hosted runs (Rule 8). Also skip on
+    # dependabot PRs unless `dependabot-full-ci` labelled (Rule 6).
+    if: >-
+      (github.event_name != 'pull_request' ||
+        github.event.pull_request.head.repo.full_name == github.repository) &&
+      (github.actor != 'dependabot[bot]' ||
+        contains(github.event.pull_request.labels.*.name, 'dependabot-full-ci'))
     runs-on: [self-hosted, amd-gpu]
     continue-on-error: true
     timeout-minutes: 15
