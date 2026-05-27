@@ -27,6 +27,15 @@ on:
         type: boolean
         default: true
 
+# Artifact-publishing workflow: DO NOT cancel in-progress runs (Rule 1
+# exception in the global GH Actions cost policy). Cancelling mid-publish
+# could leave the GitHub release / Homebrew tap with partial / corrupt
+# tarballs. Group still scopes per-ref so two concurrent tag pushes don't
+# stomp each other's keychain setup.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
   packages: write

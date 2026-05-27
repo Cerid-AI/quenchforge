@@ -7,8 +7,18 @@ name: rebase-upstream
 
 on:
   schedule:
-    - cron: '0 8 * * 1' # Monday 08:00 UTC
+    # why: weekly cadence is enough — upstream llama.cpp master moves quickly
+    # but daily rebase PRs would drown the maintainer in review noise. Monday
+    # 08:00 UTC lands the PR before US-morning review block.
+    - cron: '0 8 * * 1'
   workflow_dispatch:
+
+# Long-running rebase + PR open job. Cancel superseded scheduled+manual runs
+# on the same ref so back-to-back dispatches don't both burn macos-latest
+# minutes (Rule 1, global GH Actions cost policy).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: write
