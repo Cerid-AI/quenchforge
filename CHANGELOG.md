@@ -8,6 +8,52 @@ patch bumps fix bugs or polish without behaviour change.
 
 ---
 
+## v0.8.0 — AMD-discrete GPU mode + VRAM-tier-adaptive sizing (2026-05-31)
+
+Promotes the `v0.8.0-rc2` AMD-discrete GPU-mode revival (below) to a
+final release and adds **VRAM-tier-adaptive slot sizing** so the full
+range of Intel-Mac AMD GPUs — not just the 32 GB Vega II — runs
+out-of-the-box without operator hand-tuning.
+
+### VRAM-tier-adaptive sizing
+
+Prior to this release every AMD-discrete profile inherited the Vega II
+bench constants (`--ctx-size 8192`, embed `--ubatch-size 1024`)
+regardless of card. On a smaller card (8 GB RX 5700, 4 GB MacBook Pro
+dGPU) those defaults could oversubscribe VRAM, forcing the operator to
+discover and set `QUENCHFORGE_MAX_CONTEXT` / `QUENCHFORGE_EMBED_UBATCH_SIZE`
+by hand. `internal/tuning/tuning.go::amdSizing` now derives both from the
+detected headline VRAM (`hardware.Info.GPUVRAMGB`, threaded into
+`KernelParams`):
+
+| VRAM | `--ctx-size` cap | embed `--ubatch-size` | example cards |
+|---|---|---|---|
+| ≥ 12 GB | none (keeps `MaxContext`) | 1024 | Vega II/Duo, W6800X, W6900X, Vega 56/64, 5600M |
+| 7–11 GB | 4096 | 512 | RX 5700 / 5700 XT, W5700X |
+| ≤ 6 GB | 2048 | 256 | 4 GB MacBook Pro dGPUs (5300M/5500M), Polaris 560X |
+
+Design guarantees:
+
+- **Zero regression on the validated path.** The ≥ 12 GB tier (and any
+  VRAM probe that returns 0/unknown) keeps the exact Vega-II-benched
+  values, so the canonical Mac Pro config is byte-for-byte unchanged.
+- **Caps only ever lower.** `buildSlotArgs` applies the context ceiling
+  as `min(cfg.MaxContext, cap)`, so an operator who raised
+  `QUENCHFORGE_MAX_CONTEXT` on a big card is never clamped.
+- **Operator overrides still win.** An explicit
+  `QUENCHFORGE_EMBED_UBATCH_SIZE` beats the tier ubatch; the context cap
+  is an independent safety knob.
+- The fix is family-agnostic: unlisted/future AMD cards fall through
+  `classifyProfile` to `vega-pro` and are sized by VRAM like any other.
+
+New coverage: `TestAmdSizing_Tiers`, `TestKernelParams_EmbedLowVRAMScalesDown`,
+`TestKernelParams_ContextCapAppliesToAllAMDSlots`,
+`TestKernelParams_HighVRAMAndNonAMDHaveNoContextCap`,
+`TestKernelParams_UbatchOverrideBeatsTierButCapStands`, and
+`TestBuildSlotArgs_LowVRAMAMDCapsContextAndUbatch`.
+
+---
+
 ## v0.8.0-rc2 — AMD-discrete GPU mode revival (2026-05-25)
 
 The Mac Pro 7,1 + Radeon Pro Vega II 32 GB configuration now runs all

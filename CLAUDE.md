@@ -145,18 +145,24 @@ that copy require a maintainer review.
 2. **Embed/rerank slots have their own AMD safety surface — section 3.**
    The family-B graph-compute buffer-corruption crash hits embed/rerank
    under sustained batch load (eval suites, bulk KB ingest, sustained
-   MCP retrieval). Operators on AMD discrete running those workloads
-   should set:
+   MCP retrieval). As of **v0.8.0 the embed ubatch + context ceiling are
+   VRAM-tier-adaptive** (`internal/tuning/tuning.go::amdSizing`): the
+   detected `GPUVRAMGB` picks 1024/none (≥ 12 GB), 512/4096 (8 GB), or
+   256/2048 (4 GB) automatically, so small cards no longer need
+   hand-tuning. Operators only set the env vars below to *override* the
+   tier (force a value, or apply the same safety knobs on a profile the
+   detector classified as non-AMD):
 
    ```
-   QUENCHFORGE_EMBED_UBATCH_SIZE=1024   # or smaller — caps Metal staging-buffer pressure
+   QUENCHFORGE_EMBED_UBATCH_SIZE=1024   # override tier ubatch — caps Metal staging-buffer pressure
    QUENCHFORGE_EMBED_METAL_N_CB=1       # serialise command-buffer submission
    QUENCHFORGE_AUTO_BACKOFF=true        # auto-503 before SIGABRT
    ```
 
-   Defaults preserve historical behaviour. `quenchforge-bench
-   sustained-embed` is the empirical tuning tool; the follow-up PR
-   will land bench-driven Vega-II defaults.
+   The ≥ 12 GB tier keeps the bench-validated Vega II values verbatim;
+   a VRAM probe miss (0/unknown) is treated as high tier so detection
+   failures never throttle the validated path. `quenchforge-bench
+   sustained-embed` remains the empirical tuning tool for new families.
 
 3. **`internal/tuning/` is the sole owner of per-(profile, kind) slot
    tuning.** `cmd/quenchforge/main.go::buildSlotArgs` and `slotEnv`

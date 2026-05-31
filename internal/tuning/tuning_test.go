@@ -36,6 +36,12 @@ var amdProfiles = []hardware.Profile{
 	hardware.ProfileRDNA2,
 }
 
+// vramHigh is a >= 12 GB headline VRAM (e.g. Vega II's 32 GB). At this
+// tier amdSizing imposes no context cap and keeps ubatch 1024, so the
+// pre-v0.8.0 assertions below remain valid verbatim. Low-VRAM behaviour
+// has its own dedicated tests.
+const vramHigh = 32
+
 func TestProfileIsAMDDiscrete_MatchesHardwarePackage(t *testing.T) {
 	// Cross-check our inline AMD predicate against hardware.Info's
 	// IsAMDDiscrete. If hardware adds or removes a profile from the
@@ -55,7 +61,7 @@ func TestKernelParams_ChatAMDGetsGPUWithConcurrencyDisable(t *testing.T) {
 	cfg := config.Config{MaxContext: 8192}
 	for _, p := range amdProfiles {
 		t.Run(string(p), func(t *testing.T) {
-			tn := KernelParams(p, gateway.KindChat, cfg)
+			tn := KernelParams(p, vramHigh, gateway.KindChat, cfg)
 			wantExtra := []string{
 				"--flash-attn", "off",
 				"--cache-ram", "0",
@@ -94,7 +100,7 @@ func TestKernelParams_ChatNonAMDIsEmpty(t *testing.T) {
 			continue
 		}
 		t.Run(string(p), func(t *testing.T) {
-			tn := KernelParams(p, gateway.KindChat, cfg)
+			tn := KernelParams(p, vramHigh, gateway.KindChat, cfg)
 			if !slices.Equal(tn.ExtraArgs, nil) && len(tn.ExtraArgs) != 0 {
 				t.Errorf("chat %s should emit no ExtraArgs, got %v",
 					p, tn.ExtraArgs)
@@ -115,7 +121,7 @@ func TestKernelParams_EmbedDefaultsByProfile(t *testing.T) {
 	for _, p := range allProfiles {
 		for _, k := range []gateway.SlotKind{gateway.KindEmbed, gateway.KindCodeEmbed} {
 			t.Run(string(p)+"/"+string(k), func(t *testing.T) {
-				tn := KernelParams(p, k, cfg)
+				tn := KernelParams(p, vramHigh, k, cfg)
 				wantUbatch := 8192
 				wantNCB := 0
 				if profileIsAMDDiscrete(p) {
@@ -148,7 +154,7 @@ func TestKernelParams_EmbedAMDGetsGPUWithConcurrencyDisable(t *testing.T) {
 	for _, p := range allProfiles {
 		for _, k := range []gateway.SlotKind{gateway.KindEmbed, gateway.KindCodeEmbed} {
 			t.Run(string(p)+"/"+string(k), func(t *testing.T) {
-				tn := KernelParams(p, k, cfg)
+				tn := KernelParams(p, vramHigh, k, cfg)
 				hasGPUFlag := containsSubslice(tn.ExtraArgs, []string{"--gpu-layers", "999"})
 				if profileIsAMDDiscrete(p) {
 					if !hasGPUFlag {
@@ -181,7 +187,7 @@ func TestKernelParams_EmbedAMDMultithreading(t *testing.T) {
 	for _, p := range allProfiles {
 		for _, k := range []gateway.SlotKind{gateway.KindEmbed, gateway.KindCodeEmbed, gateway.KindRerank} {
 			t.Run(string(p)+"/"+string(k), func(t *testing.T) {
-				tn := KernelParams(p, k, cfg)
+				tn := KernelParams(p, vramHigh, k, cfg)
 				hasThreads := containsArgPair(tn.ExtraArgs, "--threads", "15")
 				hasParallel := containsArgPair(tn.ExtraArgs, "--parallel", "4")
 				if profileIsAMDDiscrete(p) {
@@ -244,7 +250,7 @@ func TestKernelParams_RerankAMDGetsGPUWithConcurrencyDisable(t *testing.T) {
 	cfg := config.Config{MaxContext: 8192}
 	for _, p := range allProfiles {
 		t.Run(string(p), func(t *testing.T) {
-			tn := KernelParams(p, gateway.KindRerank, cfg)
+			tn := KernelParams(p, vramHigh, gateway.KindRerank, cfg)
 			hasGPUFlag := containsSubslice(tn.ExtraArgs, []string{"--gpu-layers", "999"})
 			if profileIsAMDDiscrete(p) {
 				if !hasGPUFlag {
@@ -273,7 +279,7 @@ func TestKernelParams_RerankAMDGetsMetalNCBDefault(t *testing.T) {
 	cfg := config.Config{MaxContext: 8192}
 	for _, p := range allProfiles {
 		t.Run(string(p), func(t *testing.T) {
-			tn := KernelParams(p, gateway.KindRerank, cfg)
+			tn := KernelParams(p, vramHigh, gateway.KindRerank, cfg)
 			wantNCB := 0
 			if profileIsAMDDiscrete(p) {
 				wantNCB = amdEmbedMetalNCBDefault
@@ -289,7 +295,7 @@ func TestKernelParams_RerankAMDGetsMetalNCBDefault(t *testing.T) {
 func TestKernelParams_EmbedHonoursUbatchOverride(t *testing.T) {
 	// Operator-set QUENCHFORGE_EMBED_UBATCH_SIZE wins.
 	cfg := config.Config{MaxContext: 8192, EmbedUbatchSize: 1024}
-	tn := KernelParams(hardware.ProfileVegaPro, gateway.KindEmbed, cfg)
+	tn := KernelParams(hardware.ProfileVegaPro, vramHigh, gateway.KindEmbed, cfg)
 	if tn.UbatchSize != 1024 {
 		t.Errorf("UbatchSize = %d, want 1024 (env override)", tn.UbatchSize)
 	}
@@ -300,7 +306,7 @@ func TestKernelParams_EmbedHonoursUbatchOverride(t *testing.T) {
 
 func TestKernelParams_EmbedHonoursMetalNCBOverride(t *testing.T) {
 	cfg := config.Config{MaxContext: 8192, EmbedMetalNCB: 1}
-	tn := KernelParams(hardware.ProfileVegaPro, gateway.KindEmbed, cfg)
+	tn := KernelParams(hardware.ProfileVegaPro, vramHigh, gateway.KindEmbed, cfg)
 	if tn.MetalNCB != 1 {
 		t.Errorf("MetalNCB = %d, want 1 (env override)", tn.MetalNCB)
 	}
@@ -311,7 +317,7 @@ func TestKernelParams_EmbedAMDGetsAutoRespawn(t *testing.T) {
 	for _, p := range amdProfiles {
 		for _, k := range []gateway.SlotKind{gateway.KindEmbed, gateway.KindCodeEmbed} {
 			t.Run(string(p)+"/"+string(k), func(t *testing.T) {
-				tn := KernelParams(p, k, cfg)
+				tn := KernelParams(p, vramHigh, k, cfg)
 				if !tn.AutoRespawn {
 					t.Errorf("%s %s should request AutoRespawn on AMD", p, k)
 				}
@@ -329,7 +335,7 @@ func TestKernelParams_EmbedNonAMDNoAutoRespawn(t *testing.T) {
 			continue
 		}
 		t.Run(string(p), func(t *testing.T) {
-			tn := KernelParams(p, gateway.KindEmbed, cfg)
+			tn := KernelParams(p, vramHigh, gateway.KindEmbed, cfg)
 			if tn.AutoRespawn {
 				t.Errorf("%s should NOT request AutoRespawn", p)
 			}
@@ -344,7 +350,7 @@ func TestKernelParams_RerankNoBatchOverrideByDefault(t *testing.T) {
 	cfg := config.Config{MaxContext: 8192}
 	for _, p := range allProfiles {
 		t.Run(string(p), func(t *testing.T) {
-			tn := KernelParams(p, gateway.KindRerank, cfg)
+			tn := KernelParams(p, vramHigh, gateway.KindRerank, cfg)
 			if tn.BatchSize != 0 {
 				t.Errorf("%s rerank BatchSize = %d, want 0 (no override)",
 					p, tn.BatchSize)
@@ -355,7 +361,7 @@ func TestKernelParams_RerankNoBatchOverrideByDefault(t *testing.T) {
 
 func TestKernelParams_RerankHonoursBatchOverride(t *testing.T) {
 	cfg := config.Config{MaxContext: 8192, RerankBatchSize: 2048}
-	tn := KernelParams(hardware.ProfileVegaPro, gateway.KindRerank, cfg)
+	tn := KernelParams(hardware.ProfileVegaPro, vramHigh, gateway.KindRerank, cfg)
 	if tn.BatchSize != 2048 {
 		t.Errorf("BatchSize = %d, want 2048", tn.BatchSize)
 	}
@@ -368,11 +374,114 @@ func TestKernelParams_RerankAMDGetsAutoRespawn(t *testing.T) {
 	cfg := config.Config{MaxContext: 8192}
 	for _, p := range amdProfiles {
 		t.Run(string(p), func(t *testing.T) {
-			tn := KernelParams(p, gateway.KindRerank, cfg)
+			tn := KernelParams(p, vramHigh, gateway.KindRerank, cfg)
 			if !tn.AutoRespawn {
 				t.Errorf("%s rerank should request AutoRespawn on AMD", p)
 			}
 		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// VRAM-tier-adaptive sizing (v0.8.0)
+// ---------------------------------------------------------------------------
+
+func TestAmdSizing_Tiers(t *testing.T) {
+	// Whitebox: the (contextCap, ubatch) curve over VRAM. <=0 and >=12
+	// are the high tier (no cap, validated 1024) so a probe miss or a
+	// big card never throttles. 8 GB scales to 4096/512; 4 GB to 2048/256.
+	cases := []struct {
+		vram       int
+		wantCtx    int
+		wantUbatch int
+	}{
+		{vram: 0, wantCtx: 0, wantUbatch: amdEmbedUbatchDefault},  // probe miss -> high
+		{vram: -1, wantCtx: 0, wantUbatch: amdEmbedUbatchDefault}, // negative -> high
+		{vram: 32, wantCtx: 0, wantUbatch: amdEmbedUbatchDefault}, // Vega II
+		{vram: 16, wantCtx: 0, wantUbatch: amdEmbedUbatchDefault}, // W6800X-class
+		{vram: 12, wantCtx: 0, wantUbatch: amdEmbedUbatchDefault}, // tier boundary (incl)
+		{vram: 11, wantCtx: 4096, wantUbatch: 512},                // just below high
+		{vram: 8, wantCtx: 4096, wantUbatch: 512},                 // RX 5700
+		{vram: 7, wantCtx: 4096, wantUbatch: 512},                 // low boundary (incl)
+		{vram: 6, wantCtx: 2048, wantUbatch: 256},                 // tiny boundary
+		{vram: 4, wantCtx: 2048, wantUbatch: 256},                 // 4 GB MBP dGPU
+	}
+	for _, c := range cases {
+		ctx, ub := amdSizing(c.vram)
+		if ctx != c.wantCtx || ub != c.wantUbatch {
+			t.Errorf("amdSizing(%d) = (ctx %d, ubatch %d), want (ctx %d, ubatch %d)",
+				c.vram, ctx, ub, c.wantCtx, c.wantUbatch)
+		}
+	}
+}
+
+func TestKernelParams_EmbedLowVRAMScalesDown(t *testing.T) {
+	// An 8 GB AMD card must get the reduced embed ubatch (512) and a
+	// context ceiling (4096) without any operator env var.
+	cfg := config.Config{MaxContext: 8192}
+	for _, p := range amdProfiles {
+		for _, k := range []gateway.SlotKind{gateway.KindEmbed, gateway.KindCodeEmbed} {
+			t.Run(string(p)+"/"+string(k), func(t *testing.T) {
+				tn := KernelParams(p, 8, k, cfg)
+				if tn.UbatchSize != 512 || tn.BatchSize != 512 {
+					t.Errorf("%s %s ubatch/batch = %d/%d, want 512/512",
+						p, k, tn.UbatchSize, tn.BatchSize)
+				}
+				if tn.ContextSize != 4096 {
+					t.Errorf("%s %s ContextSize = %d, want 4096", p, k, tn.ContextSize)
+				}
+			})
+		}
+	}
+}
+
+func TestKernelParams_ContextCapAppliesToAllAMDSlots(t *testing.T) {
+	// A 4 GB card caps context to 2048 on every AMD slot kind (chat,
+	// embed, code-embed, rerank) — the KV cache is the dominant VRAM
+	// consumer and must shrink uniformly.
+	cfg := config.Config{MaxContext: 8192}
+	for _, k := range []gateway.SlotKind{
+		gateway.KindChat, gateway.KindEmbed, gateway.KindCodeEmbed, gateway.KindRerank,
+	} {
+		t.Run(string(k), func(t *testing.T) {
+			tn := KernelParams(hardware.ProfileVegaPro, 4, k, cfg)
+			if tn.ContextSize != 2048 {
+				t.Errorf("%s ContextSize = %d, want 2048", k, tn.ContextSize)
+			}
+		})
+	}
+}
+
+func TestKernelParams_HighVRAMAndNonAMDHaveNoContextCap(t *testing.T) {
+	// >= 12 GB AMD and every non-AMD profile must leave ContextSize 0 so
+	// buildSlotArgs keeps cfg.MaxContext verbatim (zero regression).
+	cfg := config.Config{MaxContext: 8192}
+	for _, p := range allProfiles {
+		for _, k := range []gateway.SlotKind{
+			gateway.KindChat, gateway.KindEmbed, gateway.KindRerank,
+		} {
+			t.Run(string(p)+"/"+string(k), func(t *testing.T) {
+				tn := KernelParams(p, vramHigh, k, cfg)
+				if tn.ContextSize != 0 {
+					t.Errorf("%s %s ContextSize = %d, want 0 (no cap)",
+						p, k, tn.ContextSize)
+				}
+			})
+		}
+	}
+}
+
+func TestKernelParams_UbatchOverrideBeatsTierButCapStands(t *testing.T) {
+	// An explicit QUENCHFORGE_EMBED_UBATCH_SIZE wins over the tier ubatch,
+	// but the VRAM context cap is independent and still applies — the two
+	// knobs protect different resources.
+	cfg := config.Config{MaxContext: 8192, EmbedUbatchSize: 2048}
+	tn := KernelParams(hardware.ProfileVegaPro, 4, gateway.KindEmbed, cfg)
+	if tn.UbatchSize != 2048 {
+		t.Errorf("UbatchSize = %d, want 2048 (operator override wins)", tn.UbatchSize)
+	}
+	if tn.ContextSize != 2048 {
+		t.Errorf("ContextSize = %d, want 2048 (cap independent of ubatch override)", tn.ContextSize)
 	}
 }
 
@@ -383,7 +492,7 @@ func TestKernelParams_UnknownKindsAreEmpty(t *testing.T) {
 	cfg := config.Config{MaxContext: 8192}
 	for _, k := range []gateway.SlotKind{gateway.KindWhisper, gateway.KindImageGen} {
 		t.Run(string(k), func(t *testing.T) {
-			tn := KernelParams(hardware.ProfileVegaPro, k, cfg)
+			tn := KernelParams(hardware.ProfileVegaPro, vramHigh, k, cfg)
 			if tn.UbatchSize != 0 || tn.BatchSize != 0 || tn.MetalNCB != 0 ||
 				len(tn.ExtraArgs) != 0 || tn.AutoRespawn {
 				t.Errorf("%s should emit empty SlotTuning, got %+v", k, tn)

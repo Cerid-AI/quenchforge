@@ -908,15 +908,23 @@ type slotSpec struct {
 // only for the base arg shape plus the layering of the tuning result.
 // Move the per-profile decisions there when they change, not here.
 func buildSlotArgs(cfg config.Config, hwInfo hardware.Info, spec slotSpec, modelPath string) []string {
+	tn := tuning.KernelParams(hwInfo.Profile, hwInfo.GPUVRAMGB, spec.Kind, cfg)
+
+	// VRAM-tier-adaptive context ceiling: ContextSize only ever lowers
+	// cfg.MaxContext (small AMD cards), never raises it.
+	ctxSize := cfg.MaxContext
+	if tn.ContextSize > 0 && tn.ContextSize < ctxSize {
+		ctxSize = tn.ContextSize
+	}
+
 	args := []string{
 		"--model", modelPath,
 		"--host", "127.0.0.1",
 		"--port", fmt.Sprintf("%d", spec.Port),
-		"--ctx-size", fmt.Sprintf("%d", cfg.MaxContext),
+		"--ctx-size", fmt.Sprintf("%d", ctxSize),
 	}
 	args = append(args, spec.ExtraArgs...)
 
-	tn := tuning.KernelParams(hwInfo.Profile, spec.Kind, cfg)
 	if tn.BatchSize > 0 {
 		args = append(args, "--batch-size", fmt.Sprintf("%d", tn.BatchSize))
 	}
@@ -936,7 +944,7 @@ func buildSlotArgs(cfg config.Config, hwInfo hardware.Info, spec slotSpec, model
 // on AMD discrete).
 func slotEnv(cfg config.Config, hwInfo hardware.Info, kind gateway.SlotKind) []string {
 	ncb := cfg.MetalNCB
-	tn := tuning.KernelParams(hwInfo.Profile, kind, cfg)
+	tn := tuning.KernelParams(hwInfo.Profile, hwInfo.GPUVRAMGB, kind, cfg)
 	if tn.MetalNCB > 0 {
 		ncb = tn.MetalNCB
 	}
@@ -1022,7 +1030,7 @@ func startSlot(ctx context.Context, cfg config.Config, hwInfo hardware.Info, spe
 	// graph-compute buffer-corruption crash is non-deterministic and the
 	// slot stays dead after SIGABRT until manual restart. Tuning module
 	// owns the decision; we just translate AutoRespawn → RestartPolicy.
-	tn := tuning.KernelParams(hwInfo.Profile, spec.Kind, cfg)
+	tn := tuning.KernelParams(hwInfo.Profile, hwInfo.GPUVRAMGB, spec.Kind, cfg)
 	if tn.AutoRespawn {
 		slot.RestartPolicy = supervisor.PolicyExpBackoff
 	}

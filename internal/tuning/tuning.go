@@ -16,9 +16,11 @@
 // kind on this hardware profile want", with table-driven tests.
 //
 // The function is intentionally pure (no I/O, no globals): it consumes
-// a profile, a slot kind, and a config snapshot, and returns a
-// `SlotTuning` describing the additional llama-server flags and env
-// vars the supervisor should layer on top of the base argv.
+// a profile, the detected GPU VRAM (GB), a slot kind, and a config
+// snapshot, and returns a `SlotTuning` describing the additional
+// llama-server flags and env vars the supervisor should layer on top of
+// the base argv. VRAM drives the adaptive context/ubatch sizing (see
+// amdSizing) so smaller AMD cards fit without operator hand-tuning.
 //
 // Honors operator overrides: env-driven config fields (cfg.EmbedUbatchSize,
 // cfg.EmbedMetalNCB, cfg.RerankBatchSize, cfg.RerankMetalNCB) win over
@@ -93,6 +95,14 @@ type SlotTuning struct {
 	// models and chat-decode races. See llama.cpp issue #19563 and patch 0002.
 	// Apple Silicon (UMA) does not need this; the concurrent path is correct there.
 	MetalConcurrencyDisable bool
+
+	// ContextSize, when non-zero, is a VRAM-tier-derived ceiling on the
+	// slot's --ctx-size. buildSlotArgs applies it as min(cfg.MaxContext,
+	// ContextSize), so it only ever LOWERS the configured context: small
+	// AMD cards (<= 11 GB) get a KV cache that fits without manual tuning,
+	// while >= 12 GB cards and non-AMD profiles leave this 0 (no cap) and
+	// keep cfg.MaxContext verbatim. See amdSizing.
+	ContextSize int
 }
 
 // KernelParams returns the tuning the supervisor should apply for the
@@ -108,14 +118,14 @@ type SlotTuning struct {
 // `~/Develop/quenchforge/llama.cpp/ggml/src/ggml-metal/ggml-metal-device.m:1665-1717`
 // — the `buf->is_shared` fast path uses plain `memcpy`). Adding flags
 // on those profiles would regress throughput without any safety win.
-func KernelParams(profile hardware.Profile, kind gateway.SlotKind, cfg config.Config) SlotTuning {
+func KernelParams(profile hardware.Profile, vramGB int, kind gateway.SlotKind, cfg config.Config) SlotTuning {
 	switch kind {
 	case gateway.KindChat:
-		return chatParams(profile)
+		return chatParams(profile, vramGB)
 	case gateway.KindEmbed, gateway.KindCodeEmbed:
-		return embedParams(profile, cfg)
+		return embedParams(profile, vramGB, cfg)
 	case gateway.KindRerank:
-		return rerankParams(profile, cfg)
+		return rerankParams(profile, vramGB, cfg)
 	}
 	// Whisper / imagegen and any future kinds fall through unchanged.
 	return SlotTuning{}
@@ -129,10 +139,11 @@ func KernelParams(profile hardware.Profile, kind gateway.SlotKind, cfg config.Co
 // theory that chat is naturally bursty; cerid eval workloads broke
 // that assumption (chat.log entry at 2026-05-16T23:14 — task 143
 // hit GGML_ASSERT at `set_tensor` after ~30 successful chat calls).
-func chatParams(profile hardware.Profile) SlotTuning {
+func chatParams(profile hardware.Profile, vramGB int) SlotTuning {
 	if !profileIsAMDDiscrete(profile) {
 		return SlotTuning{}
 	}
+	ctxCap, _ := amdSizing(vramGB)
 	// AMD-discrete chat slot runs on GPU as of v0.8.0. The MTLDispatchTypeConcurrent
 	// race that produced cross-call non-determinism is disabled via
 	// MetalConcurrencyDisable -> GGML_METAL_CONCURRENCY_DISABLE=1. The family-B
@@ -150,6 +161,7 @@ func chatParams(profile hardware.Profile) SlotTuning {
 			"--no-cache-prompt",
 			"--gpu-layers", "999",
 		},
+		ContextSize:             ctxCap,
 		MetalConcurrencyDisable: true,
 		AutoRespawn:             true,
 	}
@@ -174,23 +186,28 @@ func chatParams(profile hardware.Profile) SlotTuning {
 //   - AMD discrete profiles additionally enable AutoRespawn — the
 //     supervisor brings the slot back on a Metal SIGABRT instead of
 //     leaving it dead until manual restart.
-func embedParams(profile hardware.Profile, cfg config.Config) SlotTuning {
+func embedParams(profile hardware.Profile, vramGB int, cfg config.Config) SlotTuning {
 	ubatch := cfg.MaxContext
 	metalNCB := cfg.MetalNCB
+	ctxCap := 0
 	if profileIsAMDDiscrete(profile) {
-		// AMD-discrete on GPU (v0.8.0) needs the 1024 ubatch cap re-enabled —
+		// AMD-discrete on GPU (v0.8.0) needs the ubatch cap re-enabled —
 		// it bounds per-call Metal staging-buffer pressure even with patch 0002's
-		// pool in place. CLAUDE.md operational gotcha #2 documents this knob.
-		ubatch = amdEmbedUbatchDefault
+		// pool in place. As of v0.8.0 the cap is VRAM-tier-adaptive (1024 on
+		// >= 12 GB cards, 512 on 8 GB, 256 on 4 GB) so smaller cards don't OOM
+		// without an operator setting QUENCHFORGE_EMBED_UBATCH_SIZE by hand.
+		// CLAUDE.md operational gotcha #2 documents this knob.
+		ctxCap, ubatch = amdSizing(vramGB)
 		metalNCB = amdEmbedMetalNCBDefault
 	}
 	if cfg.EmbedUbatchSize > 0 {
 		ubatch = cfg.EmbedUbatchSize
 	}
 	t := SlotTuning{
-		UbatchSize: ubatch,
-		BatchSize:  ubatch,
-		MetalNCB:   metalNCB,
+		UbatchSize:  ubatch,
+		BatchSize:   ubatch,
+		MetalNCB:    metalNCB,
+		ContextSize: ctxCap,
 	}
 	if cfg.EmbedMetalNCB > 0 {
 		t.MetalNCB = cfg.EmbedMetalNCB
@@ -224,13 +241,15 @@ func embedParams(profile hardware.Profile, cfg config.Config) SlotTuning {
 //
 // AutoRespawn fires on AMD discrete same as embed. AMD profiles also
 // get the conservative MetalNCB=1 default same as embed.
-func rerankParams(profile hardware.Profile, cfg config.Config) SlotTuning {
+func rerankParams(profile hardware.Profile, vramGB int, cfg config.Config) SlotTuning {
 	t := SlotTuning{}
 	if cfg.RerankBatchSize > 0 {
 		t.BatchSize = cfg.RerankBatchSize
 		t.UbatchSize = cfg.RerankBatchSize
 	}
 	if profileIsAMDDiscrete(profile) {
+		ctxCap, _ := amdSizing(vramGB)
+		t.ContextSize = ctxCap
 		t.MetalNCB = amdEmbedMetalNCBDefault
 	}
 	if cfg.RerankMetalNCB > 0 {
@@ -249,6 +268,36 @@ func rerankParams(profile hardware.Profile, cfg config.Config) SlotTuning {
 		)
 	}
 	return t
+}
+
+// amdSizing returns the VRAM-tier-adaptive context ceiling and embed
+// ubatch for an AMD-discrete profile. A contextCap of 0 means "no cap —
+// honour cfg.MaxContext as-is".
+//
+// The high tier (>= 12 GB: Vega II/Duo, W6800X, W6900X, Vega 56/64,
+// 5600M) keeps the Vega-II-validated values: no context cap, ubatch
+// 1024. Smaller cards scale both down so the KV cache + Metal staging
+// buffers fit without an operator hand-tuning QUENCHFORGE_MAX_CONTEXT /
+// QUENCHFORGE_EMBED_UBATCH_SIZE:
+//
+//	VRAM        context cap   embed ubatch   example cards
+//	>= 12 GB    none (0)      1024           Vega II/Duo, W6800X, W6900X, Vega 56/64, 5600M
+//	7-11 GB     4096          512            RX 5700 / 5700 XT, W5700X
+//	<= 6 GB     2048          256            4 GB MacBook Pro dGPUs (5300M/5500M), Polaris 560X
+//
+// vramGB <= 0 means detection could not read VRAM; treat it as the high
+// tier so a probe miss never throttles the validated Vega II path. The
+// caps only ever LOWER cfg.MaxContext (buildSlotArgs takes the min), so a
+// high-VRAM operator who raised QUENCHFORGE_MAX_CONTEXT is unaffected.
+func amdSizing(vramGB int) (contextCap, ubatch int) {
+	switch {
+	case vramGB <= 0 || vramGB >= 12:
+		return 0, amdEmbedUbatchDefault
+	case vramGB >= 7:
+		return 4096, 512
+	default:
+		return 2048, 256
+	}
 }
 
 // profileIsAMDDiscrete inlines hardware.Info.IsAMDDiscrete logic
