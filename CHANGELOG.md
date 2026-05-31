@@ -8,6 +8,29 @@ patch bumps fix bugs or polish without behaviour change.
 
 ---
 
+## Unreleased
+
+### Prestart port guard (LaunchAgent)
+
+`quenchforge install` now also writes a prestart guard to
+`~/.config/quenchforge/prestart-guard.sh` and points the generated plist's
+`ProgramArguments[0]` at it. Before exec'ing `quenchforge serve` the guard
+boots out Ollama's launchd job and evicts any non-quenchforge listener on
+port 11434, so quenchforge authoritatively reclaims the canonical
+Ollama-API port on every (re)start and at login.
+
+Fixes the recurring contention where Ollama.app's auto-launched
+`ollama serve` grabbed 11434 during a quenchforge restart window: because
+the pre-bind check yields (exits 0) on a held port and
+`KeepAlive.SuccessfulExit=false` then leaves the job dead, the squatter
+would win and quenchforge stayed down until hand-evicted. The guard
+removes the manual step. It only kills the actual squatter (never a
+running quenchforge / `llama-server`) and is a no-op when Ollama isn't
+present. Source: `cmd/quenchforge/prestart-guard.sh`; covered by
+`TestInstall_WritesPlistAndPrestartGuard`.
+
+---
+
 ## v0.8.0 — AMD-discrete GPU mode + VRAM-tier-adaptive sizing (2026-05-31)
 
 Promotes the `v0.8.0-rc2` AMD-discrete GPU-mode revival (below) to a

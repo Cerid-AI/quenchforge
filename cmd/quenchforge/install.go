@@ -22,7 +22,15 @@ import (
 //go:embed plist_template.plist
 var plistTemplate []byte
 
+//go:embed prestart-guard.sh
+var prestartGuard []byte
+
 const plistFilename = "com.cerid.quenchforge.plist"
+
+// prestartGuardRelPath is where the guard is written under the operator's
+// HOME. The generated plist's ProgramArguments[0] points here (via the
+// REPLACE_ME → $USER substitution), so the two must stay in sync.
+var prestartGuardRelPath = filepath.Join(".config", "quenchforge", "prestart-guard.sh")
 
 func cmdInstall(args []string, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("install", flag.ContinueOnError)
@@ -91,7 +99,20 @@ func cmdInstall(args []string, stdout, stderr io.Writer) error {
 		return fmt.Errorf("install: write %s: %w", targetPath, err)
 	}
 
+	// Write the prestart guard the plist's ProgramArguments[0] points at.
+	// It reclaims port 11434 from a squatter (e.g. Ollama) before exec'ing
+	// `quenchforge serve`. Executable; lives under the operator's HOME so
+	// the REPLACE_ME → $USER substitution in the plist resolves to it.
+	guardPath := filepath.Join(home, prestartGuardRelPath)
+	if err := os.MkdirAll(filepath.Dir(guardPath), 0o755); err != nil {
+		return fmt.Errorf("install: mkdir %s: %w", filepath.Dir(guardPath), err)
+	}
+	if err := os.WriteFile(guardPath, prestartGuard, 0o755); err != nil {
+		return fmt.Errorf("install: write prestart guard %s: %w", guardPath, err)
+	}
+
 	fmt.Fprintf(stdout, "Installed LaunchAgent at %s (%d bytes)\n", targetPath, len(data))
+	fmt.Fprintf(stdout, "Installed prestart port guard at %s\n", guardPath)
 	if !*skipUserSub {
 		fmt.Fprintf(stdout, "  Substituted REPLACE_ME → %s\n", os.Getenv("USER"))
 	}
