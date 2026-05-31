@@ -36,9 +36,19 @@
     <key>Label</key>
     <string>com.cerid.quenchforge</string>
 
+    <!--
+      ProgramArguments[0] is the prestart guard, not quenchforge directly.
+      The guard reclaims port 11434 from a squatter (typically Ollama.app's
+      auto-launched `ollama serve`) before exec'ing `quenchforge serve`, so
+      quenchforge stays authoritative on the canonical Ollama-API port
+      across restarts and logins without the operator hand-evicting Ollama.
+      `quenchforge install` writes the guard to ~/.config/quenchforge/.
+      Operators who intentionally run Ollama can replace these two lines
+      with the bare binary path + `serve`.
+    -->
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/local/bin/quenchforge</string>
+        <string>/Users/REPLACE_ME/.config/quenchforge/prestart-guard.sh</string>
         <string>serve</string>
     </array>
 
@@ -75,7 +85,10 @@
       message when the port is held by Ollama or a stale quenchforge —
       KeepAlive=<true/> would respawn-loop on that, defeating the
       operator-friendly error. SuccessfulExit=false keeps the supervisor
-      restart-on-crash semantics while letting clean exits stick.
+      restart-on-crash semantics while letting clean exits stick. With the
+      prestart guard reclaiming the port first, that yield path now only
+      triggers when a squatter cannot be evicted (e.g. another user's
+      process), which is the correct time to surface the error and stop.
     -->
     <key>KeepAlive</key>
     <dict>

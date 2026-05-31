@@ -27,6 +27,32 @@ The canonical source for the embedded template is
 [`cmd/quenchforge/plist_template.plist`](../../cmd/quenchforge/plist_template.plist) —
 inspect it before installing if you want to see what will land.
 
+### Prestart port guard
+
+`quenchforge install` also writes a small **prestart guard** to
+`~/.config/quenchforge/prestart-guard.sh`, and the generated plist's
+`ProgramArguments[0]` points at it (rather than the bare binary). On every
+(re)start and at login the guard:
+
+1. boots out Ollama's launchd job (`com.ollama.ollama`) if present, so it
+   can't immediately respawn its `ollama serve` child;
+2. evicts any **non-quenchforge** listener still holding port `11434`;
+3. `exec`s `quenchforge serve`.
+
+Why: quenchforge's pre-bind check deliberately exits 0 (yields) when the
+port is already held, and `KeepAlive.SuccessfulExit=false` then leaves it
+dead — so without the guard, anything that grabs `11434` during a restart
+window (classically Ollama.app's auto-launched server) wins and quenchforge
+stays down. The guard makes quenchforge authoritatively reclaim the
+canonical Ollama-API port without the operator hand-evicting Ollama.
+
+The guard only kills the actual port squatter (never a running quenchforge
+or `llama-server`) and only boots out Ollama if its job exists, so it's a
+no-op on a machine without Ollama. Source:
+[`cmd/quenchforge/prestart-guard.sh`](../../cmd/quenchforge/prestart-guard.sh).
+Operators who intentionally run Ollama alongside quenchforge can edit the
+plist's `ProgramArguments` back to the bare `quenchforge` + `serve`.
+
 To uninstall:
 
 ```bash
