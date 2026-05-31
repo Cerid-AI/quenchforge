@@ -176,9 +176,9 @@ All settings have sensible defaults. Selected env vars:
 | `QUENCHFORGE_MODELS_DIR` | `~/.quenchforge/models` | Where Quenchforge looks for GGUFs |
 | `QUENCHFORGE_LOG_DIR` | `~/Library/Logs/quenchforge` | Per-slot log files land here |
 | `QUENCHFORGE_PID_DIR` | `~/.config/quenchforge/pids` | Orphan-reaper pidfile dir |
-| `QUENCHFORGE_MAX_CONTEXT` | `8192` | `--ctx-size` passed to every slot |
+| `QUENCHFORGE_MAX_CONTEXT` | `8192` | `--ctx-size` passed to every slot. On AMD-discrete cards ≤ 11 GB this is auto-capped by VRAM tier (4096 on 8 GB, 2048 on 4 GB) so the KV cache fits; the cap only lowers, never raises, your value. ≥ 12 GB cards use it verbatim. |
 | `QUENCHFORGE_METAL_N_CB` | `2` | Metal command-buffer count (`GGML_METAL_N_CB`); global default — per-slot overrides below |
-| `QUENCHFORGE_EMBED_UBATCH_SIZE` | `0` (inherit MaxContext) | Per-call `--batch-size` / `--ubatch-size` for embed and code-embed slots. On AMD discrete, lowering this (e.g. `1024`) caps Metal staging-buffer pressure and prevents the family-B sustained-load SIGABRT documented in `patches/README.md` section 3. |
+| `QUENCHFORGE_EMBED_UBATCH_SIZE` | `0` (auto) | Per-call `--batch-size` / `--ubatch-size` for embed and code-embed slots. Zero auto-sizes by VRAM tier on AMD discrete (1024 on ≥ 12 GB, 512 on 8 GB, 256 on 4 GB) to cap Metal staging-buffer pressure and prevent the family-B sustained-load SIGABRT (`patches/README.md` section 3); non-AMD inherits MaxContext. An explicit value overrides the tier. |
 | `QUENCHFORGE_EMBED_METAL_N_CB` | `0` (inherit `METAL_N_CB`) | Per-slot `GGML_METAL_N_CB` for embed and code-embed. Set to `1` on AMD discrete to serialise Metal command-buffer submission. |
 | `QUENCHFORGE_RERANK_BATCH_SIZE` | `0` (llama.cpp's 512-token default) | Rerank slot `--batch-size` and `--ubatch-size`. Raise this when the reranker takes (query, doc) pairs longer than 510 tokens (e.g. `bge-reranker-v2-m3` with ≥ 1k-token chunks). |
 | `QUENCHFORGE_RERANK_METAL_N_CB` | `0` (inherit `METAL_N_CB`) | Per-slot `GGML_METAL_N_CB` for the rerank slot. |

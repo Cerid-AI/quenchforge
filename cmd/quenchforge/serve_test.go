@@ -343,6 +343,35 @@ func TestBuildSlotArgs_EmbedKindsBatchOverride(t *testing.T) {
 	}
 }
 
+func TestBuildSlotArgs_LowVRAMAMDCapsContextAndUbatch(t *testing.T) {
+	// v0.8.0 adaptive sizing: an 8 GB AMD card (e.g. RX 5700) must get a
+	// capped --ctx-size 4096 (down from MaxContext 8192) and --ubatch-size
+	// 512 on embed/chat without any operator env var — the gap that used
+	// to force manual QUENCHFORGE_MAX_CONTEXT / _EMBED_UBATCH_SIZE tuning.
+	cfg := config.Config{MaxContext: 8192}
+	info := hardware.Info{Profile: hardware.ProfileRDNA1, GPUVRAMGB: 8}
+
+	embedArgs := buildSlotArgs(cfg, info, slotSpec{Kind: gateway.KindEmbed, Name: "embed", Port: 11501}, "/tmp/e.gguf")
+	if !containsArgPair(embedArgs, "--ctx-size", "4096") {
+		t.Errorf("8 GB AMD embed missing capped --ctx-size 4096: %v", embedArgs)
+	}
+	if !containsArgPair(embedArgs, "--ubatch-size", "512") {
+		t.Errorf("8 GB AMD embed missing scaled --ubatch-size 512: %v", embedArgs)
+	}
+
+	chatArgs := buildSlotArgs(cfg, info, slotSpec{Kind: gateway.KindChat, Name: "chat", Port: 11500}, "/tmp/c.gguf")
+	if !containsArgPair(chatArgs, "--ctx-size", "4096") {
+		t.Errorf("8 GB AMD chat missing capped --ctx-size 4096: %v", chatArgs)
+	}
+
+	// Regression: a 32 GB card keeps the full configured context.
+	hi := hardware.Info{Profile: hardware.ProfileVegaPro, GPUVRAMGB: 32}
+	hiArgs := buildSlotArgs(cfg, hi, slotSpec{Kind: gateway.KindChat, Name: "chat", Port: 11500}, "/tmp/c.gguf")
+	if !containsArgPair(hiArgs, "--ctx-size", "8192") {
+		t.Errorf("32 GB AMD chat should keep --ctx-size 8192 (no cap): %v", hiArgs)
+	}
+}
+
 func TestBuildSlotArgs_NonEmbedKindsSkipBatchOverride(t *testing.T) {
 	// Chat / rerank / whisper slots don't need the embed batch override
 	// (they decode autoregressively or operate per-pair). Adding it
