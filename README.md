@@ -21,11 +21,12 @@ Quenchforge carries a single load-bearing patch per submodule that gates the bug
 | **Image generation** | `stable-diffusion.cpp` | ✅ shipped in v0.3.1 — sd-server supervised slot, `/v1/images/generations` proxies through gateway |
 | **Text-to-speech** | `bark.cpp` | ✅ shipped in v0.3.1 — bark server supervised slot, `/v1/audio/speech` → `/tts` path-rewrite |
 
-> **Status:** v0.4.0 shipped (2026-05-14). Production-stable for chat + embeddings + reranker + whisper transcription on Mac Pro 2019 + Radeon Pro Vega II (32 GB HBM2). Image-gen + TTS slots are wired end-to-end but **AMD-Mac correctness is unverified** — they depend on the same `simdgroup_reduction` / `bfloat` fix landing in each project's vendored ggml, which we haven't audited yet. Treat those two slots as experimental on Intel Mac + AMD until a hardware-profile report confirms. **Signed + notarized release binaries are live** at the [GitHub releases page](https://github.com/Cerid-AI/quenchforge/releases) (Developer ID Application: Justin Michaels, team `4A5VDRMRB8`, hardened-runtime, Apple-notarized). Homebrew tap at [`Cerid-AI/homebrew-tap`](https://github.com/Cerid-AI/homebrew-tap) — `brew install cerid-ai/tap/quenchforge` works.
+> **Status:** v0.8.1 (2026-05-31), signed + notarized. Production-stable for **chat + embeddings + code-embeddings + reranking — all GPU-resident** — on Mac Pro 2019 + Radeon Pro Vega II (32 GB HBM2), and VRAM-tier-adaptive across the rest of the Intel-Mac AMD range. Whisper transcription ships CPU-mode (correct, fast). Image-gen + TTS slots are wired but **AMD-Mac correctness is unverified** — treat as experimental until a hardware-profile report confirms. Signed + notarized release binaries (Developer ID Application: Justin Michaels, team `4A5VDRMRB8`, hardened-runtime, Apple-notarized) are on the [releases page](https://github.com/Cerid-AI/quenchforge/releases); `brew install cerid-ai/tap/quenchforge` works.
 >
-> **v0.4.0 highlights:** Model registry — `quenchforge pull llama3.2:3b`, `quenchforge list`, `quenchforge rm` with HuggingFace integration (SHA-256 verification, atomic downloads with resume, curated catalog of 8 well-tested aliases keyed to AMD-Mac VRAM tiers). VRAM pre-flight refuses to spawn slots whose combined weights would oversubscribe VRAM, with per-slot breakdown + suggested fixes. 11 new registry tests + 7 VRAM-check tests, all green.
->
-> **v0.3.3 highlights (still in effect):** Ollama-wire ↔ OpenAI-wire body translation in the gateway so Ollama clients work end-to-end against llama-server's OpenAI wire. Hardware-aware chat-slot args on AMD discrete (auto-adds `--flash-attn off --cache-ram 0 --no-cache-prompt` for Vega Pro / W6800X / W6900X / RDNA1+2 to keep attention GPU-resident and avoid the Vega II prompt-cache GGML_ASSERT crash). LaunchAgent template at `packaging/macos/com.cerid.quenchforge.plist` for from-source installs.
+> **Recent highlights** (full history in [CHANGELOG.md](CHANGELOG.md)):
+> - **v0.8.1** — prestart port guard: the install-generated LaunchAgent reclaims `:11434` from an Ollama squatter on every start/login, so the two coexist with no manual eviction.
+> - **v0.8.0** — AMD-discrete **GPU mode shipped for all four slots** (chat, embed, code-embed, rerank) via two ggml Metal patches (kernel correctness + a staging-buffer pool for sustained load), plus **VRAM-tier-adaptive sizing** so cards from 4 GB MacBook Pro dGPUs to 32 GB Vega II run out-of-the-box.
+> - **v0.5.0** — dedicated **code-embed slot** (route code-tuned embedders independently of general-text), model registry (`pull` / `list` / `rm` with HuggingFace + SHA-256 verification), and VRAM pre-flight that refuses to oversubscribe.
 
 ## Hardware compatibility matrix
 
@@ -40,7 +41,20 @@ Quenchforge carries a single load-bearing patch per submodule that gates the bug
 | Linux / Windows | **Out of scope** | Use stock Ollama with CUDA / ROCm / DirectML; that path is already well-served |
 | Hackintosh + AMD | Community best-effort | Tagged in telemetry as non-genuine; no SLA |
 
-## Honesty about Metal in v0.3
+## Versus the alternatives (Intel Mac + AMD discrete)
+
+On Apple Silicon, Ollama / LM Studio / llama.cpp all work fine — use any of them. This table is specifically the **Intel-Mac + AMD-discrete** axis quenchforge exists to serve:
+
+| | GPU on AMD-Mac Metal | Correct output | Drop-in Ollama API | Embed + rerank + STT, one port | Local-only |
+|---|---|---|---|---|---|
+| **Quenchforge** | ✅ patched | ✅ | ✅ | ✅ | ✅ |
+| Ollama | ❌ silent CPU fallback ([#1016](https://github.com/ollama/ollama/issues/1016)) | ✅ (CPU, slow) | — (it *is* the API) | partial | ✅ |
+| llama.cpp (stock) | ⚠️ runs but **garbage tokens** ([#19563](https://github.com/ggml-org/llama.cpp/issues/19563)) | ❌ | ❌ | ✅ (manual, multi-process) | ✅ |
+| LM Studio | ❌ no AMD-Mac GPU path¹ | ✅ (CPU) | partial | partial | ✅ |
+
+¹ LM Studio is llama.cpp-based, so its Metal path inherits the same `#19563` bug class on AMD discrete; we haven't independently benchmarked it.
+
+## Honesty about Metal on AMD
 
 | Workload | llama.cpp Metal on Vega II | whisper.cpp Metal on Vega II |
 |---|---|---|
@@ -105,53 +119,38 @@ curl -X POST http://127.0.0.1:11434/v1/audio/transcriptions \
   -F file=@speech.wav -F response_format=json
 ```
 
-### Homebrew tap (coming with v0.3 signed release)
+### Homebrew (recommended)
 
 ```sh
-# brew install cerid-ai/tap/quenchforge
-# brew services start quenchforge
+brew install cerid-ai/tap/quenchforge
+quenchforge install            # writes the LaunchAgent (+ prestart port guard) to ~/Library/LaunchAgents
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cerid.quenchforge.plist
+curl http://127.0.0.1:11434/   # verify
 ```
 
-Signed + notarized bottles depend on Apple Developer ID configuration in CI.
+Release binaries are signed with a Developer ID and Apple-notarized.
 
 ### Coexistence with Ollama.app
 
 Quenchforge listens on `127.0.0.1:11434` — the same port as Ollama. If
-`/Applications/Ollama.app` is also installed, its login agent
-(`com.ollama.ollama`) races quenchforge to bind the port at every
-login. The pre-bind check (added in this release) detects the conflict
-and exits cleanly with guidance; the `KeepAlive=<dict><SuccessfulExit
-false/></dict>` plist setting prevents launchd from respawning on the
-clean exit.
+`/Applications/Ollama.app` is installed, its login agent
+(`com.ollama.ollama`) would otherwise race quenchforge to bind the port
+at every login.
 
-To resolve:
+**This is handled automatically (v0.8.1+).** `quenchforge install`
+writes a LaunchAgent whose `ProgramArguments[0]` is a prestart guard
+(`~/.config/quenchforge/prestart-guard.sh`): on every start and at login
+it boots out `com.ollama.ollama` and evicts any non-quenchforge listener
+on `:11434` before starting the server. So quenchforge reliably owns the
+canonical Ollama-API port with no manual eviction. Ollama.app stays
+installed for its GUI — `open -a Ollama` still works; it just won't
+auto-serve on `:11434`.
 
-**Option A — use quenchforge only** (recommended for cerid AI workloads):
+**Prefer them on separate ports instead?** Set `QUENCHFORGE_LISTEN_ADDR`
+in the LaunchAgent's `<EnvironmentVariables>` (e.g. `:11435`), restart,
+and point quenchforge clients at the new port; Ollama keeps `11434`.
 
-```sh
-osascript -e 'tell application "Ollama" to quit' 2>/dev/null || true
-launchctl bootout gui/$(id -u)/com.ollama.ollama
-launchctl kickstart -k gui/$(id -u)/com.cerid.quenchforge
-```
-
-The Ollama.app stays installed; you can run `open -a Ollama` manually
-if you ever need it.
-
-**Option B — coexist on different ports**:
-
-Edit `~/Library/LaunchAgents/com.cerid.quenchforge.plist` and add to
-the `<EnvironmentVariables>` dict:
-
-```xml
-<key>QUENCHFORGE_LISTEN_ADDR</key>
-<string>:11435</string>
-```
-
-Then `launchctl kickstart -k gui/$(id -u)/com.cerid.quenchforge`.
-Quenchforge is now on `11435` and Ollama owns `11434`. Update any
-clients that point at quenchforge to use the new port.
-
-Run `quenchforge doctor` to verify either resolution.
+Run `quenchforge doctor` to verify.
 
 ## First-launch prompts to expect
 
@@ -185,7 +184,7 @@ All settings have sensible defaults. Selected env vars:
 | `QUENCHFORGE_AUTO_BACKOFF` | `false` | Opt-in: gateway returns `HTTP 503` + `Retry-After: 2` on `/v1/embeddings` etc. when the slot's rolling p99 latency is `critical` (5× p50 or error rate > 5%). Default off — observability via `/health` works without this flag. |
 | `QUENCHFORGE_ADVERTISE_MDNS` | `false` | Bonjour advertisement (`_quenchforge._tcp.local.`) |
 
-**Operator overrides** (gated by the v0.3.3 hardware-aware defaults):
+**Operator overrides** (escape hatches over the AMD-Mac-safe defaults the patches + tuning apply automatically):
 | Env var | Default | What |
 |---|---|---|
 | `GGML_METAL_FORCE_SIMDGROUP_REDUCTION` | unset | Re-enables the AMD-buggy reduction kernel — for diagnostic use only |
