@@ -8,9 +8,7 @@ patch bumps fix bugs or polish without behaviour change.
 
 ---
 
-## Unreleased
-
-### Prestart port guard (LaunchAgent)
+## v0.8.1 — Prestart port guard reclaims :11434 from Ollama (2026-05-31)
 
 `quenchforge install` now also writes a prestart guard to
 `~/.config/quenchforge/prestart-guard.sh` and points the generated plist's
