@@ -226,13 +226,13 @@ release:
     Local inference for **Mac + AMD discrete GPU**, behind Ollama- and OpenAI-compatible HTTP APIs.
     See [README](https://github.com/Cerid-AI/quenchforge#readme) for the hardware compatibility matrix.
   footer: |
-    **Install via Homebrew tap (recommended):**
+    **Install (one line):**
+    ```sh
+    curl -fsSL https://raw.githubusercontent.com/Cerid-AI/quenchforge/main/install.sh | sh
+    ```
+    **Or via Homebrew tap:**
     ```sh
     brew install cerid-ai/tap/quenchforge
     brew services start quenchforge
     ```
-    **Verify before installing:**
-    ```sh
-    curl -fsSL https://github.com/Cerid-AI/quenchforge/releases/download/{{ .Tag }}/quenchforge-preflight_{{ .Version }}_darwin_universal.tar.gz \
-      | tar -xz -O quenchforge-preflight | sh
-    ```
+    Release binaries are Developer-ID-signed and Apple-notarized; the installer verifies SHA-256 against `checksums.txt`.

@@ -78,7 +78,23 @@ That's why the whisper slot defaults to `--no-gpu` on Intel Mac + AMD. Flip `QUE
 
 ## Quickstart
 
-### Building from source (today)
+### Install (one line) — easiest
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Cerid-AI/quenchforge/main/install.sh | sh
+```
+
+Downloads the latest signed + notarized universal build, verifies its SHA-256 against `checksums.txt`, installs the binaries to `/usr/local/bin`, runs the hardware preflight, and writes the LaunchAgent + prestart port guard. Then pull a model and start it:
+
+```sh
+quenchforge pull llama3.2:3b   # `quenchforge pull --list` for the curated catalog
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cerid.quenchforge.plist
+curl http://127.0.0.1:11434/
+```
+
+Knobs: `QUENCHFORGE_VERSION=v0.8.1` to pin a release, `QUENCHFORGE_NO_SERVICE=1` to install the binaries without the LaunchAgent.
+
+### Building from source
 
 ```sh
 git clone --recursive https://github.com/Cerid-AI/quenchforge
