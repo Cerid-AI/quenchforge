@@ -8,6 +8,28 @@ patch bumps fix bugs or polish without behaviour change.
 
 ---
 
+## Unreleased
+
+### One-line installer
+
+Added `install.sh` (served from `main`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Cerid-AI/quenchforge/main/install.sh | sh
+```
+
+Resolves the latest release, downloads the universal `darwin_all` tarball,
+**verifies its SHA-256 against `checksums.txt`**, installs both binaries to
+`/usr/local/bin`, gates on `quenchforge-preflight` (`status=ok`), and writes
+the LaunchAgent + prestart port guard via `quenchforge install`. Knobs:
+`QUENCHFORGE_VERSION` to pin, `QUENCHFORGE_PREFIX` to relocate,
+`QUENCHFORGE_NO_SERVICE=1` for binaries-only. macOS-only and installs a
+per-user LaunchAgent on purpose (the daemon needs an Aqua session for Metal
+GPU access). Also fixed the GitHub-release footer, which pointed at a
+non-existent `quenchforge-preflight_*_darwin_universal.tar.gz` asset.
+
+---
+
 ## v0.8.1 — Prestart port guard reclaims :11434 from Ollama (2026-05-31)
 
 `quenchforge install` now also writes a prestart guard to
