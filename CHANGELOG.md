@@ -8,7 +8,7 @@ patch bumps fix bugs or polish without behaviour change.
 
 ---
 
-## Unreleased
+## v0.8.2 — one-line curl installer (2026-06-02)
 
 ### One-line installer
 
