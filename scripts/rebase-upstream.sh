@@ -77,62 +77,69 @@ rebase_one() {
 
   cd "${submod_dir}"
 
-  if (( ! REGEN_ONLY )); then
+  # Resolve the upstream target for this submodule.
+  local target="${REF}"
+  if [[ -z "${target}" ]]; then
+    if (( ! REGEN_ONLY )); then
+      echo "==> [${submod}] fetching origin (upstream)"
+      git fetch origin --tags --prune
+    fi
+    local db; db="$(default_branch)"
+    if [[ -z "${db}" ]]; then
+      echo "    [error] ${submod}: could not resolve origin default branch" >&2
+      return 1
+    fi
+    target="origin/${db}"
+  elif (( ! REGEN_ONLY )); then
     echo "==> [${submod}] fetching origin (upstream)"
     git fetch origin --tags --prune
+  fi
 
-    local target="${REF}"
-    if [[ -z "${target}" ]]; then
-      local db; db="$(default_branch)"
-      if [[ -z "${db}" ]]; then
-        echo "    [error] ${submod}: could not resolve origin default branch" >&2
-        return 1
-      fi
-      target="origin/${db}"
-    fi
-
-    echo "==> [${submod}] snapshotting working-tree patches as commits"
-    local pre_ref commits_ref
-    pre_ref="$(git rev-parse HEAD)"
-    # apply-patches.sh leaves our patches present-but-uncommitted in the
-    # working tree. Materialize them as commits so `git am -3` can replay them.
-    if ! git diff --quiet || ! git diff --cached --quiet; then
-      git add -A
-      git commit -q -m "WIP: quenchforge patches (pre-rebase snapshot)" --allow-empty
-    fi
-    commits_ref="$(git rev-parse HEAD)"
-
-    echo "==> [${submod}] generating replay series from ${pre_ref}..${commits_ref}"
-    local tmp_series; tmp_series="$(mktemp -d)"
-    git format-patch --zero-commit -N -o "${tmp_series}" "${pre_ref}..${commits_ref}" >/dev/null
-
+  if (( ! REGEN_ONLY )); then
+    # Apply the committed patch series directly onto the fresh upstream. This
+    # does NOT depend on the working tree being pre-patched — the canonical
+    # source of truth is patches/<submodule>/*.patch.
+    git am --abort >/dev/null 2>&1 || true
     echo "==> [${submod}] resetting to ${target}"
     git reset --hard "${target}"
 
-    echo "==> [${submod}] replaying patches with three-way merge"
-    if ! git am -3 "${tmp_series}"/*.patch; then
+    echo "==> [${submod}] applying patches/${submod}/*.patch with three-way merge"
+    if ! git am -3 "${patches[@]}"; then
       echo
       echo "rebase stopped on conflict in ${submod}. Resolve hunks, then:"
       echo "  git -C ${submod} add <files>"
       echo "  git -C ${submod} am --continue"
       echo "  scripts/rebase-upstream.sh --only ${submod} --regenerate-only"
-      rm -rf "${tmp_series}"
       return 1
     fi
-    rm -rf "${tmp_series}"
   fi
 
   echo "==> [${submod}] regenerating canonical series into patches/${submod}/"
-  local base
-  base="$(git rev-list --max-parents=0 HEAD | tail -1)"
-  if [[ -n "${REF}" ]]; then
-    base="$(git merge-base HEAD "${REF}")"
+  # After `git am`, HEAD = target + N quenchforge commits; regenerate the
+  # series off that base so the on-disk patches are refreshed against upstream
+  # (3-way merge may have adjusted context lines).
+  local base; base="$(git merge-base HEAD "${target}")"
+  local tmp_out; tmp_out="$(mktemp -d)"
+  git format-patch --zero-commit -N -o "${tmp_out}" "${base}..HEAD" >/dev/null
+
+  shopt -s nullglob
+  local gen=( "${tmp_out}"/*.patch )
+  shopt -u nullglob
+  # git format-patch names files from the commit subject; preserve the curated
+  # filenames (positional — series order is stable) so doc references and the
+  # 0001/0002 numbering don't churn on every rebase.
+  if (( ${#gen[@]} == ${#patches[@]} )); then
+    rm -f "${sub_patch_dir}"/*.patch
+    local i
+    for i in "${!gen[@]}"; do
+      cp "${gen[$i]}" "${sub_patch_dir}/$(basename "${patches[$i]}")"
+    done
   else
-    local db; db="$(default_branch)"
-    [[ -n "${db}" ]] && base="$(git merge-base HEAD "origin/${db}")"
+    echo "    [warn] ${submod}: regenerated ${#gen[@]} patches vs ${#patches[@]} curated — keeping generated names" >&2
+    rm -f "${sub_patch_dir}"/*.patch
+    cp "${gen[@]}" "${sub_patch_dir}/"
   fi
-  rm -f "${sub_patch_dir}"/*.patch
-  git format-patch --zero-commit -N -o "${sub_patch_dir}" "${base}..HEAD" >/dev/null
+  rm -rf "${tmp_out}"
   echo "    updated: $(ls -1 "${sub_patch_dir}"/*.patch 2>/dev/null | xargs -n1 basename 2>/dev/null | tr '\n' ' ')"
 }
 
