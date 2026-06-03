@@ -47,3 +47,7 @@ AuthKey_*.p8
 
 # goreleaser
 /dist-snapshot/
+
+# Maintainer-local docs (kept on disk, never published — contains
+# maintainer-specific signing setup with no value to external contributors)
+docs/APPLE_DEVELOPER_ID.md
