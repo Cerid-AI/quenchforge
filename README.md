@@ -6,7 +6,7 @@
 
 `ggml`'s Metal backend enables Apple-Silicon-specific kernels on any device that supports `MTLGPUFamilyMetal3`, including **AMD discrete GPUs on Intel Mac** (Vega II / W6800X / RDNA1+2) and **Intel iGPUs**. On those devices the simdgroup-reduction and bfloat ops *compile* but produce wrong arithmetic at runtime, so models emit garbage tokens forever ([ggml-org/llama.cpp#19563](https://github.com/ggml-org/llama.cpp/issues/19563)). Stock Ollama on the same hardware silently falls back to CPU without surfacing the underlying bug ([ollama/ollama#1016](https://github.com/ollama/ollama/issues/1016), open since 2023).
 
-Quenchforge carries a single load-bearing patch per submodule that gates the buggy kernels to Apple Silicon only, restoring **correct output on AMD Mac Metal**. The patches are re-derived from the public issue, not copied from third-party gists, and applied at build time via `scripts/apply-patches.sh` — the submodule SHAs stay clean.
+Quenchforge carries a small patch series — one kernel-correctness patch per submodule that gates the buggy kernels to Apple Silicon only, plus (for `llama.cpp`) a second staging-buffer-pool patch that keeps embed/rerank stable under sustained AMD load — restoring **correct output on AMD Mac Metal**. The patches are re-derived from the public issue, not copied from third-party gists, and applied at build time via `scripts/apply-patches.sh` — the submodule SHAs stay clean.
 
 ## Why ggml, not just LLMs
 
@@ -18,12 +18,13 @@ Quenchforge carries a single load-bearing patch per submodule that gates the bug
 | **Embeddings** (BGE-M3, e5, GTE — *not LLMs*) | `llama.cpp --embedding` | ✅ shipped, gateway routes `/api/embeddings` + `/v1/embeddings` |
 | **Reranking** (BGE-reranker, cross-encoders) | `llama.cpp --reranking` | ✅ shipped, gateway route `/v1/rerank` |
 | **Speech-to-text** | `whisper.cpp` | ✅ shipped, CPU mode default — correct transcription at 12.8× real-time on Xeon W-3245 |
-| **Image generation** | `stable-diffusion.cpp` | ✅ shipped in v0.3.1 — sd-server supervised slot, `/v1/images/generations` proxies through gateway |
-| **Text-to-speech** | `bark.cpp` | ✅ shipped in v0.3.1 — bark server supervised slot, `/v1/audio/speech` → `/tts` path-rewrite |
+| **Image generation** | `stable-diffusion.cpp` | ⚠️ experimental — sd-server slot + `/v1/images/generations` wired, but AMD-Mac correctness unverified |
+| **Text-to-speech** | `bark.cpp` | ⚠️ experimental — bark slot + `/v1/audio/speech` → `/tts` wired, but AMD-Mac correctness unverified |
 
-> **Status:** v0.8.1 (2026-05-31), signed + notarized. Production-stable for **chat + embeddings + code-embeddings + reranking — all GPU-resident** — on Mac Pro 2019 + Radeon Pro Vega II (32 GB HBM2), and VRAM-tier-adaptive across the rest of the Intel-Mac AMD range. Whisper transcription ships CPU-mode (correct, fast). Image-gen + TTS slots are wired but **AMD-Mac correctness is unverified** — treat as experimental until a hardware-profile report confirms. Signed + notarized release binaries (Developer ID Application: Justin Michaels, team `4A5VDRMRB8`, hardened-runtime, Apple-notarized) are on the [releases page](https://github.com/Cerid-AI/quenchforge/releases); `brew install cerid-ai/tap/quenchforge` works.
+> **Status:** v0.8.2 (2026-06-02), signed + notarized. Production-stable for **chat + embeddings + code-embeddings + reranking — all GPU-resident** — on Mac Pro 2019 + Radeon Pro Vega II (32 GB HBM2), and VRAM-tier-adaptive across the rest of the Intel-Mac AMD range. Whisper transcription ships CPU-mode (correct, fast). Image-gen + TTS slots are wired but **AMD-Mac correctness is unverified** — treat as experimental until a hardware-profile report confirms. Signed + notarized release binaries (Developer ID Application: Justin Michaels, team `4A5VDRMRB8`, hardened-runtime, Apple-notarized) are on the [releases page](https://github.com/Cerid-AI/quenchforge/releases); `brew install cerid-ai/tap/quenchforge` works.
 >
 > **Recent highlights** (full history in [CHANGELOG.md](CHANGELOG.md)):
+> - **v0.8.2** — one-line `curl … | sh` installer: resolves the latest release, verifies its SHA-256 against `checksums.txt`, installs the binaries, and writes the LaunchAgent + prestart port guard.
 > - **v0.8.1** — prestart port guard: the install-generated LaunchAgent reclaims `:11434` from an Ollama squatter on every start/login, so the two coexist with no manual eviction.
 > - **v0.8.0** — AMD-discrete **GPU mode shipped for all four slots** (chat, embed, code-embed, rerank) via two ggml Metal patches (kernel correctness + a staging-buffer pool for sustained load), plus **VRAM-tier-adaptive sizing** so cards from 4 GB MacBook Pro dGPUs to 32 GB Vega II run out-of-the-box.
 > - **v0.5.0** — dedicated **code-embed slot** (route code-tuned embedders independently of general-text), model registry (`pull` / `list` / `rm` with HuggingFace + SHA-256 verification), and VRAM pre-flight that refuses to oversubscribe.
@@ -74,7 +75,7 @@ That's why the whisper slot defaults to `--no-gpu` on Intel Mac + AMD. Flip `QUE
 | `quenchforge-preflight` | One-line `curl ... | sh` gating binary that emits `KEY=VALUE` for install scripts. Refuses to install on unsupported macOS / hardware |
 | `scripts/build-llama.sh` | Builds patched `llama-server` (Metal, dual-arch, universal lipo) |
 | `scripts/build-whisper.sh` | Builds patched `whisper-server` (same patch shape, different submodule) |
-| `patches/llama.cpp/` and `patches/whisper.cpp/` | The actual diffs against each submodule. `scripts/apply-patches.sh` is idempotent + `--check` + `--reset` |
+| `patches/{llama,whisper,sd,bark}.cpp/` | The actual diffs against each submodule (llama.cpp carries two; the rest one each). `scripts/apply-patches.sh` is idempotent + `--check` + `--reset` |
 
 ## Quickstart
 
@@ -92,7 +93,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cerid.quenchforge.pl
 curl http://127.0.0.1:11434/
 ```
 
-Knobs: `QUENCHFORGE_VERSION=v0.8.1` to pin a release, `QUENCHFORGE_NO_SERVICE=1` to install the binaries without the LaunchAgent.
+Knobs: `QUENCHFORGE_VERSION=v0.8.2` to pin a release, `QUENCHFORGE_NO_SERVICE=1` to install the binaries without the LaunchAgent.
 
 ### Building from source
 
@@ -104,6 +105,9 @@ cd quenchforge
 bash scripts/apply-patches.sh
 bash scripts/build-llama.sh
 bash scripts/build-whisper.sh   # only if you want the transcription slot
+# experimental, unverified on AMD Mac:
+# bash scripts/build-sd.sh      # image-gen slot
+# bash scripts/build-bark.sh    # TTS slot
 
 # Build the quenchforge supervisor + CLI
 go build -o /usr/local/bin/quenchforge ./cmd/quenchforge
@@ -171,7 +175,7 @@ Run `quenchforge doctor` to verify.
 ## First-launch prompts to expect
 
 - **"Quenchforge would like to find and connect to devices on your local network"** — Sonoma+ TCC prompt for mDNS / Bonjour advertisement (`_quenchforge._tcp.local.`). Only shown when `QUENCHFORGE_ADVERTISE_MDNS=true`. Allowing this lets cerid-ai and other LAN clients auto-discover the service.
-- **Telemetry** — none. Zero network traffic in the default config. The CLAUDE.md design contract reserves `QUENCHFORGE_TELEMETRY` for a future opt-in benchmark dashboard at `bench.quenchforge.dev`, but no code is shipped for that yet. Setting `QUENCHFORGE_SENTRY_DSN` enables Sentry error reporting for operators who explicitly want it; absent that env var, no Sentry traffic.
+- **Telemetry** — none, and none is implemented: there is no telemetry, analytics, or error-reporting code in the binary today, so the default config produces zero network traffic. The design contract reserves opt-in hooks for if/when they're built — a future benchmark dashboard at `bench.quenchforge.dev` and Sentry error reporting via `QUENCHFORGE_SENTRY_DSN` — but no such code ships yet.
 - **Gatekeeper** — once signed/notarized binaries ship, `quenchforge --version` is the first run that triggers a one-time online check.
 
 ## Configuration
