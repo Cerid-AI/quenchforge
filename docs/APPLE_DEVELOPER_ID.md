@@ -15,11 +15,11 @@ to flip signed + notarized releases on.
 
 | Item | Status |
 |---|---|
-| Apple ID | `sunrunnerfire@mac.com` — confirmed configured |
-| Apple Developer Team ID | **`4A5VDRMRB8`** |
+| Apple ID | maintainer Apple ID — configured |
+| Apple Developer Team ID | **`4A5VDRMRB8`** (embedded in every signed release; not secret) |
 | Xcode + `notarytool` | installed at `/Applications/Xcode.app/...` |
-| CSR | generated at `~/quenchforge-signing/quenchforge-developer-id.csr` |
-| Private key | at `~/quenchforge-signing/quenchforge-developer-id.key` (mode 0600) |
+| CSR | generated under the maintainer's signing dir |
+| Private key | kept under the maintainer's signing dir (mode 0600, never committed) |
 | Developer ID Application certificate | ✅ **minted** (Justin Michaels / 4A5VDRMRB8) |
 | App Store Connect API key | ✅ **created + uploaded as repo secret** |
 | GitHub repo secrets (5 Apple ones) | ✅ **set** — `APPLE_DEVELOPER_ID_CERT_P12_B64`, `APPLE_DEVELOPER_ID_CERT_PASSWORD`, `APPLE_NOTARY_API_KEY_ID`, `APPLE_NOTARY_API_KEY_ISSUER`, `APPLE_NOTARY_API_KEY_P8_B64` |

@@ -6,8 +6,11 @@
 #
 # Walks each subdirectory of patches/ matching an existing submodule and
 # applies the .patch files in lexicographic order. Currently:
-#   patches/llama.cpp/    -> llama.cpp/
-#   patches/whisper.cpp/  -> whisper.cpp/
+#   patches/llama.cpp/    -> llama.cpp/   (0001 + 0002)
+#   patches/whisper.cpp/  -> whisper.cpp/ (0001)
+#   patches/sd.cpp/       -> sd.cpp/      (0001)
+#   patches/bark.cpp/     -> bark.cpp/    (0001)
+# (drafts/*.patch.broken are never applied.)
 #
 # Usage:
 #   scripts/apply-patches.sh                # apply all submodules
