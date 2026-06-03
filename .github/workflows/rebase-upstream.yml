@@ -1,9 +1,10 @@
 name: rebase-upstream
 
-# Weekly + on-demand: pull the latest llama.cpp master, replay the patch
-# series, and open a PR. Real hardware validation happens on the self-hosted
-# [amd-gpu] runner (added in a follow-up PR) — until that runner is online
-# the workflow opens the PR and tags it `needs-hw-verify`.
+# Weekly + on-demand: pull the latest upstream for each patched submodule
+# (llama.cpp, whisper.cpp, sd.cpp, bark.cpp), replay the patch series, and open
+# a PR. Real hardware validation happens on the self-hosted [amd-gpu] runner
+# (added in a follow-up PR) — until that runner is online the workflow opens
+# the PR and tags it `needs-hw-verify`.
 
 on:
   schedule:
@@ -33,20 +34,6 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: fetch upstream master for each submodule
-        run: |
-          for submod in llama.cpp whisper.cpp; do
-            if [ ! -d "${submod}/.git" ] && [ ! -f "${submod}/.git" ]; then
-              echo "skipping ${submod} — submodule not initialized"
-              continue
-            fi
-            ( cd "${submod}"
-              git remote get-url upstream >/dev/null 2>&1 || \
-                git remote add upstream "https://github.com/ggml-org/${submod}.git"
-              git fetch upstream master --tags --prune
-            )
-          done
-
       - name: replay patch series via scripts/rebase-upstream.sh
         id: rebase
         run: |
@@ -58,11 +45,12 @@ jobs:
         if: steps.rebase.outputs.exit_code == '0'
         uses: peter-evans/create-pull-request@v6
         with:
-          commit-message: 'chore(deps): rebase llama.cpp patches onto upstream master'
-          branch: 'auto/rebase-llama-cpp'
-          title: 'chore(deps): rebase llama.cpp patches'
+          commit-message: 'chore(deps): rebase patch series onto upstream'
+          branch: 'auto/rebase-upstream'
+          title: 'chore(deps): rebase patch series onto upstream'
           body: |
-            Automated weekly rebase of the patch series onto `ggml-org/llama.cpp` master.
+            Automated weekly rebase of the patch series onto each submodule's
+            upstream default branch (llama.cpp, whisper.cpp, sd.cpp, bark.cpp).
 
             Resolved cleanly with `git am -3`. The self-hosted `[amd-gpu]` runner
             should validate this PR before merge.
@@ -74,13 +62,14 @@ jobs:
         if: steps.rebase.outputs.exit_code != '0'
         uses: peter-evans/create-pull-request@v6
         with:
-          commit-message: 'chore(deps): WIP — llama.cpp rebase conflict'
+          commit-message: 'chore(deps): WIP — upstream rebase conflict'
           branch: 'auto/rebase-conflict'
-          title: 'WIP: llama.cpp rebase conflict — manual resolution needed'
+          title: 'WIP: upstream rebase conflict — manual resolution needed'
           body: |
-            `scripts/rebase-upstream.sh` exited non-zero. Manual hunk
-            resolution required. See the `llama.cpp/` working tree for
-            unmerged paths.
+            `scripts/rebase-upstream.sh` exited non-zero for at least one
+            submodule. Manual hunk resolution required — see the affected
+            submodule working tree(s) for unmerged paths. The script log names
+            which submodule stopped and the `git am --continue` recovery steps.
           labels: |
             deps
             rebase-conflict

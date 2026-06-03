@@ -27,13 +27,14 @@ become a generic inference framework.
 2. **macOS-only.** No CUDA, no ROCm, no Vulkan, no Linux-specific code paths.
    Apple Silicon and Intel Mac are the only targets. If a PR adds non-Darwin
    code, the answer is no.
-3. **One patch — minimise the patch surface.** The llama.cpp patch series is
-   exactly the load-bearing change(s) in `patches/`. As of 2026-05-12 that's
-   a single patch (`0001-metal-correctness-on-non-apple-silicon.patch`); the
-   originally-planned VRAM and simdgroup-mm patches turned out to be obsolete
-   against the current upstream. `GGML_METAL_N_CB` is set via env, not a
-   code patch. Adding a second patch requires a written rationale in
-   `patches/README.md`, a public upstream issue link, and review.
+3. **Minimise the patch surface.** The patch series is exactly the
+   load-bearing change(s) in `patches/<submodule>/`. As of 2026-05-25 that is:
+   - `llama.cpp`: `0001-metal-correctness-on-non-apple-silicon` + `0002-metal-staging-buffer-pool`
+   - `whisper.cpp`, `sd.cpp`, `bark.cpp`: `0001-metal-correctness-on-non-apple-silicon` each
+   Two further drafts (`0003`/`0004` BERT fallback kernels) are parked in
+   `patches/llama.cpp/drafts/*.broken` and are never applied. `GGML_METAL_N_CB`
+   is set via env, not a code patch. Adding any new patch requires a written
+   rationale in `patches/README.md`, a public upstream issue link, and review.
 4. **No `quenchforge doctor` paste = no bug-report triage.** The
    `.github/ISSUE_TEMPLATE/bug.yml` form makes this a hard requirement. Maintainer
    replies to triage-incomplete issues with the doctor-paste request and
@@ -56,18 +57,20 @@ internal/
   registry/   — GGUF pull (HF Etag integrity), disk preflight
   config/     — YAML config loader
   migrate/    — ~/.ollama/models/ symlink-import
-  obs/        — Prometheus, Sentry, structured JSON logs
+  discovery/  — mDNS/Bonjour LAN advertisement of the Ollama API
+  portcheck/  — prestart :11434 reclaim / Ollama-squatter deconfliction
 llama.cpp/    — git submodule
-whisper.cpp/  — git submodule (v0.2)
-patches/
-  0001-metal-correctness-on-non-apple-silicon.patch
+whisper.cpp/  — git submodule
+sd.cpp/       — git submodule
+bark.cpp/     — git submodule
+patches/<submodule>/NNNN-*.patch   — see patches/README.md for the live series
 scripts/
-  apply-patches.sh       — idempotent: git am --reject each patch
-  build-llama.sh         — CMake invocation per target triple
-  rebase-upstream.sh     — fetch upstream, rebase patches, run tests
-  imatrix-recalibrate.sh — quantization calibration on user query distribution
+  apply-patches.sh    — idempotent patch application across all submodules
+  build-{llama,whisper,sd,bark}.sh — CMake invocation per target triple
+  rebase-upstream.sh  — fetch each submodule's upstream, replay patches, regenerate series
+  bench-{bert,llama}-{correctness,sustained-load}.py — slot validation harnesses
 Formula/quenchforge.rb   — Homebrew formula with service block
-.github/workflows/{ci,release,rebase-upstream,runner-health}.yml
+.github/workflows/{ci,release,rebase-upstream}.yml
 .github/ISSUE_TEMPLATE/{bug.yml,hardware_profile.yml,feature.yml}
 tests/integration/       — gated on [amd-gpu] self-hosted runner
 ```
@@ -125,13 +128,16 @@ a previously-closed-not-planned decision.
 
 ## Telemetry policy
 
-Both Sentry error reporting AND the anonymous benchmark dashboard at
-`bench.quenchforge.dev` are **opt-in only** via a first-launch consent
-screen. Never send anything beyond hardware profile, tokens/sec, and
-latency. Never send prompts, model outputs, file paths, or anything
-user-identifiable. The consent screen copy lives in
-[`internal/obs/consent.go`](internal/obs/consent.go) (TBD); changes to
-that copy require a maintainer review.
+**Status: not yet implemented.** Quenchforge currently ships **no** telemetry,
+error reporting, or analytics code — there is no `internal/obs/` package and
+no network reporting path. The rules below are the binding policy for *when*
+any such code is added, not a description of current behaviour.
+
+If/when telemetry lands, both error reporting AND any anonymous benchmark
+dashboard must be **opt-in only** via a first-launch consent screen. Never
+send anything beyond hardware profile, tokens/sec, and latency. Never send
+prompts, model outputs, file paths, or anything user-identifiable. The consent
+flow and its copy must land in `internal/obs/` with a maintainer review.
 
 ## Operational gotchas
 
@@ -179,11 +185,13 @@ that copy require a maintainer review.
   ([llama.cpp#20104](https://github.com/ggml-org/llama.cpp/issues/20104))
 - Default-on telemetry of any kind
 - Bundling a GGUF model into the release artifact
-- Carrying a third patch without rationale (see absolute rule #3)
+- Carrying any new patch without rationale (see absolute rule #3)
 - Adding any feature behind a paywall or auth gate
 
 ## Sentry
 
-Error monitoring under Sentry org `cerid-ai`, project `quenchforge`.
-DSN is set at runtime via `QUENCHFORGE_SENTRY_DSN` and is **not in the
-default config**. Operators who do not opt in produce zero Sentry traffic.
+**Status: not yet wired into the code.** No Sentry SDK is imported anywhere in
+`cmd/` or `internal/` today. The intended design — should it be added — is
+error monitoring under Sentry org `cerid-ai`, project `quenchforge`, with the
+DSN supplied at runtime via `QUENCHFORGE_SENTRY_DSN` and **never** baked into
+the default config, so operators who do not opt in produce zero Sentry traffic.

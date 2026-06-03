@@ -79,7 +79,11 @@ archives:
       - NOTICE
       - README.md
       - SECURITY.md
-      - patches/**/*
+      # Ship the live patch series + READMEs, but NOT the parked
+      # drafts/*.patch.broken (they don't apply and would confuse consumers).
+      - patches/README.md
+      - 'patches/*/[0-9]*.patch'
+      - 'patches/*/README.md'
 
 checksum:
   name_template: 'checksums.txt'

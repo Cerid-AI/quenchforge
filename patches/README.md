@@ -99,7 +99,7 @@ ggml-metal-device.m:1665+: ggml_metal_buffer_set_tensor →
                             ggml_abort → SIGABRT
 ```
 
-Reading `~/Develop/quenchforge/llama.cpp/ggml/src/ggml-metal/ggml-metal-device.m:1665-1717`
+Reading `llama.cpp/ggml/src/ggml-metal/ggml-metal-device.m:1665-1717`
 the mechanism is clear: `newBufferWithBytesNoCopy` with
 `MTLResourceStorageModeShared` requests a CPU-visible Metal buffer
 from the AMD discrete driver. On Apple Silicon this is trivial — unified
@@ -243,7 +243,8 @@ Combined 3955 sustained requests across 90 min wall-clock, zero
 family-B SIGABRTs, zero kernel panics. Throughput speedup vs CPU
 baseline: ~2.5× for nomic embed, ~1.7× for jina code-embed.
 
-The full design lives at `docs/superpowers/specs/2026-05-25-amd-metal-staging-buffer-pool-revival-design.md`.
+The full empirical isolation and design rationale are captured in the
+sections above plus [`docs/METAL_AMD_BERT_CORRECTNESS.md`](../docs/METAL_AMD_BERT_CORRECTNESS.md).
 
 **Scope note — patches 0003 + 0004 parked.** The originally-planned
 `_fb` BERT fallback kernels (LayerNorm/softmax/matmul) parked to

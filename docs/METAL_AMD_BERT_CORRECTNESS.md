@@ -13,8 +13,8 @@
 > ([issue #19563](https://github.com/ggml-org/llama.cpp/issues/19563))
 > and routed to AMD-discrete slots in v0.8.0 via
 > `SlotTuning.MetalConcurrencyDisable`. See
-> [`docs/superpowers/specs/2026-05-25-amd-metal-staging-buffer-pool-revival-design.md`](superpowers/specs/2026-05-25-amd-metal-staging-buffer-pool-revival-design.md)
-> for the actual v0.8.0 design.
+> [`patches/README.md`](../patches/README.md) for the patch series and the
+> v0.8.0 design rationale.
 >
 > The wave-width / `N_SIMDWIDTH=32` issue described below is a real
 > architectural mismatch per Apple MSL Spec §4.4.2 — but it is **not**
