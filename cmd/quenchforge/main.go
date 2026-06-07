@@ -24,6 +24,7 @@ import (
 	"github.com/cerid-ai/quenchforge/internal/gateway"
 	"github.com/cerid-ai/quenchforge/internal/hardware"
 	"github.com/cerid-ai/quenchforge/internal/portcheck"
+	"github.com/cerid-ai/quenchforge/internal/pressure"
 	"github.com/cerid-ai/quenchforge/internal/supervisor"
 	"github.com/cerid-ai/quenchforge/internal/tuning"
 )
@@ -585,6 +586,9 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 
 	g := gateway.New(cfg)
 	g.SetVersion(Version)
+	if cfg.GovernorEnabled {
+		g.SetScheduler(startGovernor(ctx, pressure.NewSensor(), cfg, stdout))
+	}
 	if err := g.Start(ctx); err != nil {
 		if errors.Is(err, gateway.ErrAddrInUse) {
 			fmt.Fprintf(stderr,

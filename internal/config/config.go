@@ -222,6 +222,25 @@ type Config struct {
 	// works without this flag; only the back-pressure response is gated.
 	AutoBackoffEnabled bool
 
+	// GovernorEnabled turns on the GPU-pressure governor: adaptive admission
+	// concurrency that reserves GPU headroom for the macOS display compositor
+	// (WindowServer) while a screen is being driven, preventing sustained
+	// inference from starving it into a kernel-watchdog panic. Default true;
+	// it is a no-op on headless hosts (full throughput) so server users are
+	// unaffected.
+	GovernorEnabled bool
+
+	// GPUConcurrencyMax is the admission ceiling when the host is headless or
+	// the display is asleep — full throughput.
+	GPUConcurrencyMax int
+
+	// GPUConcurrencyDisplayActive is the reduced ceiling while a display is
+	// being driven, reserving GPU headroom for the compositor.
+	GPUConcurrencyDisplayActive int
+
+	// GovernorIntervalMS is how often the governor re-reads host pressure.
+	GovernorIntervalMS int
+
 	// TelemetryEnabled is opt-in. Wired in v0.2 once the consent screen ships.
 	TelemetryEnabled bool
 
@@ -266,6 +285,11 @@ func Default() (Config, error) {
 		RerankBatchSize:    0, // 0 = use llama.cpp's 512-token internal default
 		RerankMetalNCB:     0, // 0 = inherit MetalNCB
 		AutoBackoffEnabled: false,
+
+		GovernorEnabled:             true,
+		GPUConcurrencyMax:           6,
+		GPUConcurrencyDisplayActive: 2,
+		GovernorIntervalMS:          3000,
 	}, nil
 }
 
@@ -305,6 +329,10 @@ func Load() (Config, error) {
 	cfg.RerankBatchSize = envIntOr("QUENCHFORGE_RERANK_BATCH_SIZE", cfg.RerankBatchSize)
 	cfg.RerankMetalNCB = envIntOr("QUENCHFORGE_RERANK_METAL_N_CB", cfg.RerankMetalNCB)
 	cfg.AutoBackoffEnabled = envBoolOr("QUENCHFORGE_AUTO_BACKOFF", cfg.AutoBackoffEnabled)
+	cfg.GovernorEnabled = envBoolOr("QUENCHFORGE_GOVERNOR", cfg.GovernorEnabled)
+	cfg.GPUConcurrencyMax = envIntOr("QUENCHFORGE_GPU_CONCURRENCY_MAX", cfg.GPUConcurrencyMax)
+	cfg.GPUConcurrencyDisplayActive = envIntOr("QUENCHFORGE_GPU_CONCURRENCY_DISPLAY_ACTIVE", cfg.GPUConcurrencyDisplayActive)
+	cfg.GovernorIntervalMS = envIntOr("QUENCHFORGE_GOVERNOR_INTERVAL_MS", cfg.GovernorIntervalMS)
 	cfg.TelemetryEnabled = envBoolOr("QUENCHFORGE_TELEMETRY", false)
 	cfg.AdvertiseMDNS = envBoolOr("QUENCHFORGE_ADVERTISE_MDNS", false)
 

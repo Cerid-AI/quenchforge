@@ -47,6 +47,7 @@ import (
 	"time"
 
 	"github.com/cerid-ai/quenchforge/internal/config"
+	"github.com/cerid-ai/quenchforge/internal/scheduler"
 )
 
 // SlotKind enumerates the slot types the gateway can route to. Adding a
@@ -88,6 +89,10 @@ type Gateway struct {
 	upstreams map[SlotKind]upstreamEntry
 	version   string
 	latency   *latencyTracker
+	// sched, when non-nil, gates GPU-bound routes through the admission
+	// scheduler so the pressure governor's concurrency ceiling reserves GPU
+	// headroom for the display compositor. nil → routes run ungated.
+	sched *scheduler.Scheduler
 }
 
 // New returns a Gateway bound to cfg. The server is not yet listening;
@@ -107,6 +112,62 @@ func (g *Gateway) SetVersion(v string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.version = v
+}
+
+// SetScheduler installs the admission scheduler used to gate GPU-bound
+// routes. Pass nil (the default) to leave routes ungated. The pressure
+// governor adjusts the scheduler's concurrency ceiling over time.
+func (g *Gateway) SetScheduler(s *scheduler.Scheduler) {
+	g.mu.Lock()
+	g.sched = s
+	g.mu.Unlock()
+}
+
+// priorityForKind maps a slot kind to its scheduler priority so streaming
+// chat is admitted ahead of batch embed/rerank when GPU headroom is scarce.
+func priorityForKind(kind SlotKind) scheduler.Priority {
+	switch kind {
+	case KindChat:
+		return scheduler.PriorityChat
+	case KindEmbed, KindCodeEmbed:
+		return scheduler.PriorityEmbed
+	case KindRerank:
+		return scheduler.PriorityRerank
+	default: // whisper, imagegen, tts
+		return scheduler.PriorityBackground
+	}
+}
+
+// gated wraps a GPU-bound handler with the admission scheduler. It is the
+// single chokepoint covering BOTH forward paths — the reverse-proxy handlers
+// AND the Ollama-translation handlers (which forward via their own
+// http.Client) — so the governor's ceiling applies to all GPU traffic.
+// Non-GPU routes (/, /health, /api/tags, /api/pull) are never wrapped. When
+// no scheduler is installed the handler runs unchanged (zero overhead).
+//
+// Acquire blocks on the request's context, so a client that gives up (or
+// times out) frees its place in line; if that happens before admission we
+// return 503 + Retry-After so callers get structured backpressure instead of
+// a hang.
+func (g *Gateway) gated(kind SlotKind, h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		g.mu.RLock()
+		sched := g.sched
+		g.mu.RUnlock()
+		if sched == nil {
+			h(w, r)
+			return
+		}
+		release, err := sched.Acquire(r.Context(), priorityForKind(kind))
+		if err != nil {
+			w.Header().Set("Retry-After", "1")
+			writeJSONError(w, http.StatusServiceUnavailable,
+				fmt.Sprintf("%s slot saturated under GPU pressure; retry shortly", kind))
+			return
+		}
+		defer release()
+		h(w, r)
+	}
 }
 
 // SetUpstream points the proxy for the given slot kind at a URL. Passing an
@@ -160,39 +221,39 @@ func (g *Gateway) Start(ctx context.Context) error {
 	// handlers in ollama_translate.go so Ollama clients work end-to-end.
 	// /v1/chat/completions is OpenAI-native and goes through the simple
 	// reverse-proxy path unchanged.
-	mux.HandleFunc("/api/chat", g.handleOllamaChat(false))
-	mux.HandleFunc("/api/generate", g.handleOllamaChat(true))
-	mux.HandleFunc("/v1/chat/completions", g.proxyHandler(KindChat, ""))
+	mux.HandleFunc("/api/chat", g.gated(KindChat, g.handleOllamaChat(false)))
+	mux.HandleFunc("/api/generate", g.gated(KindChat, g.handleOllamaChat(true)))
+	mux.HandleFunc("/v1/chat/completions", g.gated(KindChat, g.proxyHandler(KindChat, "")))
 	// embeddings (Ollama + OpenAI surfaces).  Same translation story:
 	// /api/embeddings and /api/embed are Ollama wire, translated to
 	// /v1/embeddings on the upstream embed slot; /v1/embeddings is
 	// pass-through.
-	mux.HandleFunc("/api/embeddings", g.handleOllamaEmbeddings())
-	mux.HandleFunc("/api/embed", g.handleOllamaEmbeddings())
-	mux.HandleFunc("/v1/embeddings", g.handleOpenAIEmbeddings())
+	mux.HandleFunc("/api/embeddings", g.gated(KindEmbed, g.handleOllamaEmbeddings()))
+	mux.HandleFunc("/api/embed", g.gated(KindEmbed, g.handleOllamaEmbeddings()))
+	mux.HandleFunc("/v1/embeddings", g.gated(KindEmbed, g.handleOpenAIEmbeddings()))
 	// rerank (OpenAI-style /v1/rerank; llama-server speaks its own /rerank
 	// when launched with --reranking; we route both to the same slot).
-	mux.HandleFunc("/v1/rerank", g.proxyHandler(KindRerank, "/rerank"))
-	mux.HandleFunc("/rerank", g.proxyHandler(KindRerank, ""))
+	mux.HandleFunc("/v1/rerank", g.gated(KindRerank, g.proxyHandler(KindRerank, "/rerank")))
+	mux.HandleFunc("/rerank", g.gated(KindRerank, g.proxyHandler(KindRerank, "")))
 	// whisper audio transcription. OpenAI's /v1/audio/transcriptions and
 	// whisper.cpp's /inference take the same multipart shape but on
 	// different paths — rewrite the OpenAI path to /inference on the way
 	// through. /v1/audio/translations same surface (English-only output).
-	mux.HandleFunc("/v1/audio/transcriptions", g.proxyHandler(KindWhisper, "/inference"))
-	mux.HandleFunc("/v1/audio/translations", g.proxyHandler(KindWhisper, "/inference"))
-	mux.HandleFunc("/inference", g.proxyHandler(KindWhisper, "")) // whisper-native path
+	mux.HandleFunc("/v1/audio/transcriptions", g.gated(KindWhisper, g.proxyHandler(KindWhisper, "/inference")))
+	mux.HandleFunc("/v1/audio/translations", g.gated(KindWhisper, g.proxyHandler(KindWhisper, "/inference")))
+	mux.HandleFunc("/inference", g.gated(KindWhisper, g.proxyHandler(KindWhisper, ""))) // whisper-native path
 	// image generation — sd-server speaks OpenAI's /v1/images/generations
 	// natively, so no path rewrite needed.
-	mux.HandleFunc("/v1/images/generations", g.proxyHandler(KindImageGen, ""))
+	mux.HandleFunc("/v1/images/generations", g.gated(KindImageGen, g.proxyHandler(KindImageGen, "")))
 	// stable-diffusion.cpp also exposes its own SD-API surface; expose
 	// /sdapi/ unchanged for clients that prefer the AUTOMATIC1111-style API.
-	mux.HandleFunc("/sdapi/v1/txt2img", g.proxyHandler(KindImageGen, ""))
-	mux.HandleFunc("/sdapi/v1/img2img", g.proxyHandler(KindImageGen, ""))
+	mux.HandleFunc("/sdapi/v1/txt2img", g.gated(KindImageGen, g.proxyHandler(KindImageGen, "")))
+	mux.HandleFunc("/sdapi/v1/img2img", g.gated(KindImageGen, g.proxyHandler(KindImageGen, "")))
 	// text-to-speech (bark.cpp server). Its native route is /tts (returns
 	// audio/wav); OpenAI's /v1/audio/speech POSTs JSON { input, voice, ... }.
 	// We pass-through; client format-translation is a v0.4 concern.
-	mux.HandleFunc("/v1/audio/speech", g.proxyHandler(KindTTS, "/tts"))
-	mux.HandleFunc("/tts", g.proxyHandler(KindTTS, ""))
+	mux.HandleFunc("/v1/audio/speech", g.gated(KindTTS, g.proxyHandler(KindTTS, "/tts")))
+	mux.HandleFunc("/tts", g.gated(KindTTS, g.proxyHandler(KindTTS, "")))
 	// pull (stub — points users at migrate-from-ollama)
 	mux.HandleFunc("/api/pull", g.handlePull)
 
@@ -325,11 +386,24 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 			overall = StatusDegraded
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"status":               string(overall),
 		"slots":                slots,
 		"auto_backoff_enabled": g.cfg.AutoBackoffEnabled,
-	})
+	}
+	g.mu.RLock()
+	sched := g.sched
+	g.mu.RUnlock()
+	if sched != nil {
+		// Live governor state — lets operators watch the admission ceiling
+		// drop while a display is being driven and recover when it sleeps.
+		resp["governor"] = map[string]any{
+			"concurrency": sched.Concurrency(),
+			"active":      sched.Active(),
+			"pending":     sched.Pending(),
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (g *Gateway) handleTags(w http.ResponseWriter, _ *http.Request) {

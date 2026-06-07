@@ -143,6 +143,30 @@ func (s *Scheduler) release() {
 	s.mu.Unlock()
 }
 
+// SetConcurrency adjusts the admission ceiling at runtime. The pressure
+// governor calls this to reserve GPU headroom for the macOS display
+// compositor when a screen is being driven, and to restore full throughput
+// when the host is headless or the display is asleep. n is clamped to >= 1.
+// Raising the ceiling immediately admits any pending requests that now fit;
+// lowering it never evicts in-flight work — the new ceiling takes effect as
+// active workloads drain.
+func (s *Scheduler) SetConcurrency(n int) {
+	if n < 1 {
+		n = 1
+	}
+	s.mu.Lock()
+	s.concurrency = n
+	s.maybeAdmitLocked()
+	s.mu.Unlock()
+}
+
+// Concurrency reports the current admission ceiling.
+func (s *Scheduler) Concurrency() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.concurrency
+}
+
 // Active reports how many workloads are in-flight right now.
 func (s *Scheduler) Active() int {
 	s.mu.Lock()
