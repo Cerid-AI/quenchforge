@@ -1,4 +1,4 @@
-From 39db7657d40f1faaa827786af675decfe344450e Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Quenchforge Contributors <maintainers@cerid-ai.com>
 Date: Mon, 25 May 2026 16:40:29 -0400
 Subject: [PATCH] metal: pool transient staging buffers on AMD discrete
@@ -8,7 +8,7 @@ Subject: [PATCH] metal: pool transient staging buffers on AMD discrete
  1 file changed, 145 insertions(+), 22 deletions(-)
 
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
-index 851c240..4529784 100644
+index 79d963fc6..f8a98417d 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.m
 +++ b/ggml/src/ggml-metal/ggml-metal-device.m
 @@ -25,6 +25,99 @@
@@ -111,7 +111,7 @@ index 851c240..4529784 100644
  #if !GGML_METAL_EMBED_LIBRARY
  // Here to assist with NSBundle Path Hack
  @interface GGMLMetalClass : NSObject
-@@ -1669,12 +1762,27 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor *
+@@ -1719,12 +1812,27 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor *
      }
  
      @autoreleasepool {
@@ -142,7 +142,7 @@ index 851c240..4529784 100644
  
          GGML_ASSERT(buf_src);
  
-@@ -1682,10 +1790,6 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor *
+@@ -1732,10 +1840,6 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor *
          struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(buf, tensor);
          bid_dst.offs += offset;
  
@@ -153,7 +153,7 @@ index 851c240..4529784 100644
          id<MTLCommandBuffer> cmd_buf = [buf->dev->mtl_queue commandBufferWithUnretainedReferences];
  
          {
-@@ -1700,19 +1804,19 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor *
+@@ -1750,19 +1854,19 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor *
              [encoder endEncoding];
          }
  
@@ -183,7 +183,7 @@ index 851c240..4529784 100644
      }
  }
  
-@@ -1727,11 +1831,23 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
+@@ -1777,11 +1881,23 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
          struct ggml_metal_buffer_id bid_src = ggml_metal_buffer_get_id(buf, tensor);
          bid_src.offs += offset;
  
@@ -212,7 +212,7 @@ index 851c240..4529784 100644
  
          GGML_ASSERT(buf_dst);
  
-@@ -1751,6 +1867,13 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
+@@ -1801,6 +1917,13 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
  
          [cmd_buf commit];
          [cmd_buf waitUntilCompleted];
@@ -227,5 +227,5 @@ index 851c240..4529784 100644
  }
  
 -- 
-2.50.1 (Apple Git-155)
+2.54.0
 

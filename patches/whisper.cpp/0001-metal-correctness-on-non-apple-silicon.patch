@@ -23,10 +23,10 @@ Signed-off-by: Quenchforge Contributors <maintainers@cerid-ai.com>
  1 file changed, 15 insertions(+), 4 deletions(-)
 
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
-index fe90aaf..6f3600e 100644
+index 885344ec6..1554dab0a 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.m
 +++ b/ggml/src/ggml-metal/ggml-metal-device.m
-@@ -644,14 +644,25 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
+@@ -689,14 +689,25 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
              dev->addr_virt = 0x000000400ULL;
  
              dev->props.device = device;
@@ -57,5 +57,5 @@ index fe90aaf..6f3600e 100644
                  dev->props.has_bfloat = false;
              }
 -- 
-2.50.1 (Apple Git-155)
+2.54.0
 
