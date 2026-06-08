@@ -135,6 +135,12 @@ type Config struct {
 	// EmbedPort is where the supervised embed slot binds. Default 11501.
 	EmbedPort int
 
+	// EmbedCPUPort is where the *CPU* embed instance binds when the embed
+	// kind is placed in "auto" mode (dual-placed). Default 11511. Only used
+	// when PlaceEmbed == "auto"; otherwise no CPU instance is launched and
+	// this port stays free.
+	EmbedCPUPort int
+
 	// CodeEmbedModel is the GGUF the *code-tuned* embedding slot loads.
 	// Empty means no code-embed slot is started; embed requests for any
 	// model name route to the regular embed slot. When set, the gateway
@@ -147,6 +153,11 @@ type Config struct {
 	// CodeEmbedPort is where the supervised code-embed slot binds.
 	// Default 11506 — 11503-11505 are reserved for whisper/sd/bark.
 	CodeEmbedPort int
+
+	// CodeEmbedCPUPort is where the *CPU* code-embed instance binds when the
+	// code-embed kind is placed in "auto" mode (dual-placed). Default 11516.
+	// Only used when PlaceCodeEmbed == "auto".
+	CodeEmbedCPUPort int
 
 	// RerankModel is the GGUF reranker model. Empty disables /v1/rerank.
 	RerankModel string
@@ -262,6 +273,14 @@ type Config struct {
 	PlaceCodeEmbed string
 	PlaceRerank    string
 
+	// AutoBatchThreshold is the input-count boundary the gateway uses to
+	// route "auto"-placed embedding requests: a request whose input count is
+	// > threshold (bulk/throughput) routes to the GPU instance; <= threshold
+	// (single/small, latency-bound) routes to the CPU instance. Default 1, so
+	// single-input requests go CPU and any batch goes GPU. Treated as 1 when
+	// below 1.
+	AutoBatchThreshold int
+
 	// TelemetryEnabled is opt-in. Wired in v0.2 once the consent screen ships.
 	TelemetryEnabled bool
 
@@ -288,8 +307,10 @@ func Default() (Config, error) {
 		ChatPort:           11500,
 		EmbedModel:         "", // opt-in
 		EmbedPort:          11501,
+		EmbedCPUPort:       11511,
 		CodeEmbedModel:     "", // opt-in
 		CodeEmbedPort:      11506,
+		CodeEmbedCPUPort:   11516,
 		RerankModel:        "", // opt-in
 		RerankPort:         11502,
 		WhisperModel:       "", // opt-in
@@ -313,6 +334,8 @@ func Default() (Config, error) {
 		GPUDutyCycleDisplayActive:   0.5,
 		GovernorMaxCooldownMS:       250,
 		GovernorIntervalMS:          3000,
+
+		AutoBatchThreshold: 1,
 	}, nil
 }
 
@@ -334,8 +357,10 @@ func Load() (Config, error) {
 	cfg.ChatPort = envIntOr("QUENCHFORGE_CHAT_PORT", cfg.ChatPort)
 	cfg.EmbedModel = envOr("QUENCHFORGE_EMBED_MODEL", cfg.EmbedModel)
 	cfg.EmbedPort = envIntOr("QUENCHFORGE_EMBED_PORT", cfg.EmbedPort)
+	cfg.EmbedCPUPort = envIntOr("QUENCHFORGE_EMBED_CPU_PORT", cfg.EmbedCPUPort)
 	cfg.CodeEmbedModel = envOr("QUENCHFORGE_CODE_EMBED_MODEL", cfg.CodeEmbedModel)
 	cfg.CodeEmbedPort = envIntOr("QUENCHFORGE_CODE_EMBED_PORT", cfg.CodeEmbedPort)
+	cfg.CodeEmbedCPUPort = envIntOr("QUENCHFORGE_CODE_EMBED_CPU_PORT", cfg.CodeEmbedCPUPort)
 	cfg.RerankModel = envOr("QUENCHFORGE_RERANK_MODEL", cfg.RerankModel)
 	cfg.RerankPort = envIntOr("QUENCHFORGE_RERANK_PORT", cfg.RerankPort)
 	cfg.WhisperModel = envOr("QUENCHFORGE_WHISPER_MODEL", cfg.WhisperModel)
@@ -362,6 +387,7 @@ func Load() (Config, error) {
 	cfg.PlaceEmbed = envOr("QUENCHFORGE_PLACE_EMBED", cfg.PlaceEmbed)
 	cfg.PlaceCodeEmbed = envOr("QUENCHFORGE_PLACE_CODE_EMBED", cfg.PlaceCodeEmbed)
 	cfg.PlaceRerank = envOr("QUENCHFORGE_PLACE_RERANK", cfg.PlaceRerank)
+	cfg.AutoBatchThreshold = envIntOr("QUENCHFORGE_AUTO_BATCH_THRESHOLD", cfg.AutoBatchThreshold)
 	cfg.TelemetryEnabled = envBoolOr("QUENCHFORGE_TELEMETRY", false)
 	cfg.AdvertiseMDNS = envBoolOr("QUENCHFORGE_ADVERTISE_MDNS", false)
 
@@ -409,7 +435,9 @@ func (c Config) Validate() error {
 		name string
 		v    int
 	}{
+		{"EmbedCPUPort", c.EmbedCPUPort},
 		{"CodeEmbedPort", c.CodeEmbedPort},
+		{"CodeEmbedCPUPort", c.CodeEmbedCPUPort},
 		{"RerankPort", c.RerankPort},
 		{"WhisperPort", c.WhisperPort},
 		{"SDPort", c.SDPort},
@@ -421,13 +449,15 @@ func (c Config) Validate() error {
 	}
 	// No two slot ports can collide.
 	ports := map[string]int{
-		"ChatPort":      c.ChatPort,
-		"EmbedPort":     c.EmbedPort,
-		"CodeEmbedPort": c.CodeEmbedPort,
-		"RerankPort":    c.RerankPort,
-		"WhisperPort":   c.WhisperPort,
-		"SDPort":        c.SDPort,
-		"BarkPort":      c.BarkPort,
+		"ChatPort":         c.ChatPort,
+		"EmbedPort":        c.EmbedPort,
+		"EmbedCPUPort":     c.EmbedCPUPort,
+		"CodeEmbedPort":    c.CodeEmbedPort,
+		"CodeEmbedCPUPort": c.CodeEmbedCPUPort,
+		"RerankPort":       c.RerankPort,
+		"WhisperPort":      c.WhisperPort,
+		"SDPort":           c.SDPort,
+		"BarkPort":         c.BarkPort,
 	}
 	seen := map[int]string{}
 	for name, p := range ports {

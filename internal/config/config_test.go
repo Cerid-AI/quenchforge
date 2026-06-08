@@ -58,17 +58,19 @@ func TestValidateRejectsBadConfigs(t *testing.T) {
 	// each case isolates the field under test.
 	base := func() Config {
 		return Config{
-			ListenAddr:    "127.0.0.1:11434",
-			ModelsDir:     "/tmp/m",
-			MaxContext:    8192,
-			MetalNCB:      2,
-			ChatPort:      11500,
-			EmbedPort:     11501,
-			RerankPort:    11502,
-			WhisperPort:   11503,
-			SDPort:        11504,
-			BarkPort:      11505,
-			CodeEmbedPort: 11506,
+			ListenAddr:       "127.0.0.1:11434",
+			ModelsDir:        "/tmp/m",
+			MaxContext:       8192,
+			MetalNCB:         2,
+			ChatPort:         11500,
+			EmbedPort:        11501,
+			RerankPort:       11502,
+			WhisperPort:      11503,
+			SDPort:           11504,
+			BarkPort:         11505,
+			CodeEmbedPort:    11506,
+			EmbedCPUPort:     11511,
+			CodeEmbedCPUPort: 11516,
 		}
 	}
 	cases := []struct {
@@ -87,6 +89,9 @@ func TestValidateRejectsBadConfigs(t *testing.T) {
 		{"rerank port 0", func(c *Config) { c.RerankPort = 0 }, "RerankPort"},
 		{"whisper port 0", func(c *Config) { c.WhisperPort = 0 }, "WhisperPort"},
 		{"code-embed port 0", func(c *Config) { c.CodeEmbedPort = 0 }, "CodeEmbedPort"},
+		{"embed-cpu port 0", func(c *Config) { c.EmbedCPUPort = 0 }, "EmbedCPUPort"},
+		{"code-embed-cpu port 0", func(c *Config) { c.CodeEmbedCPUPort = 0 }, "CodeEmbedCPUPort"},
+		{"same embed embed-cpu port", func(c *Config) { c.EmbedCPUPort = c.EmbedPort }, "must differ"},
 		{"same chat embed port", func(c *Config) { c.EmbedPort = c.ChatPort }, "must differ"},
 		{"same chat rerank port", func(c *Config) { c.RerankPort = c.ChatPort }, "must differ"},
 		{"same embed whisper port", func(c *Config) { c.WhisperPort = c.EmbedPort }, "must differ"},

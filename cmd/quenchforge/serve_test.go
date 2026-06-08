@@ -259,7 +259,8 @@ func TestSlotEnv_ChatKeepsGlobalNCB(t *testing.T) {
 // kind (chat, embed, code-embed, rerank). Required to disable the upstream
 // MTLDispatchTypeConcurrent path that's unreliable on non-UMA Metal.
 func TestSlotEnv_AMDIncludesConcurrencyDisable(t *testing.T) {
-	cfg := config.Config{PlaceChat: "gpu"} // chat default is now CPU; force GPU to test its Metal env
+	// chat + rerank default to CPU now; force both to GPU to test their Metal env.
+	cfg := config.Config{PlaceChat: "gpu", PlaceRerank: "gpu"}
 	hwInfo := hardware.Info{Profile: hardware.ProfileVegaPro}
 
 	for _, kind := range []gateway.SlotKind{

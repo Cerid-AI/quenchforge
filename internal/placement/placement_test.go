@@ -16,10 +16,14 @@ func TestDevice(t *testing.T) {
 
 func TestAMDDefaults(t *testing.T) {
 	p := NewPolicy(true, nil)
-	if p.Device(KindChat) != CPU {
-		t.Errorf("AMD chat should default to CPU, got %v", p.Device(KindChat))
+	// chat + rerank are latency / single-request bound — CPU beats the AMD
+	// Metal path on both. embed + code-embed are batched-throughput — GPU.
+	for _, k := range []string{KindChat, KindRerank} {
+		if p.Device(k) != CPU {
+			t.Errorf("AMD %s should default to CPU, got %v", k, p.Device(k))
+		}
 	}
-	for _, k := range []string{KindEmbed, KindCodeEmbed, KindRerank} {
+	for _, k := range []string{KindEmbed, KindCodeEmbed} {
 		if p.Device(k) != GPU {
 			t.Errorf("AMD %s should default to GPU, got %v", k, p.Device(k))
 		}
@@ -43,8 +47,8 @@ func TestOverrides(t *testing.T) {
 	if p.Device(KindChat) != GPU {
 		t.Errorf("chat override to gpu (case-insensitive) failed: %v", p.Device(KindChat))
 	}
-	if p.Device(KindRerank) != GPU {
-		t.Errorf("invalid rerank override should be ignored (AMD default GPU): %v", p.Device(KindRerank))
+	if p.Device(KindRerank) != CPU {
+		t.Errorf("invalid rerank override should be ignored (AMD default CPU): %v", p.Device(KindRerank))
 	}
 	if p.Device(KindCodeEmbed) != GPU {
 		t.Errorf("empty code-embed override should be ignored: %v", p.Device(KindCodeEmbed))

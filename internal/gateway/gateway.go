@@ -47,6 +47,7 @@ import (
 	"time"
 
 	"github.com/cerid-ai/quenchforge/internal/config"
+	"github.com/cerid-ai/quenchforge/internal/placement"
 	"github.com/cerid-ai/quenchforge/internal/scheduler"
 )
 
@@ -87,22 +88,34 @@ type Gateway struct {
 	mu        sync.RWMutex
 	server    *http.Server
 	upstreams map[SlotKind]upstreamEntry
-	version   string
-	latency   *latencyTracker
+	// cpuUpstreams holds the CPU instance of a dual-placed ("auto") kind. Only
+	// embedding kinds populate it today, via SetCPUUpstream; routeEmbed sends a
+	// single/small request here when the placement policy routes it to the CPU.
+	cpuUpstreams map[SlotKind]upstreamEntry
+	version      string
+	latency      *latencyTracker
 	// sched, when non-nil, gates GPU-bound routes through the admission
 	// scheduler so the pressure governor's concurrency ceiling reserves GPU
 	// headroom for the display compositor. nil → routes run ungated.
 	sched *scheduler.Scheduler
+	// policy is the device-placement policy. The zero value reports every kind
+	// as "gpu" (Mode default), so until SetPlacement is called the gateway
+	// behaves exactly as it did before placement awareness: all kinds GPU-bound
+	// and governed. autoThreshold is the input-count boundary routeEmbed uses
+	// for "auto"-placed kinds.
+	policy        placement.Policy
+	autoThreshold int
 }
 
 // New returns a Gateway bound to cfg. The server is not yet listening;
 // call Start to bind and serve.
 func New(cfg config.Config) *Gateway {
 	return &Gateway{
-		cfg:       cfg,
-		version:   "0.0.0-dev",
-		upstreams: make(map[SlotKind]upstreamEntry),
-		latency:   newLatencyTracker(),
+		cfg:          cfg,
+		version:      "0.0.0-dev",
+		upstreams:    make(map[SlotKind]upstreamEntry),
+		cpuUpstreams: make(map[SlotKind]upstreamEntry),
+		latency:      newLatencyTracker(),
 	}
 }
 
@@ -151,38 +164,66 @@ func priorityForKind(kind SlotKind) scheduler.Priority {
 // a hang.
 func (g *Gateway) gated(kind SlotKind, h http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		g.mu.RLock()
-		sched := g.sched
-		g.mu.RUnlock()
-		if sched == nil {
+		// CPU-placed kinds (chat / rerank on AMD-discrete, anything an operator
+		// pins to "cpu") don't contend with the display compositor for the GPU,
+		// so they skip admission entirely and run at full speed. Until
+		// SetPlacement is called the zero-value policy reports every kind as GPU,
+		// preserving the pre-placement behaviour (all routes governed).
+		if g.placementDevice(kind) == placement.CPU {
 			h(w, r)
 			return
 		}
-		release, err := sched.Acquire(r.Context(), priorityForKind(kind))
-		if err != nil {
-			w.Header().Set("Retry-After", "1")
-			writeJSONError(w, http.StatusServiceUnavailable,
-				fmt.Sprintf("%s slot saturated under GPU pressure; retry shortly", kind))
-			return
+		g.withGPUAdmission(kind, w, r, func() { h(w, r) })
+	}
+}
+
+// withGPUAdmission runs serve under the GPU admission scheduler: it acquires a
+// slot (503 + Retry-After if the request's context expires while waiting),
+// runs serve, then holds the slot idle for the duty-cycle cooldown before
+// releasing so the GPU yields a window to the display compositor. When no
+// scheduler is installed, serve runs unchanged (zero overhead). This is the
+// single chokepoint for all GPU traffic — reverse-proxy routes via gated, and
+// the per-request embedding routers call it directly for their GPU branch.
+func (g *Gateway) withGPUAdmission(kind SlotKind, w http.ResponseWriter, r *http.Request, serve func()) {
+	g.mu.RLock()
+	sched := g.sched
+	g.mu.RUnlock()
+	if sched == nil {
+		serve()
+		return
+	}
+	release, err := sched.Acquire(r.Context(), priorityForKind(kind))
+	if err != nil {
+		w.Header().Set("Retry-After", "1")
+		writeJSONError(w, http.StatusServiceUnavailable,
+			fmt.Sprintf("%s slot saturated under GPU pressure; retry shortly", kind))
+		return
+	}
+	defer release()
+	start := time.Now()
+	serve()
+	// Duty-cycle cooldown: after the response is sent, keep holding the slot
+	// idle for a span proportional to the GPU time this request just used,
+	// so the GPU yields a window to the display compositor before the next
+	// admission. This temporal gap — not concurrency capping — is what
+	// prevents sustained gapless inference from starving WindowServer.
+	if d := sched.DutyCycle(); d < 1.0 {
+		idle := time.Duration(float64(time.Since(start)) * (1.0 - d) / d)
+		if m := g.maxCooldown(); idle > m {
+			idle = m
 		}
-		defer release()
-		start := time.Now()
-		h(w, r)
-		// Duty-cycle cooldown: after the response is sent, keep holding the slot
-		// idle for a span proportional to the GPU time this request just used,
-		// so the GPU yields a window to the display compositor before the next
-		// admission. This temporal gap — not concurrency capping — is what
-		// prevents sustained gapless inference from starving WindowServer.
-		if d := sched.DutyCycle(); d < 1.0 {
-			idle := time.Duration(float64(time.Since(start)) * (1.0 - d) / d)
-			if m := g.maxCooldown(); idle > m {
-				idle = m
-			}
-			if idle > 0 {
-				time.Sleep(idle)
-			}
+		if idle > 0 {
+			time.Sleep(idle)
 		}
 	}
+}
+
+// placementDevice reports the device the placement policy assigns to a kind.
+// The zero-value policy returns GPU for everything (see Gateway.policy).
+func (g *Gateway) placementDevice(kind SlotKind) placement.Device {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.policy.Device(string(kind))
 }
 
 // maxCooldown caps the per-request duty-cycle idle hold so a single long
@@ -223,6 +264,107 @@ func (g *Gateway) SetUpstream(kind SlotKind, raw string) error {
 	return nil
 }
 
+// SetCPUUpstream points the CPU instance of a dual-placed ("auto") kind at a
+// URL. Mirrors SetUpstream but stores into cpuUpstreams; routeEmbed forwards a
+// single/small request here when the policy routes it to the CPU. Passing an
+// empty raw URL clears the entry (routeEmbed then falls back to the GPU
+// upstream for that kind).
+func (g *Gateway) SetCPUUpstream(kind SlotKind, raw string) error {
+	if raw == "" {
+		g.mu.Lock()
+		delete(g.cpuUpstreams, kind)
+		g.mu.Unlock()
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("gateway: parse %s cpu upstream %q: %w", kind, raw, err)
+	}
+	proxy := httputil.NewSingleHostReverseProxy(u)
+	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		writeJSONError(w, http.StatusBadGateway,
+			fmt.Sprintf("%s cpu upstream %s unreachable: %v", kind, u.Host, err))
+	}
+	g.mu.Lock()
+	g.cpuUpstreams[kind] = upstreamEntry{url: u, proxy: proxy}
+	g.mu.Unlock()
+	return nil
+}
+
+// SetPlacement installs the device-placement policy and the auto-routing batch
+// threshold. Called once at startup after the host profile is known. Before
+// this call the gateway's zero-value policy treats every kind as GPU-bound, so
+// placement awareness is dormant (no behaviour change) until it is wired.
+func (g *Gateway) SetPlacement(p placement.Policy, threshold int) {
+	g.mu.Lock()
+	g.policy = p
+	g.autoThreshold = threshold
+	g.mu.Unlock()
+}
+
+// routeEmbed picks the upstream for one embedding request given the kind's
+// placement mode and the request's input count:
+//
+//   - "cpu"  : always the (single) upstream registered for the kind, ungoverned.
+//   - "gpu"  : always the kind's upstream, GPU-governed.
+//   - "auto" : RouteRequest decides by batch shape. A CPU verdict routes to the
+//     registered CPU instance when one exists; otherwise it falls back to the
+//     GPU upstream so a missing CPU slot degrades to working-but-on-GPU rather
+//     than 503. A GPU verdict always uses the GPU upstream.
+//
+// onGPU reports whether the chosen instance needs GPU admission; ok is false
+// when the chosen upstream has no proxy (slot not configured) so the caller can
+// return 503. The zero-value policy reports "gpu", so the default is the GPU
+// upstream — identical to the pre-placement single-upstream path.
+func (g *Gateway) routeEmbed(kind SlotKind, batchN int) (entry upstreamEntry, onGPU bool, ok bool) {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	switch g.policy.Mode(string(kind)) {
+	case placement.ModeCPU:
+		entry = g.upstreams[kind]
+		onGPU = false
+	case placement.ModeAuto:
+		if g.policy.RouteRequest(string(kind), batchN, g.autoThreshold) == placement.CPU {
+			if e, exists := g.cpuUpstreams[kind]; exists && e.proxy != nil {
+				return e, false, true
+			}
+		}
+		entry = g.upstreams[kind]
+		onGPU = true
+	default: // ModeGPU and any unknown mode
+		entry = g.upstreams[kind]
+		onGPU = true
+	}
+	ok = entry.proxy != nil
+	return entry, onGPU, ok
+}
+
+// countEmbedInputs returns the number of inputs in an embedding request, used
+// by routeEmbed to classify single-vs-batch under "auto" placement. An []string
+// or []interface{} counts by length; a non-empty string counts as 1; an empty
+// or absent input falls back to the prompt. The result is clamped to a minimum
+// of 1 so a malformed body still routes deterministically (upstream rejects it).
+func countEmbedInputs(input interface{}, prompt string) int {
+	switch x := input.(type) {
+	case []interface{}:
+		if len(x) > 0 {
+			return len(x)
+		}
+	case []string:
+		if len(x) > 0 {
+			return len(x)
+		}
+	case string:
+		if x != "" {
+			return 1
+		}
+	}
+	if prompt != "" {
+		return 1
+	}
+	return 1
+}
+
 // Start binds the listener and begins serving. The call returns once the
 // listener is ready; Serve runs in a goroutine. Use Stop to shut down.
 //
@@ -255,9 +397,14 @@ func (g *Gateway) Start(ctx context.Context) error {
 	// /api/embeddings and /api/embed are Ollama wire, translated to
 	// /v1/embeddings on the upstream embed slot; /v1/embeddings is
 	// pass-through.
-	mux.HandleFunc("/api/embeddings", g.gated(KindEmbed, g.handleOllamaEmbeddings()))
-	mux.HandleFunc("/api/embed", g.gated(KindEmbed, g.handleOllamaEmbeddings()))
-	mux.HandleFunc("/v1/embeddings", g.gated(KindEmbed, g.handleOpenAIEmbeddings()))
+	// Embeddings self-admit: the handlers route per request (resolving the
+	// embed kind and, under "auto" placement, the GPU/CPU instance) and apply
+	// GPU admission only to the GPU branch — so a CPU-routed embed runs
+	// ungoverned. Wrapping them in gated(KindEmbed, …) would double-admit and
+	// misclassify code-embed traffic, so the route registration is bare.
+	mux.HandleFunc("/api/embeddings", g.handleOllamaEmbeddings())
+	mux.HandleFunc("/api/embed", g.handleOllamaEmbeddings())
+	mux.HandleFunc("/v1/embeddings", g.handleOpenAIEmbeddings())
 	// rerank (OpenAI-style /v1/rerank; llama-server speaks its own /rerank
 	// when launched with --reranking; we route both to the same slot).
 	mux.HandleFunc("/v1/rerank", g.gated(KindRerank, g.proxyHandler(KindRerank, "/rerank")))
@@ -593,17 +740,18 @@ func (g *Gateway) handleOpenAIEmbeddings() http.HandlerFunc {
 				fmt.Sprintf("read request body: %v", err))
 			return
 		}
-		// Minimal probe — only `model` matters for routing; everything
-		// else passes through unchanged. We re-attach the body below.
+		// Minimal probe — `model` selects the embed kind and `input` gives the
+		// batch shape for "auto" placement routing; everything else passes
+		// through unchanged. We re-attach the body below.
 		var probe struct {
-			Model string `json:"model"`
+			Model string      `json:"model"`
+			Input interface{} `json:"input"`
 		}
 		_ = json.Unmarshal(raw, &probe) // tolerate empty/invalid bodies; let upstream reject
 		kind := g.resolveEmbedKind(probe.Model)
-		g.mu.RLock()
-		entry, ok := g.upstreams[kind]
-		g.mu.RUnlock()
-		if !ok || entry.proxy == nil {
+		batchN := countEmbedInputs(probe.Input, "")
+		entry, onGPU, ok := g.routeEmbed(kind, batchN)
+		if !ok {
 			writeJSONError(w, http.StatusServiceUnavailable,
 				fmt.Sprintf("no %s slot configured. Check `quenchforge doctor` for status.", kind))
 			return
@@ -617,7 +765,12 @@ func (g *Gateway) handleOpenAIEmbeddings() http.HandlerFunc {
 				fmt.Sprintf("%s slot is at critical latency — back off (Retry-After: 2s)", kind))
 			return
 		}
-		g.serveAndTrack(kind, entry.proxy, w, r)
+		serve := func() { g.serveAndTrack(kind, entry.proxy, w, r) }
+		if onGPU {
+			g.withGPUAdmission(kind, w, r, serve)
+		} else {
+			serve()
+		}
 	}
 }
 

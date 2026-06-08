@@ -79,7 +79,9 @@ type Policy struct {
 // overrides. amdDiscrete selects the hardware-adaptive defaults:
 //
 //   - AMD-discrete (Vega II / W6800X / RDNA1/2): chat -> CPU (latency, GPU
-//     slow); embed/code-embed/rerank -> GPU (batched throughput win).
+//     slow); embed/code-embed -> GPU (batched throughput win); rerank -> CPU
+//     (query-time, single-request, measured faster on CPU than the AMD Metal
+//     path).
 //   - everything else (Apple Silicon UMA / unknown): all GPU — the Metal
 //     path is fast and the contention class doesn't apply.
 //
@@ -92,7 +94,7 @@ func NewPolicy(amdDiscrete bool, overrides map[string]string) Policy {
 		m[KindChat] = ModeCPU
 		m[KindEmbed] = ModeGPU
 		m[KindCodeEmbed] = ModeGPU
-		m[KindRerank] = ModeGPU
+		m[KindRerank] = ModeCPU
 	} else {
 		m[KindChat] = ModeGPU
 		m[KindEmbed] = ModeGPU

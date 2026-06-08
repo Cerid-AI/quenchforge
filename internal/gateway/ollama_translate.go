@@ -344,10 +344,9 @@ func (g *Gateway) handleOllamaEmbeddings() http.HandlerFunc {
 		}
 
 		kind := g.resolveEmbedKind(req.Model)
-		g.mu.RLock()
-		entry, ok := g.upstreams[kind]
-		g.mu.RUnlock()
-		if !ok || entry.proxy == nil {
+		batchN := countEmbedInputs(req.Input, req.Prompt)
+		entry, onGPU, ok := g.routeEmbed(kind, batchN)
+		if !ok {
 			writeJSONError(w, http.StatusServiceUnavailable,
 				fmt.Sprintf("no %s slot configured. Check `quenchforge doctor` for status.", kind))
 			return
@@ -400,49 +399,61 @@ func (g *Gateway) handleOllamaEmbeddings() http.HandlerFunc {
 			return
 		}
 
-		started := time.Now()
-		resp, err := translateHTTPClient.Do(upReq)
-		if err != nil {
-			g.latency.Record(kind, time.Since(started), true)
-			writeJSONError(w, http.StatusBadGateway,
-				fmt.Sprintf("embed upstream %s unreachable: %v",
-					entry.url.Host, err))
-			return
-		}
-		defer resp.Body.Close()
-		g.latency.Record(kind, time.Since(started), resp.StatusCode >= 500)
+		// The forward + response translation runs under GPU admission only
+		// when routeEmbed picked the GPU instance; a CPU-routed embed (single
+		// request under "auto" placement, or a "cpu"-pinned kind) runs
+		// ungoverned. When no scheduler is installed withGPUAdmission is a
+		// pass-through, so the default single-upstream behaviour is unchanged.
+		serve := func() {
+			started := time.Now()
+			resp, err := translateHTTPClient.Do(upReq)
+			if err != nil {
+				g.latency.Record(kind, time.Since(started), true)
+				writeJSONError(w, http.StatusBadGateway,
+					fmt.Sprintf("embed upstream %s unreachable: %v",
+						entry.url.Host, err))
+				return
+			}
+			defer resp.Body.Close()
+			g.latency.Record(kind, time.Since(started), resp.StatusCode >= 500)
 
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
-			writeJSONError(w, resp.StatusCode,
-				extractOpenAIErrorMessage(body))
-			return
-		}
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+				writeJSONError(w, resp.StatusCode,
+					extractOpenAIErrorMessage(body))
+				return
+			}
 
-		var openaiResp openAIEmbedResponse
-		if err := json.NewDecoder(resp.Body).Decode(&openaiResp); err != nil {
-			writeJSONError(w, http.StatusBadGateway,
-				fmt.Sprintf("decode upstream embed response: %v", err))
-			return
-		}
+			var openaiResp openAIEmbedResponse
+			if err := json.NewDecoder(resp.Body).Decode(&openaiResp); err != nil {
+				writeJSONError(w, http.StatusBadGateway,
+					fmt.Sprintf("decode upstream embed response: %v", err))
+				return
+			}
 
-		// Ollama wire: legacy /api/embeddings returns {embedding: [...]},
-		// newer /api/embed returns {embeddings: [[...], ...]}. We always
-		// emit the newer shape because it works for both single and batch
-		// callers; the legacy shape is recovered by reading [0] when the
-		// request was single-input.
-		//
-		// Compatibility note: cerid's `core.utils.embeddings` only reads
-		// `embedding` (singular) on /api/embeddings calls; emit BOTH keys
-		// so legacy clients keep working without an extra round-trip.
-		out := map[string]interface{}{
-			"model":      openaiResp.Model,
-			"embeddings": extractEmbeddings(openaiResp),
+			// Ollama wire: legacy /api/embeddings returns {embedding: [...]},
+			// newer /api/embed returns {embeddings: [[...], ...]}. We always
+			// emit the newer shape because it works for both single and batch
+			// callers; the legacy shape is recovered by reading [0] when the
+			// request was single-input.
+			//
+			// Compatibility note: cerid's `core.utils.embeddings` only reads
+			// `embedding` (singular) on /api/embeddings calls; emit BOTH keys
+			// so legacy clients keep working without an extra round-trip.
+			out := map[string]interface{}{
+				"model":      openaiResp.Model,
+				"embeddings": extractEmbeddings(openaiResp),
+			}
+			if len(openaiResp.Data) == 1 {
+				out["embedding"] = openaiResp.Data[0].Embedding
+			}
+			writeJSON(w, http.StatusOK, out)
 		}
-		if len(openaiResp.Data) == 1 {
-			out["embedding"] = openaiResp.Data[0].Embedding
+		if onGPU {
+			g.withGPUAdmission(kind, w, r, serve)
+		} else {
+			serve()
 		}
-		writeJSON(w, http.StatusOK, out)
 	}
 }
 

@@ -128,6 +128,27 @@ func KernelParams(profile hardware.Profile, vramGB int, kind gateway.SlotKind, c
 	if PolicyFor(profile, cfg).Device(string(kind)) == placement.CPU {
 		return cpuTuning()
 	}
+	return gpuKernelParams(profile, vramGB, kind, cfg)
+}
+
+// KernelParamsForDevice returns the tuning for a slot whose device is decided
+// by the caller, bypassing the placement policy. The supervisor uses this for
+// "auto"-placed kinds where it launches BOTH a GPU and a CPU instance of the
+// same (profile, kind): each instance must get the tuning for the device it
+// actually runs on, not the single device the policy would pick. dev==CPU
+// yields the minimal CPU tuning; dev==GPU yields the same per-kind GPU params
+// KernelParams produces for a GPU-placed slot.
+func KernelParamsForDevice(profile hardware.Profile, vramGB int, kind gateway.SlotKind, cfg config.Config, dev placement.Device) SlotTuning {
+	if dev == placement.CPU {
+		return cpuTuning()
+	}
+	return gpuKernelParams(profile, vramGB, kind, cfg)
+}
+
+// gpuKernelParams is the per-kind GPU tuning switch shared by KernelParams and
+// KernelParamsForDevice. It assumes the slot runs on the GPU; the CPU decision
+// is made by the callers above.
+func gpuKernelParams(profile hardware.Profile, vramGB int, kind gateway.SlotKind, cfg config.Config) SlotTuning {
 	switch kind {
 	case gateway.KindChat:
 		return chatParams(profile, vramGB)
