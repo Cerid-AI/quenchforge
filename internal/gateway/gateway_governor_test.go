@@ -71,6 +71,61 @@ func TestGatedBackpressures503WhenSaturated(t *testing.T) {
 	}
 }
 
+func TestGatedDutyCycleHoldsCooldown(t *testing.T) {
+	// duty=0.5 -> after ~40ms of "GPU work", hold the slot idle ~40ms more
+	// before releasing, so the gated call takes ~2x the handler time.
+	g := New(config.Config{GovernorMaxCooldownMS: 250})
+	s := scheduler.New(1)
+	s.SetDutyCycle(0.5)
+	g.SetScheduler(s)
+	h := g.gated(KindChat, func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(40 * time.Millisecond) // simulate GPU work
+		w.WriteHeader(http.StatusOK)
+	})
+	start := time.Now()
+	h(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/api/chat", nil))
+	elapsed := time.Since(start)
+	if elapsed < 70*time.Millisecond {
+		t.Fatalf("duty-cycle cooldown not applied: elapsed=%v, want >=~80ms (40 work + ~40 idle)", elapsed)
+	}
+	if s.Active() != 0 {
+		t.Fatalf("slot leaked after cooldown: active=%d", s.Active())
+	}
+}
+
+func TestGatedNoCooldownAtFullDuty(t *testing.T) {
+	g := New(config.Config{})
+	s := scheduler.New(1) // duty defaults to 1.0 -> no cooldown
+	g.SetScheduler(s)
+	h := g.gated(KindChat, func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(30 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	})
+	start := time.Now()
+	h(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/api/chat", nil))
+	if elapsed := time.Since(start); elapsed > 60*time.Millisecond {
+		t.Fatalf("unexpected cooldown at duty=1.0: elapsed=%v, want ~30ms", elapsed)
+	}
+}
+
+func TestGatedCooldownCapped(t *testing.T) {
+	// duty=0.1 would imply 9x idle, but the 50ms cap bounds it.
+	g := New(config.Config{GovernorMaxCooldownMS: 50})
+	s := scheduler.New(1)
+	s.SetDutyCycle(0.1)
+	g.SetScheduler(s)
+	h := g.gated(KindChat, func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(30 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	})
+	start := time.Now()
+	h(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/api/chat", nil))
+	// 30ms work + capped 50ms cooldown ~= 80ms; must be well under the uncapped 30*9=270ms.
+	if elapsed := time.Since(start); elapsed > 150*time.Millisecond {
+		t.Fatalf("cooldown not capped: elapsed=%v, want <=~80ms", elapsed)
+	}
+}
+
 func TestGatedReleasesSlotAfterHandler(t *testing.T) {
 	g := New(config.Config{})
 	s := scheduler.New(1)

@@ -166,8 +166,35 @@ func (g *Gateway) gated(kind SlotKind, h http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 		defer release()
+		start := time.Now()
 		h(w, r)
+		// Duty-cycle cooldown: after the response is sent, keep holding the slot
+		// idle for a span proportional to the GPU time this request just used,
+		// so the GPU yields a window to the display compositor before the next
+		// admission. This temporal gap — not concurrency capping — is what
+		// prevents sustained gapless inference from starving WindowServer.
+		if d := sched.DutyCycle(); d < 1.0 {
+			idle := time.Duration(float64(time.Since(start)) * (1.0 - d) / d)
+			if m := g.maxCooldown(); idle > m {
+				idle = m
+			}
+			if idle > 0 {
+				time.Sleep(idle)
+			}
+		}
 	}
+}
+
+// maxCooldown caps the per-request duty-cycle idle hold so a single long
+// generation can't stall the queue for seconds. The in-generation yield for
+// long requests comes from command-buffer granularity (GGML_METAL_N_CB); this
+// cap bounds the inter-request gap.
+func (g *Gateway) maxCooldown() time.Duration {
+	ms := g.cfg.GovernorMaxCooldownMS
+	if ms <= 0 {
+		ms = 250
+	}
+	return time.Duration(ms) * time.Millisecond
 }
 
 // SetUpstream points the proxy for the given slot kind at a URL. Passing an

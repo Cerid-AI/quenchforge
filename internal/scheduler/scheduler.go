@@ -72,6 +72,11 @@ type Scheduler struct {
 	active int
 	seq    atomic.Uint64
 	wake   chan struct{}
+	// duty is the target GPU busy fraction (0<duty<=1) the governor sets when
+	// a display is active. It is the governor's knob, stored here; the gateway
+	// enforces it by holding a slot idle through a post-request cooldown so the
+	// GPU yields windows to the display compositor. 1.0 = no limit.
+	duty float64
 }
 
 // New returns a Scheduler that allows up to concurrency in-flight workloads.
@@ -83,6 +88,7 @@ func New(concurrency int) *Scheduler {
 	s := &Scheduler{
 		concurrency: concurrency,
 		wake:        make(chan struct{}, 1),
+		duty:        1.0,
 	}
 	heap.Init(&s.heap)
 	return s
@@ -165,6 +171,25 @@ func (s *Scheduler) Concurrency() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.concurrency
+}
+
+// SetDutyCycle sets the target GPU busy fraction (0 < d <= 1). Values outside
+// that range are clamped to 1.0 (no limit). The governor lowers this below 1
+// while a display is active so the gateway inserts proportional GPU idle gaps.
+func (s *Scheduler) SetDutyCycle(d float64) {
+	if d <= 0 || d > 1 {
+		d = 1.0
+	}
+	s.mu.Lock()
+	s.duty = d
+	s.mu.Unlock()
+}
+
+// DutyCycle reports the current target GPU busy fraction (1.0 = no limit).
+func (s *Scheduler) DutyCycle() float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.duty
 }
 
 // Active reports how many workloads are in-flight right now.

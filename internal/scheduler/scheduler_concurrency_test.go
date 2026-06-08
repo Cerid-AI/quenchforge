@@ -87,3 +87,20 @@ func TestSetConcurrencyClampsToOne(t *testing.T) {
 		t.Fatalf("Concurrency after SetConcurrency(0) = %d, want 1 (clamped)", s.Concurrency())
 	}
 }
+
+func TestDutyCycle(t *testing.T) {
+	s := New(1)
+	if s.DutyCycle() != 1.0 {
+		t.Fatalf("default duty = %v, want 1.0", s.DutyCycle())
+	}
+	s.SetDutyCycle(0.5)
+	if s.DutyCycle() != 0.5 {
+		t.Fatalf("duty = %v, want 0.5", s.DutyCycle())
+	}
+	for _, bad := range []float64{0, -1, 1.5} {
+		s.SetDutyCycle(bad)
+		if s.DutyCycle() != 1.0 {
+			t.Fatalf("SetDutyCycle(%v) = %v, want clamp to 1.0", bad, s.DutyCycle())
+		}
+	}
+}

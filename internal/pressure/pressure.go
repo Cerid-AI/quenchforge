@@ -40,25 +40,38 @@ type Reading struct {
 	MemPressure int
 }
 
-// Limits configures the governor's target concurrency in each regime.
+// Limits configures the governor's target plan in each regime.
 type Limits struct {
 	// Max is the admission ceiling when the GPU is ours alone (headless or
 	// display asleep) — full throughput.
 	Max int
-	// DisplayActive is the reduced ceiling while a screen is being driven,
-	// reserving GPU headroom for WindowServer. Clamped to [1, Max].
+	// DisplayActive is the admission ceiling while a screen is being driven.
+	// Serialized (1) by default so the duty-cycle gaps are clean. Clamped to
+	// [1, Max].
 	DisplayActive int
+	// DisplayActiveDuty is the target GPU busy fraction (0<d<=1) while a
+	// screen is being driven. Below 1, the gateway inserts proportional GPU
+	// idle gaps so the compositor gets time slices. The single most important
+	// knob — concurrency capping alone does NOT prevent compositor starvation
+	// (sustained gapless GPU work at any concurrency does), the idle gaps do.
+	DisplayActiveDuty float64
 }
 
-// Target maps a Reading to the scheduler concurrency the governor should set:
+// Plan is the governor's output: how many concurrent GPU workloads to admit
+// and what GPU busy fraction to hold to.
+type Plan struct {
+	Concurrency int
+	Duty        float64 // 1.0 = no idle-gap limit
+}
+
+// For maps a Reading to the plan the governor should apply:
 //
-//   - headless / display asleep      → Max (full throughput)
-//   - display active, memory normal  → DisplayActive (reserve compositor headroom)
-//   - display active, memory warn    → halve DisplayActive (min 1)
-//   - memory critical (any display)  → 1 (shed almost everything)
-//
-// The result is always clamped to [1, Max].
-func (l Limits) Target(r Reading) int {
+//   - headless / display asleep      → {Max, 1.0}   full throughput, no gaps
+//   - display active, memory normal  → {DisplayActive, DisplayActiveDuty}
+//   - display active, memory warn    → {1, DisplayActiveDuty}  serialize
+//   - display active, memory critical→ {1, tighter duty}       shed hard
+//   - headless, memory critical      → {1, 1.0}     relieve memory, no gap need
+func (l Limits) For(r Reading) Plan {
 	max := l.Max
 	if max < 1 {
 		max = 1
@@ -70,19 +83,33 @@ func (l Limits) Target(r Reading) int {
 	if da > max {
 		da = max
 	}
+	duty := l.DisplayActiveDuty
+	if duty <= 0 || duty > 1 {
+		duty = 0.5
+	}
 
-	if r.MemPressure >= MemCritical {
-		return 1
-	}
 	if !r.DisplayActive {
-		return max
-	}
-	t := da
-	if r.MemPressure >= MemWarn {
-		t = (da + 1) / 2 // halve, round up
-		if t < 1 {
-			t = 1
+		if r.MemPressure >= MemCritical {
+			return Plan{Concurrency: 1, Duty: 1.0}
 		}
+		return Plan{Concurrency: max, Duty: 1.0}
+	}
+	// Display active: the compositor is competing for the GPU.
+	if r.MemPressure >= MemCritical {
+		return Plan{Concurrency: 1, Duty: tighten(duty)}
+	}
+	if r.MemPressure >= MemWarn {
+		return Plan{Concurrency: 1, Duty: duty}
+	}
+	return Plan{Concurrency: da, Duty: duty}
+}
+
+// tighten lowers the duty cycle under memory-critical pressure, with a floor
+// so inference still makes some progress.
+func tighten(d float64) float64 {
+	t := d * 0.6
+	if t < 0.25 {
+		t = 0.25
 	}
 	return t
 }

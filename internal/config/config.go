@@ -234,9 +234,21 @@ type Config struct {
 	// the display is asleep — full throughput.
 	GPUConcurrencyMax int
 
-	// GPUConcurrencyDisplayActive is the reduced ceiling while a display is
-	// being driven, reserving GPU headroom for the compositor.
+	// GPUConcurrencyDisplayActive is the admission ceiling while a display is
+	// being driven. Serialized (1) by default so the duty-cycle gaps are clean.
 	GPUConcurrencyDisplayActive int
+
+	// GPUDutyCycleDisplayActive is the target GPU busy fraction (0<d<=1) while
+	// a display is being driven. Below 1, the gateway inserts proportional GPU
+	// idle gaps after each request so the compositor gets time slices. This is
+	// the lever that actually prevents WindowServer starvation — concurrency
+	// capping alone does not (sustained gapless GPU work starves it at any
+	// concurrency).
+	GPUDutyCycleDisplayActive float64
+
+	// GovernorMaxCooldownMS caps the per-request duty-cycle idle hold so one
+	// long generation can't stall the queue for seconds.
+	GovernorMaxCooldownMS int
 
 	// GovernorIntervalMS is how often the governor re-reads host pressure.
 	GovernorIntervalMS int
@@ -288,7 +300,9 @@ func Default() (Config, error) {
 
 		GovernorEnabled:             true,
 		GPUConcurrencyMax:           6,
-		GPUConcurrencyDisplayActive: 2,
+		GPUConcurrencyDisplayActive: 1,
+		GPUDutyCycleDisplayActive:   0.5,
+		GovernorMaxCooldownMS:       250,
 		GovernorIntervalMS:          3000,
 	}, nil
 }
@@ -332,6 +346,8 @@ func Load() (Config, error) {
 	cfg.GovernorEnabled = envBoolOr("QUENCHFORGE_GOVERNOR", cfg.GovernorEnabled)
 	cfg.GPUConcurrencyMax = envIntOr("QUENCHFORGE_GPU_CONCURRENCY_MAX", cfg.GPUConcurrencyMax)
 	cfg.GPUConcurrencyDisplayActive = envIntOr("QUENCHFORGE_GPU_CONCURRENCY_DISPLAY_ACTIVE", cfg.GPUConcurrencyDisplayActive)
+	cfg.GPUDutyCycleDisplayActive = envFloatOr("QUENCHFORGE_GPU_DUTY_DISPLAY_ACTIVE", cfg.GPUDutyCycleDisplayActive)
+	cfg.GovernorMaxCooldownMS = envIntOr("QUENCHFORGE_GOVERNOR_MAX_COOLDOWN_MS", cfg.GovernorMaxCooldownMS)
 	cfg.GovernorIntervalMS = envIntOr("QUENCHFORGE_GOVERNOR_INTERVAL_MS", cfg.GovernorIntervalMS)
 	cfg.TelemetryEnabled = envBoolOr("QUENCHFORGE_TELEMETRY", false)
 	cfg.AdvertiseMDNS = envBoolOr("QUENCHFORGE_ADVERTISE_MDNS", false)
@@ -442,6 +458,18 @@ func envIntOr(name string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+func envFloatOr(name string, fallback float64) float64 {
+	v, ok := os.LookupEnv(name)
+	if !ok || v == "" {
+		return fallback
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return fallback
+	}
+	return f
 }
 
 func envBoolOr(name string, fallback bool) bool {

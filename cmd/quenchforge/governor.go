@@ -25,15 +25,15 @@ import (
 // inference-server users see no throttling.
 func startGovernor(ctx context.Context, sensor pressure.Sensor, cfg config.Config, out io.Writer) *scheduler.Scheduler {
 	limits := pressure.Limits{
-		Max:           cfg.GPUConcurrencyMax,
-		DisplayActive: cfg.GPUConcurrencyDisplayActive,
+		Max:               cfg.GPUConcurrencyMax,
+		DisplayActive:     cfg.GPUConcurrencyDisplayActive,
+		DisplayActiveDuty: cfg.GPUDutyCycleDisplayActive,
 	}
-	// Start at the conservative display-active ceiling so we never open the
+	// Start at the conservative display-active plan so we never open the
 	// floodgates before the first reading lands.
-	sched := scheduler.New(limits.Target(pressure.Reading{
-		DisplayActive: true,
-		MemPressure:   pressure.MemNormal,
-	}))
+	startPlan := limits.For(pressure.Reading{DisplayActive: true, MemPressure: pressure.MemNormal})
+	sched := scheduler.New(startPlan.Concurrency)
+	sched.SetDutyCycle(startPlan.Duty)
 
 	interval := time.Duration(cfg.GovernorIntervalMS) * time.Millisecond
 	if interval < 250*time.Millisecond {
@@ -41,9 +41,12 @@ func startGovernor(ctx context.Context, sensor pressure.Sensor, cfg config.Confi
 	}
 
 	apply := func() {
-		target := limits.Target(sensor.Read())
-		if sched.Concurrency() != target {
-			sched.SetConcurrency(target)
+		plan := limits.For(sensor.Read())
+		if sched.Concurrency() != plan.Concurrency {
+			sched.SetConcurrency(plan.Concurrency)
+		}
+		if sched.DutyCycle() != plan.Duty {
+			sched.SetDutyCycle(plan.Duty)
 		}
 	}
 	apply() // reflect reality before the first request is served
@@ -61,7 +64,8 @@ func startGovernor(ctx context.Context, sensor pressure.Sensor, cfg config.Confi
 		}
 	}()
 
-	fmt.Fprintf(out, "quenchforge: GPU governor active (max=%d display-active=%d interval=%s)\n",
-		cfg.GPUConcurrencyMax, cfg.GPUConcurrencyDisplayActive, interval)
+	fmt.Fprintf(out, "quenchforge: GPU governor active (max=%d display-active conc=%d duty=%.2f cooldown<=%dms interval=%s)\n",
+		cfg.GPUConcurrencyMax, cfg.GPUConcurrencyDisplayActive, cfg.GPUDutyCycleDisplayActive,
+		cfg.GovernorMaxCooldownMS, interval)
 	return sched
 }
