@@ -23,7 +23,9 @@ import (
 	"github.com/cerid-ai/quenchforge/internal/discovery"
 	"github.com/cerid-ai/quenchforge/internal/gateway"
 	"github.com/cerid-ai/quenchforge/internal/hardware"
+	"github.com/cerid-ai/quenchforge/internal/placement"
 	"github.com/cerid-ai/quenchforge/internal/portcheck"
+	"github.com/cerid-ai/quenchforge/internal/pressure"
 	"github.com/cerid-ai/quenchforge/internal/supervisor"
 	"github.com/cerid-ai/quenchforge/internal/tuning"
 )
@@ -585,6 +587,15 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 
 	g := gateway.New(cfg)
 	g.SetVersion(Version)
+	// Install the device-placement policy so the gateway can route "auto"
+	// embedding kinds per request and skip GPU admission for CPU-placed kinds.
+	// Built from the same hardware profile + operator overrides the tuning
+	// module uses, so placement and slot tuning never disagree.
+	pol := tuning.PolicyFor(hwInfo.Profile, cfg)
+	g.SetPlacement(pol, cfg.AutoBatchThreshold)
+	if cfg.GovernorEnabled {
+		g.SetScheduler(startGovernor(ctx, pressure.NewSensor(), cfg, stdout))
+	}
 	if err := g.Start(ctx); err != nil {
 		if errors.Is(err, gateway.ErrAddrInUse) {
 			fmt.Fprintf(stderr,
@@ -636,6 +647,61 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 	// independently — handy for headless transcription deployments that
 	// don't want a chat slot eating VRAM.
 	slots := map[gateway.SlotKind]*supervisor.Slot{}
+
+	// startEmbedFamily launches the embed/code-embed slot(s) for one kind.
+	// Under "auto" placement it brings up TWO instances — a GPU instance
+	// (batched throughput, registered as the primary upstream) and a CPU
+	// instance (single-request latency, registered as the CPU upstream) — so
+	// the gateway routes per request by batch shape. For fixed gpu/cpu
+	// placement it launches a single instance and lets the policy pick the
+	// device, identical to the pre-auto single-slot path.
+	startEmbedFamily := func(kind gateway.SlotKind, name, model string, gpuPort, cpuPort int) {
+		extra := []string{"--embedding", "--pooling", "cls"}
+		if pol.Mode(string(kind)) != placement.ModeAuto {
+			s, err := startSlot(ctx, cfg, hwInfo, slotSpec{
+				Kind: kind, Name: name, Model: model, Port: gpuPort, ExtraArgs: extra,
+			}, maxLogBytes, logBackups, stderr)
+			if err != nil {
+				fmt.Fprintf(stderr,
+					"quenchforge: warning: %s slot not started: %v\n", name, err)
+				return
+			}
+			slots[kind] = s
+			fmt.Fprintf(stdout, "quenchforge: %s slot pid=%d model=%s port=%d\n",
+				name, s.PID(), model, gpuPort)
+			_ = g.SetUpstream(kind, fmt.Sprintf("http://127.0.0.1:%d", gpuPort))
+			return
+		}
+		// Auto: dual-placed. GPU instance is the primary upstream.
+		gpuDev, cpuDev := placement.GPU, placement.CPU
+		if s, err := startSlot(ctx, cfg, hwInfo, slotSpec{
+			Kind: kind, Name: name, Model: model, Port: gpuPort, ExtraArgs: extra, Device: &gpuDev,
+		}, maxLogBytes, logBackups, stderr); err != nil {
+			fmt.Fprintf(stderr,
+				"quenchforge: warning: %s (gpu) slot not started: %v\n", name, err)
+		} else {
+			slots[kind] = s
+			fmt.Fprintf(stdout, "quenchforge: %s slot (gpu) pid=%d model=%s port=%d\n",
+				name, s.PID(), model, gpuPort)
+			_ = g.SetUpstream(kind, fmt.Sprintf("http://127.0.0.1:%d", gpuPort))
+		}
+		// CPU instance handles single-request latency traffic.
+		cpuName := name + "-cpu"
+		if s, err := startSlot(ctx, cfg, hwInfo, slotSpec{
+			Kind: kind, Name: cpuName, Model: model, Port: cpuPort, ExtraArgs: extra, Device: &cpuDev,
+		}, maxLogBytes, logBackups, stderr); err != nil {
+			fmt.Fprintf(stderr,
+				"quenchforge: warning: %s slot not started: %v\n"+
+					"  Single-input %s requests will route to the GPU instance.\n",
+				cpuName, err, name)
+		} else {
+			slots[gateway.SlotKind(cpuName)] = s
+			fmt.Fprintf(stdout, "quenchforge: %s slot (cpu) pid=%d model=%s port=%d\n",
+				cpuName, s.PID(), model, cpuPort)
+			_ = g.SetCPUUpstream(kind, fmt.Sprintf("http://127.0.0.1:%d", cpuPort))
+		}
+	}
+
 	if !*noSlot {
 		// Chat slot — always-on unless suppressed.
 		modelName := *model
@@ -665,28 +731,13 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 	{ // embed/rerank/whisper evaluate independently of --no-slot
 
 		// Embed slot — opt-in via QUENCHFORGE_EMBED_MODEL or --embed-model.
+		// --embedding flips llama-server into pooled-embedding mode and
+		// --pooling cls is the standard for most BERT-style embedders (added
+		// by startEmbedFamily). Under "auto" placement this brings up a
+		// GPU+CPU pair; otherwise a single policy-placed instance.
 		if cfg.EmbedModel != "" {
-			s, err := startSlot(ctx, cfg, hwInfo, slotSpec{
-				Kind:  gateway.KindEmbed,
-				Name:  "embed",
-				Model: cfg.EmbedModel,
-				Port:  cfg.EmbedPort,
-				// --embedding flips llama-server into pooled-embedding mode.
-				// --pooling cls is the standard for most BERT-style embedders;
-				// callers using mean-pooling models can override via config.
-				ExtraArgs: []string{"--embedding", "--pooling", "cls"},
-			}, maxLogBytes, logBackups, stderr)
-			if err != nil {
-				fmt.Fprintf(stderr,
-					"quenchforge: warning: embed slot not started: %v\n"+
-						"  /api/embeddings will return 503.\n", err)
-			} else {
-				slots[gateway.KindEmbed] = s
-				fmt.Fprintf(stdout, "quenchforge: embed slot pid=%d model=%s port=%d\n",
-					s.PID(), cfg.EmbedModel, cfg.EmbedPort)
-				_ = g.SetUpstream(gateway.KindEmbed,
-					fmt.Sprintf("http://127.0.0.1:%d", cfg.EmbedPort))
-			}
+			startEmbedFamily(gateway.KindEmbed, "embed", cfg.EmbedModel,
+				cfg.EmbedPort, cfg.EmbedCPUPort)
 		}
 
 		// Code-embed slot — opt-in via QUENCHFORGE_CODE_EMBED_MODEL.
@@ -696,25 +747,8 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 		// process serve a general-text embedder (for KB / RAG) alongside
 		// a code-tuned embedder (for semantic-code-search MCPs).
 		if cfg.CodeEmbedModel != "" {
-			s, err := startSlot(ctx, cfg, hwInfo, slotSpec{
-				Kind:      gateway.KindCodeEmbed,
-				Name:      "code-embed",
-				Model:     cfg.CodeEmbedModel,
-				Port:      cfg.CodeEmbedPort,
-				ExtraArgs: []string{"--embedding", "--pooling", "cls"},
-			}, maxLogBytes, logBackups, stderr)
-			if err != nil {
-				fmt.Fprintf(stderr,
-					"quenchforge: warning: code-embed slot not started: %v\n"+
-						"  Embed requests for %q will fall back to the regular embed slot.\n",
-					err, cfg.CodeEmbedModel)
-			} else {
-				slots[gateway.KindCodeEmbed] = s
-				fmt.Fprintf(stdout, "quenchforge: code-embed slot pid=%d model=%s port=%d\n",
-					s.PID(), cfg.CodeEmbedModel, cfg.CodeEmbedPort)
-				_ = g.SetUpstream(gateway.KindCodeEmbed,
-					fmt.Sprintf("http://127.0.0.1:%d", cfg.CodeEmbedPort))
-			}
+			startEmbedFamily(gateway.KindCodeEmbed, "code-embed", cfg.CodeEmbedModel,
+				cfg.CodeEmbedPort, cfg.CodeEmbedCPUPort)
 		}
 
 		// Rerank slot — opt-in via QUENCHFORGE_RERANK_MODEL. Same
@@ -896,6 +930,21 @@ type slotSpec struct {
 	Model     string // model name under cfg.ModelsDir
 	Port      int    // 127.0.0.1:Port
 	ExtraArgs []string
+	// Device, when non-nil, pins this instance to a specific compute device,
+	// bypassing the placement policy. The supervisor sets it for the two
+	// instances of an "auto"-placed kind (one GPU, one CPU). nil = unset = let
+	// the policy decide (the default, behaviour-preserving path).
+	Device *placement.Device
+}
+
+// specTuning returns the kernel tuning for a slot spec, honouring an explicit
+// spec.Device when set (the dual-launch "auto" instances) and otherwise letting
+// the placement policy decide (every existing single-slot caller).
+func specTuning(cfg config.Config, hwInfo hardware.Info, spec slotSpec) tuning.SlotTuning {
+	if spec.Device != nil {
+		return tuning.KernelParamsForDevice(hwInfo.Profile, hwInfo.GPUVRAMGB, spec.Kind, cfg, *spec.Device)
+	}
+	return tuning.KernelParams(hwInfo.Profile, hwInfo.GPUVRAMGB, spec.Kind, cfg)
 }
 
 // buildSlotArgs constructs the llama-server command-line arguments for
@@ -908,7 +957,7 @@ type slotSpec struct {
 // only for the base arg shape plus the layering of the tuning result.
 // Move the per-profile decisions there when they change, not here.
 func buildSlotArgs(cfg config.Config, hwInfo hardware.Info, spec slotSpec, modelPath string) []string {
-	tn := tuning.KernelParams(hwInfo.Profile, hwInfo.GPUVRAMGB, spec.Kind, cfg)
+	tn := specTuning(cfg, hwInfo, spec)
 
 	// VRAM-tier-adaptive context ceiling: ContextSize only ever lowers
 	// cfg.MaxContext (small AMD cards), never raises it.
@@ -943,8 +992,14 @@ func buildSlotArgs(cfg config.Config, hwInfo hardware.Info, spec slotSpec, model
 // for an embed/rerank slot to serialise Metal command-buffer submission
 // on AMD discrete).
 func slotEnv(cfg config.Config, hwInfo hardware.Info, kind gateway.SlotKind) []string {
+	return envFromTuning(cfg, tuning.KernelParams(hwInfo.Profile, hwInfo.GPUVRAMGB, kind, cfg))
+}
+
+// envFromTuning derives the per-slot env list from a resolved SlotTuning. Split
+// out of slotEnv so the dual-launch path (which resolves tuning per explicit
+// device via specTuning) and the policy path produce identical env shapes.
+func envFromTuning(cfg config.Config, tn tuning.SlotTuning) []string {
 	ncb := cfg.MetalNCB
-	tn := tuning.KernelParams(hwInfo.Profile, hwInfo.GPUVRAMGB, kind, cfg)
 	if tn.MetalNCB > 0 {
 		ncb = tn.MetalNCB
 	}
@@ -1017,12 +1072,18 @@ func startSlot(ctx context.Context, cfg config.Config, hwInfo hardware.Info, spe
 
 	args := buildSlotArgs(cfg, hwInfo, spec, modelPath)
 
+	// Resolve tuning once (device-aware): drives the env and the restart
+	// policy below so a dual-launch GPU instance gets its GPU env/respawn and
+	// the CPU instance gets the minimal CPU env, even for an "auto" kind whose
+	// policy device differs from the instance's actual device.
+	tn := specTuning(cfg, hwInfo, spec)
+
 	slot := supervisor.NewSlot(spec.Name)
 	slot.BinPath = bin
 	slot.LogDir = cfg.LogDir
 	slot.PIDDir = cfg.PIDDir
 	slot.Args = args
-	slot.Env = slotEnv(cfg, hwInfo, spec.Kind)
+	slot.Env = envFromTuning(cfg, tn)
 	slot.MaxLogBytes = maxLogBytes
 	slot.LogBackups = logBackups
 
@@ -1030,7 +1091,6 @@ func startSlot(ctx context.Context, cfg config.Config, hwInfo hardware.Info, spe
 	// graph-compute buffer-corruption crash is non-deterministic and the
 	// slot stays dead after SIGABRT until manual restart. Tuning module
 	// owns the decision; we just translate AutoRespawn → RestartPolicy.
-	tn := tuning.KernelParams(hwInfo.Profile, hwInfo.GPUVRAMGB, spec.Kind, cfg)
 	if tn.AutoRespawn {
 		slot.RestartPolicy = supervisor.PolicyExpBackoff
 	}

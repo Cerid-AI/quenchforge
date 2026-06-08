@@ -10,6 +10,7 @@ import (
 	"github.com/cerid-ai/quenchforge/internal/config"
 	"github.com/cerid-ai/quenchforge/internal/gateway"
 	"github.com/cerid-ai/quenchforge/internal/hardware"
+	"github.com/cerid-ai/quenchforge/internal/placement"
 )
 
 // allProfiles is the exhaustive list of hardware.Profile values the
@@ -57,8 +58,27 @@ func TestProfileIsAMDDiscrete_MatchesHardwarePackage(t *testing.T) {
 	}
 }
 
-func TestKernelParams_ChatAMDGetsGPUWithConcurrencyDisable(t *testing.T) {
-	cfg := config.Config{MaxContext: 8192}
+// Chat on AMD-discrete now DEFAULTS to the CPU route (placement policy): the
+// AMD Metal path is ~7x slower than CPU for autoregressive chat (measured
+// 2026-06-07; corroborated by bench-llama-sustained-load p50=29.4s). The GPU
+// path's safety tuning is still produced when an operator forces PlaceChat=gpu.
+func TestKernelParams_ChatAMDDefaultsToCPU(t *testing.T) {
+	cfg := config.Config{MaxContext: 8192} // no PlaceChat override
+	for _, p := range amdProfiles {
+		t.Run(string(p), func(t *testing.T) {
+			tn := KernelParams(p, vramHigh, gateway.KindChat, cfg)
+			if !slices.Equal(tn.ExtraArgs, []string{"--gpu-layers", "0"}) {
+				t.Errorf("chat AMD %s default ExtraArgs = %v, want [--gpu-layers 0] (CPU route)", p, tn.ExtraArgs)
+			}
+			if tn.MetalConcurrencyDisable {
+				t.Errorf("chat AMD %s CPU route should NOT set MetalConcurrencyDisable", p)
+			}
+		})
+	}
+}
+
+func TestKernelParams_ChatAMDGPUOverrideRestoresSafetyTuning(t *testing.T) {
+	cfg := config.Config{MaxContext: 8192, PlaceChat: "gpu"}
 	for _, p := range amdProfiles {
 		t.Run(string(p), func(t *testing.T) {
 			tn := KernelParams(p, vramHigh, gateway.KindChat, cfg)
@@ -69,23 +89,16 @@ func TestKernelParams_ChatAMDGetsGPUWithConcurrencyDisable(t *testing.T) {
 				"--gpu-layers", "999",
 			}
 			if !slices.Equal(tn.ExtraArgs, wantExtra) {
-				t.Errorf("chat AMD %s ExtraArgs = %v, want %v",
-					p, tn.ExtraArgs, wantExtra)
+				t.Errorf("chat AMD %s (PlaceChat=gpu) ExtraArgs = %v, want %v", p, tn.ExtraArgs, wantExtra)
 			}
-			// Chat doesn't get embed-style ubatch / batch overrides,
-			// but DOES get AutoRespawn on AMD discrete — sustained
-			// chat workloads (cerid LongMemEval extraction, agent
-			// loops) hit family-B SIGABRT same as embed. v0.6.0
-			// shipped without this and the chat slot stayed dead;
-			// v0.6.1 fixed it.
 			if tn.UbatchSize != 0 || tn.BatchSize != 0 || tn.MetalNCB != 0 {
 				t.Errorf("chat AMD %s unexpected non-zero tuning: %+v", p, tn)
 			}
 			if !tn.MetalConcurrencyDisable {
-				t.Errorf("chat AMD %s should have MetalConcurrencyDisable=true", p)
+				t.Errorf("chat AMD %s (gpu) should have MetalConcurrencyDisable=true", p)
 			}
 			if !tn.AutoRespawn {
-				t.Errorf("chat AMD %s should request AutoRespawn", p)
+				t.Errorf("chat AMD %s (gpu) should request AutoRespawn", p)
 			}
 		})
 	}
@@ -183,7 +196,9 @@ func TestKernelParams_EmbedAMDMultithreading(t *testing.T) {
 	// --parallel 4 so the 16-physical-core Mac Pro 2019 doesn't bottle-
 	// neck on the default ~7-cores-per-request-one-at-a-time pattern.
 	// See embedParams docstring. Non-AMD profiles get neither flag.
-	cfg := config.Config{MaxContext: 8192}
+	// rerank defaults to CPU on AMD now, so force it onto the GPU to exercise
+	// the GPU multithreading flags alongside embed/code-embed.
+	cfg := config.Config{MaxContext: 8192, PlaceRerank: "gpu"}
 	for _, p := range allProfiles {
 		for _, k := range []gateway.SlotKind{gateway.KindEmbed, gateway.KindCodeEmbed, gateway.KindRerank} {
 			t.Run(string(p)+"/"+string(k), func(t *testing.T) {
@@ -246,8 +261,9 @@ func containsSubslice(haystack, needle []string) bool {
 func TestKernelParams_RerankAMDGetsGPUWithConcurrencyDisable(t *testing.T) {
 	// Same BERT-family Metal concurrency fix applies to bge-reranker-v2-m3.
 	// AMD discrete must have --gpu-layers 999 and MetalConcurrencyDisable=true;
-	// non-AMD profiles must not.
-	cfg := config.Config{MaxContext: 8192}
+	// non-AMD profiles must not. rerank defaults to CPU on AMD now, so force
+	// the GPU route to exercise the GPU tuning.
+	cfg := config.Config{MaxContext: 8192, PlaceRerank: "gpu"}
 	for _, p := range allProfiles {
 		t.Run(string(p), func(t *testing.T) {
 			tn := KernelParams(p, vramHigh, gateway.KindRerank, cfg)
@@ -275,8 +291,8 @@ func TestKernelParams_RerankAMDGetsGPUWithConcurrencyDisable(t *testing.T) {
 
 func TestKernelParams_RerankAMDGetsMetalNCBDefault(t *testing.T) {
 	// AMD rerank slots also inherit MetalNCB=1; non-AMD keeps 0
-	// (inherit global).
-	cfg := config.Config{MaxContext: 8192}
+	// (inherit global). rerank defaults to CPU on AMD now — force GPU.
+	cfg := config.Config{MaxContext: 8192, PlaceRerank: "gpu"}
 	for _, p := range allProfiles {
 		t.Run(string(p), func(t *testing.T) {
 			tn := KernelParams(p, vramHigh, gateway.KindRerank, cfg)
@@ -360,7 +376,7 @@ func TestKernelParams_RerankNoBatchOverrideByDefault(t *testing.T) {
 }
 
 func TestKernelParams_RerankHonoursBatchOverride(t *testing.T) {
-	cfg := config.Config{MaxContext: 8192, RerankBatchSize: 2048}
+	cfg := config.Config{MaxContext: 8192, RerankBatchSize: 2048, PlaceRerank: "gpu"}
 	tn := KernelParams(hardware.ProfileVegaPro, vramHigh, gateway.KindRerank, cfg)
 	if tn.BatchSize != 2048 {
 		t.Errorf("BatchSize = %d, want 2048", tn.BatchSize)
@@ -371,7 +387,7 @@ func TestKernelParams_RerankHonoursBatchOverride(t *testing.T) {
 }
 
 func TestKernelParams_RerankAMDGetsAutoRespawn(t *testing.T) {
-	cfg := config.Config{MaxContext: 8192}
+	cfg := config.Config{MaxContext: 8192, PlaceRerank: "gpu"} // rerank default is CPU now; force GPU
 	for _, p := range amdProfiles {
 		t.Run(string(p), func(t *testing.T) {
 			tn := KernelParams(p, vramHigh, gateway.KindRerank, cfg)
@@ -436,10 +452,12 @@ func TestKernelParams_EmbedLowVRAMScalesDown(t *testing.T) {
 }
 
 func TestKernelParams_ContextCapAppliesToAllAMDSlots(t *testing.T) {
-	// A 4 GB card caps context to 2048 on every AMD slot kind (chat,
-	// embed, code-embed, rerank) — the KV cache is the dominant VRAM
-	// consumer and must shrink uniformly.
-	cfg := config.Config{MaxContext: 8192}
+	// A 4 GB card caps context to 2048 on every GPU-placed AMD slot kind
+	// (chat, embed, code-embed, rerank) — the KV cache is the dominant VRAM
+	// consumer and must shrink uniformly. chat and rerank are CPU by default
+	// now, so we force them onto the GPU here to exercise the GPU context-cap
+	// path on every kind.
+	cfg := config.Config{MaxContext: 8192, PlaceChat: "gpu", PlaceRerank: "gpu"}
 	for _, k := range []gateway.SlotKind{
 		gateway.KindChat, gateway.KindEmbed, gateway.KindCodeEmbed, gateway.KindRerank,
 	} {
@@ -482,6 +500,68 @@ func TestKernelParams_UbatchOverrideBeatsTierButCapStands(t *testing.T) {
 	}
 	if tn.ContextSize != 2048 {
 		t.Errorf("ContextSize = %d, want 2048 (cap independent of ubatch override)", tn.ContextSize)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// KernelParamsForDevice — explicit device, bypassing the placement policy
+// ---------------------------------------------------------------------------
+
+func TestKernelParamsForDevice_ExplicitCPU(t *testing.T) {
+	// An explicit CPU device yields the minimal CPU tuning (--gpu-layers 0,
+	// no Metal env, no respawn) regardless of profile or batch sizing.
+	cfg := config.Config{MaxContext: 8192}
+	tn := KernelParamsForDevice(hardware.ProfileVegaPro, vramHigh, gateway.KindEmbed, cfg, placement.CPU)
+	if !slices.Equal(tn.ExtraArgs, []string{"--gpu-layers", "0"}) {
+		t.Errorf("explicit CPU ExtraArgs = %v, want [--gpu-layers 0]", tn.ExtraArgs)
+	}
+	if tn.MetalConcurrencyDisable || tn.AutoRespawn || tn.UbatchSize != 0 || tn.MetalNCB != 0 {
+		t.Errorf("explicit CPU should emit minimal tuning, got %+v", tn)
+	}
+}
+
+func TestKernelParamsForDevice_ExplicitGPU(t *testing.T) {
+	// An explicit GPU device yields the full AMD embed GPU tuning — the same
+	// thing KernelParams produces for a GPU-placed embed slot.
+	cfg := config.Config{MaxContext: 8192}
+	tn := KernelParamsForDevice(hardware.ProfileVegaPro, vramHigh, gateway.KindEmbed, cfg, placement.GPU)
+	if !containsSubslice(tn.ExtraArgs, []string{"--gpu-layers", "999"}) {
+		t.Errorf("explicit GPU missing --gpu-layers 999; ExtraArgs=%v", tn.ExtraArgs)
+	}
+	if !tn.MetalConcurrencyDisable {
+		t.Error("explicit GPU embed on AMD should set MetalConcurrencyDisable")
+	}
+	if tn.UbatchSize != amdEmbedUbatchDefault {
+		t.Errorf("explicit GPU UbatchSize = %d, want %d", tn.UbatchSize, amdEmbedUbatchDefault)
+	}
+}
+
+func TestKernelParamsForDevice_BypassesPlacementOverride(t *testing.T) {
+	// Even when cfg pins embed to CPU placement, an explicit GPU device must
+	// still produce GPU tuning — that's the whole point of the dual-launch
+	// GPU instance for an "auto" kind.
+	cfg := config.Config{MaxContext: 8192, PlaceEmbed: "cpu"}
+	tn := KernelParamsForDevice(hardware.ProfileVegaPro, vramHigh, gateway.KindEmbed, cfg, placement.GPU)
+	if !containsSubslice(tn.ExtraArgs, []string{"--gpu-layers", "999"}) {
+		t.Errorf("explicit GPU must bypass the CPU placement override; ExtraArgs=%v", tn.ExtraArgs)
+	}
+	// And the inverse: explicit CPU bypasses a GPU placement.
+	cfgGPU := config.Config{MaxContext: 8192, PlaceEmbed: "gpu"}
+	cpu := KernelParamsForDevice(hardware.ProfileVegaPro, vramHigh, gateway.KindEmbed, cfgGPU, placement.CPU)
+	if !slices.Equal(cpu.ExtraArgs, []string{"--gpu-layers", "0"}) {
+		t.Errorf("explicit CPU must bypass the GPU placement override; ExtraArgs=%v", cpu.ExtraArgs)
+	}
+}
+
+func TestKernelParamsForDevice_ChatGPUMatchesKernelParams(t *testing.T) {
+	// Parity check: KernelParamsForDevice(..., GPU) for chat equals
+	// KernelParams with PlaceChat=gpu (both take the GPU chat path).
+	cfgDev := config.Config{MaxContext: 8192}
+	cfgPolicy := config.Config{MaxContext: 8192, PlaceChat: "gpu"}
+	dev := KernelParamsForDevice(hardware.ProfileVegaPro, vramHigh, gateway.KindChat, cfgDev, placement.GPU)
+	pol := KernelParams(hardware.ProfileVegaPro, vramHigh, gateway.KindChat, cfgPolicy)
+	if !slices.Equal(dev.ExtraArgs, pol.ExtraArgs) || dev.MetalConcurrencyDisable != pol.MetalConcurrencyDisable {
+		t.Errorf("device GPU vs policy GPU chat diverged: dev=%+v pol=%+v", dev, pol)
 	}
 }
 
