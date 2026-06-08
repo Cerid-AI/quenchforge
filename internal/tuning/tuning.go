@@ -32,6 +32,7 @@ import (
 	"github.com/cerid-ai/quenchforge/internal/config"
 	"github.com/cerid-ai/quenchforge/internal/gateway"
 	"github.com/cerid-ai/quenchforge/internal/hardware"
+	"github.com/cerid-ai/quenchforge/internal/placement"
 )
 
 // AMD-discrete embed-slot defaults, baked from the Vega II bench at
@@ -119,6 +120,14 @@ type SlotTuning struct {
 // — the `buf->is_shared` fast path uses plain `memcpy`). Adding flags
 // on those profiles would regress throughput without any safety win.
 func KernelParams(profile hardware.Profile, vramGB int, kind gateway.SlotKind, cfg config.Config) SlotTuning {
+	// Device placement comes first: the GPU safety tuning below is only
+	// meaningful when the slot actually runs on the GPU. On a host where the
+	// placement policy routes this kind to the CPU (e.g. chat on AMD-discrete,
+	// where the Metal path is ~7x slower than CPU), return the minimal CPU
+	// tuning instead.
+	if PolicyFor(profile, cfg).Device(string(kind)) == placement.CPU {
+		return cpuTuning()
+	}
 	switch kind {
 	case gateway.KindChat:
 		return chatParams(profile, vramGB)
@@ -129,6 +138,26 @@ func KernelParams(profile hardware.Profile, vramGB int, kind gateway.SlotKind, c
 	}
 	// Whisper / imagegen and any future kinds fall through unchanged.
 	return SlotTuning{}
+}
+
+// PolicyFor builds the device-placement policy for a host profile plus any
+// operator overrides in cfg. Exposed so the gateway can consult the same
+// policy for per-request "auto" routing decisions.
+func PolicyFor(profile hardware.Profile, cfg config.Config) placement.Policy {
+	return placement.NewPolicy(profileIsAMDDiscrete(profile), map[string]string{
+		placement.KindChat:      cfg.PlaceChat,
+		placement.KindEmbed:     cfg.PlaceEmbed,
+		placement.KindCodeEmbed: cfg.PlaceCodeEmbed,
+		placement.KindRerank:    cfg.PlaceRerank,
+	})
+}
+
+// cpuTuning is the minimal CPU-route tuning: all layers on CPU and none of the
+// GPU-only Metal env or cache-disabling flags, so the CPU prompt cache stays
+// on (the measured fast path: chat ~3.8s vs ~27s GPU for 32 tokens on Vega II).
+// The --embedding / --reranking slot flags are added by the slotSpec, not here.
+func cpuTuning() SlotTuning {
+	return SlotTuning{ExtraArgs: []string{"--gpu-layers", "0"}}
 }
 
 // chatParams returns the chat-slot tuning. AMD-discrete profiles get

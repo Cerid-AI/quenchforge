@@ -57,8 +57,27 @@ func TestProfileIsAMDDiscrete_MatchesHardwarePackage(t *testing.T) {
 	}
 }
 
-func TestKernelParams_ChatAMDGetsGPUWithConcurrencyDisable(t *testing.T) {
-	cfg := config.Config{MaxContext: 8192}
+// Chat on AMD-discrete now DEFAULTS to the CPU route (placement policy): the
+// AMD Metal path is ~7x slower than CPU for autoregressive chat (measured
+// 2026-06-07; corroborated by bench-llama-sustained-load p50=29.4s). The GPU
+// path's safety tuning is still produced when an operator forces PlaceChat=gpu.
+func TestKernelParams_ChatAMDDefaultsToCPU(t *testing.T) {
+	cfg := config.Config{MaxContext: 8192} // no PlaceChat override
+	for _, p := range amdProfiles {
+		t.Run(string(p), func(t *testing.T) {
+			tn := KernelParams(p, vramHigh, gateway.KindChat, cfg)
+			if !slices.Equal(tn.ExtraArgs, []string{"--gpu-layers", "0"}) {
+				t.Errorf("chat AMD %s default ExtraArgs = %v, want [--gpu-layers 0] (CPU route)", p, tn.ExtraArgs)
+			}
+			if tn.MetalConcurrencyDisable {
+				t.Errorf("chat AMD %s CPU route should NOT set MetalConcurrencyDisable", p)
+			}
+		})
+	}
+}
+
+func TestKernelParams_ChatAMDGPUOverrideRestoresSafetyTuning(t *testing.T) {
+	cfg := config.Config{MaxContext: 8192, PlaceChat: "gpu"}
 	for _, p := range amdProfiles {
 		t.Run(string(p), func(t *testing.T) {
 			tn := KernelParams(p, vramHigh, gateway.KindChat, cfg)
@@ -69,23 +88,16 @@ func TestKernelParams_ChatAMDGetsGPUWithConcurrencyDisable(t *testing.T) {
 				"--gpu-layers", "999",
 			}
 			if !slices.Equal(tn.ExtraArgs, wantExtra) {
-				t.Errorf("chat AMD %s ExtraArgs = %v, want %v",
-					p, tn.ExtraArgs, wantExtra)
+				t.Errorf("chat AMD %s (PlaceChat=gpu) ExtraArgs = %v, want %v", p, tn.ExtraArgs, wantExtra)
 			}
-			// Chat doesn't get embed-style ubatch / batch overrides,
-			// but DOES get AutoRespawn on AMD discrete — sustained
-			// chat workloads (cerid LongMemEval extraction, agent
-			// loops) hit family-B SIGABRT same as embed. v0.6.0
-			// shipped without this and the chat slot stayed dead;
-			// v0.6.1 fixed it.
 			if tn.UbatchSize != 0 || tn.BatchSize != 0 || tn.MetalNCB != 0 {
 				t.Errorf("chat AMD %s unexpected non-zero tuning: %+v", p, tn)
 			}
 			if !tn.MetalConcurrencyDisable {
-				t.Errorf("chat AMD %s should have MetalConcurrencyDisable=true", p)
+				t.Errorf("chat AMD %s (gpu) should have MetalConcurrencyDisable=true", p)
 			}
 			if !tn.AutoRespawn {
-				t.Errorf("chat AMD %s should request AutoRespawn", p)
+				t.Errorf("chat AMD %s (gpu) should request AutoRespawn", p)
 			}
 		})
 	}
@@ -436,10 +448,11 @@ func TestKernelParams_EmbedLowVRAMScalesDown(t *testing.T) {
 }
 
 func TestKernelParams_ContextCapAppliesToAllAMDSlots(t *testing.T) {
-	// A 4 GB card caps context to 2048 on every AMD slot kind (chat,
-	// embed, code-embed, rerank) — the KV cache is the dominant VRAM
-	// consumer and must shrink uniformly.
-	cfg := config.Config{MaxContext: 8192}
+	// A 4 GB card caps context to 2048 on every GPU-placed AMD slot kind
+	// (chat, embed, code-embed, rerank) — the KV cache is the dominant VRAM
+	// consumer and must shrink uniformly. chat is CPU by default now, so we
+	// force it onto the GPU here to exercise the GPU context-cap path.
+	cfg := config.Config{MaxContext: 8192, PlaceChat: "gpu"}
 	for _, k := range []gateway.SlotKind{
 		gateway.KindChat, gateway.KindEmbed, gateway.KindCodeEmbed, gateway.KindRerank,
 	} {

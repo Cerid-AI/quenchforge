@@ -253,6 +253,15 @@ type Config struct {
 	// GovernorIntervalMS is how often the governor re-reads host pressure.
 	GovernorIntervalMS int
 
+	// Place{Chat,Embed,CodeEmbed,Rerank} override the per-kind device
+	// placement ("gpu" | "cpu" | "auto"). Empty = use the hardware-adaptive
+	// default from internal/placement (AMD-discrete: chat=cpu, others=gpu;
+	// non-AMD: all gpu). "auto" dual-places and routes per request by batch.
+	PlaceChat      string
+	PlaceEmbed     string
+	PlaceCodeEmbed string
+	PlaceRerank    string
+
 	// TelemetryEnabled is opt-in. Wired in v0.2 once the consent screen ships.
 	TelemetryEnabled bool
 
@@ -349,6 +358,10 @@ func Load() (Config, error) {
 	cfg.GPUDutyCycleDisplayActive = envFloatOr("QUENCHFORGE_GPU_DUTY_DISPLAY_ACTIVE", cfg.GPUDutyCycleDisplayActive)
 	cfg.GovernorMaxCooldownMS = envIntOr("QUENCHFORGE_GOVERNOR_MAX_COOLDOWN_MS", cfg.GovernorMaxCooldownMS)
 	cfg.GovernorIntervalMS = envIntOr("QUENCHFORGE_GOVERNOR_INTERVAL_MS", cfg.GovernorIntervalMS)
+	cfg.PlaceChat = envOr("QUENCHFORGE_PLACE_CHAT", cfg.PlaceChat)
+	cfg.PlaceEmbed = envOr("QUENCHFORGE_PLACE_EMBED", cfg.PlaceEmbed)
+	cfg.PlaceCodeEmbed = envOr("QUENCHFORGE_PLACE_CODE_EMBED", cfg.PlaceCodeEmbed)
+	cfg.PlaceRerank = envOr("QUENCHFORGE_PLACE_RERANK", cfg.PlaceRerank)
 	cfg.TelemetryEnabled = envBoolOr("QUENCHFORGE_TELEMETRY", false)
 	cfg.AdvertiseMDNS = envBoolOr("QUENCHFORGE_ADVERTISE_MDNS", false)
 

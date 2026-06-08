@@ -98,7 +98,7 @@ func TestBuildSlotArgs_AMDChatGetsCorrectnessFlags(t *testing.T) {
 		hardware.ProfileRDNA2,
 	} {
 		t.Run(string(profile), func(t *testing.T) {
-			cfg := config.Config{MaxContext: 8192}
+			cfg := config.Config{MaxContext: 8192, PlaceChat: "gpu"} // exercise GPU chat path (default is now CPU)
 			info := hardware.Info{Profile: profile}
 			spec := slotSpec{
 				Kind: gateway.KindChat,
@@ -259,7 +259,7 @@ func TestSlotEnv_ChatKeepsGlobalNCB(t *testing.T) {
 // kind (chat, embed, code-embed, rerank). Required to disable the upstream
 // MTLDispatchTypeConcurrent path that's unreliable on non-UMA Metal.
 func TestSlotEnv_AMDIncludesConcurrencyDisable(t *testing.T) {
-	cfg := config.Config{}
+	cfg := config.Config{PlaceChat: "gpu"} // chat default is now CPU; force GPU to test its Metal env
 	hwInfo := hardware.Info{Profile: hardware.ProfileVegaPro}
 
 	for _, kind := range []gateway.SlotKind{
@@ -348,7 +348,7 @@ func TestBuildSlotArgs_LowVRAMAMDCapsContextAndUbatch(t *testing.T) {
 	// capped --ctx-size 4096 (down from MaxContext 8192) and --ubatch-size
 	// 512 on embed/chat without any operator env var — the gap that used
 	// to force manual QUENCHFORGE_MAX_CONTEXT / _EMBED_UBATCH_SIZE tuning.
-	cfg := config.Config{MaxContext: 8192}
+	cfg := config.Config{MaxContext: 8192, PlaceChat: "gpu"} // chat default is now CPU; force GPU to test the context cap
 	info := hardware.Info{Profile: hardware.ProfileRDNA1, GPUVRAMGB: 8}
 
 	embedArgs := buildSlotArgs(cfg, info, slotSpec{Kind: gateway.KindEmbed, Name: "embed", Port: 11501}, "/tmp/e.gguf")
