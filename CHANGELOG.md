@@ -8,6 +8,55 @@ patch bumps fix bugs or polish without behaviour change.
 
 ---
 
+## v0.9.0 — GPU resource-control framework: placement + governor (2026-06-08)
+
+A two-part control plane so sustained inference on a single-GPU Mac can't
+starve the display compositor (WindowServer) into a kernel-watchdog panic, and
+so each workload runs on the device that actually serves it best.
+
+### Placement — where work runs (`internal/placement`)
+
+Per-kind device policy `gpu | cpu | auto`, hardware-adaptive defaults, operator
+overrides via `QUENCHFORGE_PLACE_{CHAT,EMBED,CODE_EMBED,RERANK}`.
+
+- On AMD-discrete (e.g. Mac Pro 2019 + Vega II), **chat and rerank default to
+  CPU** — measured single-request latency is far better on CPU than the AMD
+  Metal path (chat ~4–5s vs ~27s for 32 tokens; corroborated by
+  `bench-llama-sustained-load` p50≈29s) — which also removes them from
+  compositor GPU contention. Non-AMD (Apple Silicon UMA) keeps everything on GPU.
+- embed / code-embed default to GPU (the v0.8.0 batched-throughput win) and may
+  run **`auto`**: a dual GPU+CPU instance where the gateway routes each request
+  by input count — single → CPU (latency), batched → GPU (throughput). CPU
+  instances bind `QUENCHFORGE_{EMBED,CODE_EMBED}_CPU_PORT` (11511/11516);
+  `QUENCHFORGE_AUTO_BATCH_THRESHOLD` (default 1) is the split point.
+
+### Governor — how much GPU (`internal/pressure` + `internal/scheduler` + gateway)
+
+Adaptive GPU admission: a concurrency cap **plus duty-cycle idle gaps** — the
+key lever, because concurrency capping alone does not prevent starvation
+(sustained gapless command buffers do, at any concurrency). Driven by a
+display-power + memory-pressure sensor: full throughput when headless or the
+display is asleep; reserve compositor headroom when a screen is driven. Env:
+`QUENCHFORGE_GOVERNOR`, `_GPU_CONCURRENCY_{MAX,DISPLAY_ACTIVE}`,
+`_GPU_DUTY_DISPLAY_ACTIVE`, `_GOVERNOR_MAX_COOLDOWN_MS`.
+
+### Safety / compatibility
+
+- Dormant by default: with no kind set to `auto`, no second instance launches and
+  the single-upstream path is unchanged; the governor is a no-op when headless.
+- Single GPU-admission chokepoint (`withGPUAdmission`); CPU-placed kinds skip
+  admission entirely. CPU-routed work runs ungoverned at full speed.
+- Note: `Device Utilization %` from ioreg is unreliable on AMD-discrete Macs —
+  validate GPU contention with Instruments' Metal System Trace.
+
+### Also in this release
+
+- Public-surface consolidation: drift fixes, leak redaction, internal-doc removal.
+- `rebase-upstream`: apply the committed patch series directly onto upstream.
+- README refreshed; `docs/APPLE_DEVELOPER_ID.md` made maintainer-local.
+
+---
+
 ## v0.8.2 — one-line curl installer (2026-06-02)
 
 ### One-line installer
