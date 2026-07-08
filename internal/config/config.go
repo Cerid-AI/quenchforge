@@ -82,10 +82,10 @@
 //	QUENCHFORGE_RERANK_METAL_N_CB  — per-slot GGML_METAL_N_CB for the rerank
 //	                            slot. Same semantics as EMBED_METAL_N_CB.
 //	QUENCHFORGE_AUTO_BACKOFF — opt-in: gateway returns 503 + Retry-After when
-//	                            a slot's rolling latency p99 is at the
-//	                            "critical" threshold (impending crash).
-//	                            Lets consumers throttle before the slot
-//	                            SIGABRTs. Default "off".
+//	                            a slot instance's rolling ERROR RATE is at
+//	                            the "critical" threshold (the family-B crash
+//	                            signature). Latency-ratio degradation is
+//	                            observability-only and never sheds. Default "off".
 //	QUENCHFORGE_TELEMETRY    — opt-in: "on" or "off". Default "off".
 //	QUENCHFORGE_ADVERTISE_MDNS — opt-in: advertise `_quenchforge._tcp.local.`
 //	                            via the system mDNSResponder. Default "off".
@@ -228,9 +228,10 @@ type Config struct {
 	RerankMetalNCB int
 
 	// AutoBackoffEnabled is the opt-in flag for the gateway's
-	// 503+Retry-After response when a slot reaches the "critical"
-	// latency threshold. Default false — observability via /health
-	// works without this flag; only the back-pressure response is gated.
+	// 503+Retry-After response when a slot instance reaches the "critical"
+	// error-rate threshold (latency-ratio degradation is observability-only).
+	// Default false — observability via /health works without this flag;
+	// only the back-pressure response is gated.
 	AutoBackoffEnabled bool
 
 	// GovernorEnabled turns on the GPU-pressure governor: adaptive admission

@@ -8,6 +8,51 @@ patch bumps fix bugs or polish without behaviour change.
 
 ---
 
+## v0.9.1 — CPU-slot batch sizing + instance-scoped error-rate backoff (2026-07-08)
+
+Root-caused from a downstream eval incident (cerid `/agent/query` burst):
+three interacting defects turned a routine retrieval workload into
+deterministic 500s and a 60-second 503 storm.
+
+### Fixed — CPU-placed slots reverted to llama-server's 512-token batch
+
+`cpuTuning` returned only `--gpu-layers 0`, so every CPU-placed slot (rerank
++ the "auto" embed/code-embed CPU twins — CPU placement shipped in v0.9.0)
+ran at llama-server's 512 default physical batch. The embedding and rerank
+pooling paths reject any single sequence longer than n_ubatch, so every
+>512-token (query, doc) pair or single input returned HTTP 500 "input too
+large to process" — reintroducing the v0.5.0 512-token-limit bug on the CPU
+path, and silently dropping the documented `QUENCHFORGE_RERANK_BATCH_SIZE` /
+`QUENCHFORGE_EMBED_UBATCH_SIZE` overrides (dead knobs on CPU-placed slots).
+
+Now: CPU-placed embed/code-embed/rerank slots size the physical batch to the
+context (no Metal staging pressure exists on CPU; fits-context ⇒ fits-batch,
+the same principle the non-AMD embed path always used), and operator
+overrides reach CPU-placed slots. GPU-placed rerank also gains a real
+default (non-AMD: context-sized; AMD-discrete: the bench-validated amdSizing
+ubatch as a staging cap) — the old "no default" shipped llama-server's 512,
+a strictly-worse deterministic 500 generator.
+
+### Fixed — auto-backoff false positives: 503 storms from healthy slots
+
+The v0.6.0 p99/p50-ratio classifier assumed one homogeneous instance per
+kind. v0.9.0's "auto" placement made embed latency bimodal by design
+(millisecond CPU singles + multi-second governed GPU batches) — one mixed
+60-second window pushed the ratio past 5x and flipped "critical" with a 0.00
+error rate, after which `QUENCHFORGE_AUTO_BACKOFF=true` shed ALL embed
+traffic (including requests bound for the idle, healthy CPU twin) with 503s.
+
+Now: (a) the dual-placed CPU twin records under its own tracker key
+(`embed-cpu` / `code-embed-cpu`, visible in `/health`), so the two
+instances' distributions never mix and backoff is evaluated against the
+instance a request actually routes to; (b) shedding fires on a critical
+ERROR RATE only — the actual family-B crash signature — while latency-ratio
+degradation remains observability-only in `/health` ("degrade to working,
+not 503"); (c) backoff state transitions log once (`auto-backoff ON/OFF for
+<slot>`), so the next storm is diagnosable from the gateway's own log.
+
+---
+
 ## v0.9.0 — GPU resource-control framework: placement + governor (2026-06-08)
 
 A two-part control plane so sustained inference on a single-GPU Mac can't

@@ -359,19 +359,57 @@ func TestKernelParams_EmbedNonAMDNoAutoRespawn(t *testing.T) {
 	}
 }
 
-func TestKernelParams_RerankNoBatchOverrideByDefault(t *testing.T) {
-	// Without QUENCHFORGE_RERANK_BATCH_SIZE the rerank slot keeps
-	// llama-server's 512 default (matches current behaviour). Operators
-	// who need larger pairs set the env var.
+func TestKernelParams_RerankBatchSizedByDefault(t *testing.T) {
+	// Regression test for the 2026-07-08 cerid eval incident: llama-server's
+	// rerank pooling path 500s any (query, doc) pair longer than n_ubatch, so
+	// the pre-v0.9.1 "no default" behaviour (llama-server's 512) was a
+	// deterministic 500 generator for real-world 600–2k-token chunks. Every
+	// profile must now ship a batch default:
+	//   - CPU-placed rerank (AMD-discrete placement default): MaxContext —
+	//     no Metal staging pressure on CPU; fits-context ⇒ fits-batch.
+	//   - GPU-placed non-AMD: MaxContext (same principle as embedParams).
+	//   - GPU-placed AMD (operator-forced): amdSizing ubatch (staging cap).
 	cfg := config.Config{MaxContext: 8192}
 	for _, p := range allProfiles {
 		t.Run(string(p), func(t *testing.T) {
 			tn := KernelParams(p, vramHigh, gateway.KindRerank, cfg)
-			if tn.BatchSize != 0 {
-				t.Errorf("%s rerank BatchSize = %d, want 0 (no override)",
+			if tn.BatchSize != 8192 {
+				t.Errorf("%s rerank BatchSize = %d, want 8192 (MaxContext)",
 					p, tn.BatchSize)
 			}
+			if tn.UbatchSize != tn.BatchSize {
+				t.Errorf("%s rerank UbatchSize = %d, want %d (mirrors BatchSize)",
+					p, tn.UbatchSize, tn.BatchSize)
+			}
 		})
+	}
+	// AMD forced onto the GPU keeps the bench-validated staging-pressure cap.
+	gpuCfg := config.Config{MaxContext: 8192, PlaceRerank: "gpu"}
+	_, wantUbatch := amdSizing(vramHigh)
+	for _, p := range amdProfiles {
+		t.Run(string(p)+"/gpu-forced", func(t *testing.T) {
+			tn := KernelParams(p, vramHigh, gateway.KindRerank, gpuCfg)
+			if tn.BatchSize != wantUbatch {
+				t.Errorf("%s GPU rerank BatchSize = %d, want %d (amdSizing ubatch)",
+					p, tn.BatchSize, wantUbatch)
+			}
+		})
+	}
+}
+
+func TestKernelParams_CPUPlacedHonoursOverrides(t *testing.T) {
+	// The documented QUENCHFORGE_RERANK_BATCH_SIZE / QUENCHFORGE_EMBED_UBATCH_SIZE
+	// overrides must reach CPU-placed slots too — before v0.9.1 cpuTuning
+	// silently dropped them (dead knobs on the placement CPU path).
+	cfg := config.Config{MaxContext: 8192, RerankBatchSize: 2048, EmbedUbatchSize: 4096,
+		PlaceRerank: "cpu", PlaceEmbed: "cpu"}
+	rr := KernelParams(hardware.ProfileVegaPro, vramHigh, gateway.KindRerank, cfg)
+	if rr.BatchSize != 2048 || rr.UbatchSize != 2048 {
+		t.Errorf("CPU rerank batch = %d/%d, want 2048/2048 (override)", rr.BatchSize, rr.UbatchSize)
+	}
+	em := KernelParams(hardware.ProfileVegaPro, vramHigh, gateway.KindEmbed, cfg)
+	if em.BatchSize != 4096 || em.UbatchSize != 4096 {
+		t.Errorf("CPU embed batch = %d/%d, want 4096/4096 (override)", em.BatchSize, em.UbatchSize)
 	}
 }
 
@@ -508,15 +546,29 @@ func TestKernelParams_UbatchOverrideBeatsTierButCapStands(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestKernelParamsForDevice_ExplicitCPU(t *testing.T) {
-	// An explicit CPU device yields the minimal CPU tuning (--gpu-layers 0,
-	// no Metal env, no respawn) regardless of profile or batch sizing.
+	// An explicit CPU device yields CPU tuning: --gpu-layers 0, no Metal env,
+	// no respawn — but embedding-family kinds still get the context-sized
+	// batch (llama-server's embedding/rerank pooling paths reject any single
+	// sequence longer than n_ubatch, and CPU has no staging-pressure reason
+	// to cap it — the v0.9.1 fix for the 2026-07-08 512-token 500s).
 	cfg := config.Config{MaxContext: 8192}
 	tn := KernelParamsForDevice(hardware.ProfileVegaPro, vramHigh, gateway.KindEmbed, cfg, placement.CPU)
 	if !slices.Equal(tn.ExtraArgs, []string{"--gpu-layers", "0"}) {
 		t.Errorf("explicit CPU ExtraArgs = %v, want [--gpu-layers 0]", tn.ExtraArgs)
 	}
-	if tn.MetalConcurrencyDisable || tn.AutoRespawn || tn.UbatchSize != 0 || tn.MetalNCB != 0 {
-		t.Errorf("explicit CPU should emit minimal tuning, got %+v", tn)
+	if tn.MetalConcurrencyDisable || tn.AutoRespawn || tn.MetalNCB != 0 {
+		t.Errorf("explicit CPU should emit no Metal/respawn tuning, got %+v", tn)
+	}
+	if tn.UbatchSize != 8192 || tn.BatchSize != 8192 {
+		t.Errorf("explicit CPU embed batch = %d/%d, want 8192/8192 (MaxContext)",
+			tn.UbatchSize, tn.BatchSize)
+	}
+	// Chat on CPU stays minimal — its prompt path splits across ubatches, so
+	// no batch sizing is needed (and the prompt cache stays on).
+	chat := KernelParamsForDevice(hardware.ProfileVegaPro, vramHigh, gateway.KindChat, cfg, placement.CPU)
+	if chat.UbatchSize != 0 || chat.BatchSize != 0 {
+		t.Errorf("explicit CPU chat batch = %d/%d, want 0/0 (minimal)",
+			chat.UbatchSize, chat.BatchSize)
 	}
 }
 

@@ -162,7 +162,7 @@ flow and its copy must land in `internal/obs/` with a maintainer review.
    ```
    QUENCHFORGE_EMBED_UBATCH_SIZE=1024   # override tier ubatch — caps Metal staging-buffer pressure
    QUENCHFORGE_EMBED_METAL_N_CB=1       # serialise command-buffer submission
-   QUENCHFORGE_AUTO_BACKOFF=true        # auto-503 before SIGABRT
+   QUENCHFORGE_AUTO_BACKOFF=true        # auto-503 on critical ERROR RATE (crash signature) — v0.9.1: latency ratio is observability-only, never sheds
    ```
 
    The ≥ 12 GB tier keeps the bench-validated Vega II values verbatim;

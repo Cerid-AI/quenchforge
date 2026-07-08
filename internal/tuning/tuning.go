@@ -126,7 +126,7 @@ func KernelParams(profile hardware.Profile, vramGB int, kind gateway.SlotKind, c
 	// where the Metal path is ~7x slower than CPU), return the minimal CPU
 	// tuning instead.
 	if PolicyFor(profile, cfg).Device(string(kind)) == placement.CPU {
-		return cpuTuning()
+		return cpuTuning(kind, cfg)
 	}
 	return gpuKernelParams(profile, vramGB, kind, cfg)
 }
@@ -140,7 +140,7 @@ func KernelParams(profile hardware.Profile, vramGB int, kind gateway.SlotKind, c
 // KernelParams produces for a GPU-placed slot.
 func KernelParamsForDevice(profile hardware.Profile, vramGB int, kind gateway.SlotKind, cfg config.Config, dev placement.Device) SlotTuning {
 	if dev == placement.CPU {
-		return cpuTuning()
+		return cpuTuning(kind, cfg)
 	}
 	return gpuKernelParams(profile, vramGB, kind, cfg)
 }
@@ -173,12 +173,40 @@ func PolicyFor(profile hardware.Profile, cfg config.Config) placement.Policy {
 	})
 }
 
-// cpuTuning is the minimal CPU-route tuning: all layers on CPU and none of the
+// cpuTuning is the CPU-route tuning: all layers on CPU and none of the
 // GPU-only Metal env or cache-disabling flags, so the CPU prompt cache stays
 // on (the measured fast path: chat ~3.8s vs ~27s GPU for 32 tokens on Vega II).
 // The --embedding / --reranking slot flags are added by the slotSpec, not here.
-func cpuTuning() SlotTuning {
-	return SlotTuning{ExtraArgs: []string{"--gpu-layers", "0"}}
+//
+// Embedding-family kinds (embed / code-embed / rerank) size the physical
+// batch to the context: llama-server's embedding and rerank pooling paths
+// reject any single sequence longer than n_ubatch ("input too large to
+// process", HTTP 500), and the CPU backend has none of the Metal
+// staging-buffer pressure that motivates the AMD-GPU ubatch caps — so the
+// non-AMD embedParams principle applies verbatim: any input that fits the
+// context fits a single batch. Before v0.9.1 this returned only
+// `--gpu-layers 0`, silently reverting CPU-placed slots to llama-server's
+// 512-token default batch — which both reintroduced the v0.5.0
+// 512-token-limit bug on the placement CPU twins and made the documented
+// QUENCHFORGE_RERANK_BATCH_SIZE / QUENCHFORGE_EMBED_UBATCH_SIZE overrides
+// dead knobs on CPU-placed slots (2026-07-08 cerid eval incident).
+func cpuTuning(kind gateway.SlotKind, cfg config.Config) SlotTuning {
+	t := SlotTuning{ExtraArgs: []string{"--gpu-layers", "0"}}
+	switch kind {
+	case gateway.KindEmbed, gateway.KindCodeEmbed:
+		b := cfg.MaxContext
+		if cfg.EmbedUbatchSize > 0 {
+			b = cfg.EmbedUbatchSize
+		}
+		t.UbatchSize, t.BatchSize = b, b
+	case gateway.KindRerank:
+		b := cfg.MaxContext
+		if cfg.RerankBatchSize > 0 {
+			b = cfg.RerankBatchSize
+		}
+		t.UbatchSize, t.BatchSize = b, b
+	}
+	return t
 }
 
 // chatParams returns the chat-slot tuning. AMD-discrete profiles get
@@ -279,29 +307,36 @@ func embedParams(profile hardware.Profile, vramGB int, cfg config.Config) SlotTu
 	return t
 }
 
-// rerankParams returns rerank slot tuning.
+// rerankParams returns rerank (GPU-placed) slot tuning.
 //
-// The reranker has no batch override today (cf. buildSlotArgs comment)
-// because it scores (query, doc) pairs individually. But llama-server's
-// 512-token default batch is too small for any (query, doc) pair where
-// the document exceeds ~510 tokens, and bge-reranker-v2-m3 + similar
-// modern rerankers are routinely fed 1k-2k-token chunks. The operator
-// can raise this with QUENCHFORGE_RERANK_BATCH_SIZE; we don't ship a
-// non-zero default here because the right value is workload-specific.
+// llama-server's rerank pooling path rejects any (query, doc) pair longer
+// than n_ubatch ("input too large to process", HTTP 500), and its 512-token
+// default is too small for the 600–2k-token chunks modern rerankers
+// (bge-reranker-v2-m3 and kin) are routinely fed. v0.9.0 and earlier shipped
+// no default on the theory that the right value is workload-specific; the
+// 2026-07-08 cerid eval incident showed the 512 default is a deterministic
+// 500 generator, which is strictly worse than any reasonable default. So:
+// non-AMD profiles size the batch to the context (same principle as
+// embedParams — any pair that fits the context fits a batch); AMD-discrete
+// keeps the bench-validated amdSizing ubatch as a Metal staging-pressure
+// cap. QUENCHFORGE_RERANK_BATCH_SIZE still overrides both.
 //
 // AutoRespawn fires on AMD discrete same as embed. AMD profiles also
 // get the conservative MetalNCB=1 default same as embed.
 func rerankParams(profile hardware.Profile, vramGB int, cfg config.Config) SlotTuning {
 	t := SlotTuning{}
-	if cfg.RerankBatchSize > 0 {
-		t.BatchSize = cfg.RerankBatchSize
-		t.UbatchSize = cfg.RerankBatchSize
-	}
+	batch := cfg.MaxContext
 	if profileIsAMDDiscrete(profile) {
-		ctxCap, _ := amdSizing(vramGB)
+		ctxCap, ubatch := amdSizing(vramGB)
 		t.ContextSize = ctxCap
 		t.MetalNCB = amdEmbedMetalNCBDefault
+		batch = ubatch
 	}
+	if cfg.RerankBatchSize > 0 {
+		batch = cfg.RerankBatchSize
+	}
+	t.BatchSize = batch
+	t.UbatchSize = batch
 	if cfg.RerankMetalNCB > 0 {
 		t.MetalNCB = cfg.RerankMetalNCB
 	}

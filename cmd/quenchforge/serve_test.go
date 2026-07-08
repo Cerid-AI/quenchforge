@@ -373,22 +373,34 @@ func TestBuildSlotArgs_LowVRAMAMDCapsContextAndUbatch(t *testing.T) {
 	}
 }
 
-func TestBuildSlotArgs_NonEmbedKindsSkipBatchOverride(t *testing.T) {
-	// Chat / rerank / whisper slots don't need the embed batch override
-	// (they decode autoregressively or operate per-pair). Adding it
-	// would waste VRAM on the chat slot in particular.
+func TestBuildSlotArgs_ChatSkipsBatchOverride(t *testing.T) {
+	// The chat slot doesn't need the embed batch override — it decodes
+	// autoregressively and its prompt path splits across ubatches; adding it
+	// would waste VRAM. (Rerank USED to be in this list; since v0.9.1 it
+	// carries a context-sized batch because llama-server's rerank pooling
+	// path 500s any (query, doc) pair longer than n_ubatch — see
+	// tuning.rerankParams and the 2026-07-08 incident regression tests.)
 	cfg := config.Config{MaxContext: 8192}
 	info := hardware.Info{Profile: hardware.ProfileVegaPro}
 
-	for _, kind := range []gateway.SlotKind{gateway.KindChat, gateway.KindRerank} {
-		t.Run(string(kind), func(t *testing.T) {
-			spec := slotSpec{Kind: kind, Name: string(kind), Port: 11500}
-			args := buildSlotArgs(cfg, info, spec, "/tmp/model.gguf")
+	spec := slotSpec{Kind: gateway.KindChat, Name: "chat", Port: 11500}
+	args := buildSlotArgs(cfg, info, spec, "/tmp/model.gguf")
+	if containsArgPair(args, "--batch-size", "8192") {
+		t.Errorf("chat slot must not pass --batch-size 8192: %v", args)
+	}
+}
 
-			if containsArgPair(args, "--batch-size", "8192") {
-				t.Errorf("%s slot must not pass --batch-size 8192: %v", kind, args)
-			}
-		})
+func TestBuildSlotArgs_RerankCarriesContextSizedBatch(t *testing.T) {
+	// Regression (2026-07-08): the CPU-placed rerank slot spawned with no
+	// batch flags, reverting to llama-server's 512 default — every
+	// >512-token (query, doc) pair returned HTTP 500 "input too large".
+	cfg := config.Config{MaxContext: 8192}
+	info := hardware.Info{Profile: hardware.ProfileVegaPro}
+
+	spec := slotSpec{Kind: gateway.KindRerank, Name: "rerank", Port: 11502}
+	args := buildSlotArgs(cfg, info, spec, "/tmp/model.gguf")
+	if !containsArgPair(args, "--batch-size", "8192") || !containsArgPair(args, "--ubatch-size", "8192") {
+		t.Errorf("CPU-placed rerank slot must carry context-sized batch args: %v", args)
 	}
 }
 

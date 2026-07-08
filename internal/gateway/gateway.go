@@ -36,6 +36,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -105,6 +106,13 @@ type Gateway struct {
 	// for "auto"-placed kinds.
 	policy        placement.Policy
 	autoThreshold int
+
+	// backoffOn remembers, per tracker key, whether auto-backoff was shedding
+	// on the previous shouldBackoff evaluation — so state transitions log
+	// exactly once instead of once per rejected request (or never, which is
+	// what made the 2026-07-08 503 storm cost hours to diagnose).
+	backoffMu sync.Mutex
+	backoffOn map[SlotKind]bool
 }
 
 // New returns a Gateway bound to cfg. The server is not yet listening;
@@ -312,13 +320,19 @@ func (g *Gateway) SetPlacement(p placement.Policy, threshold int) {
 //     GPU upstream so a missing CPU slot degrades to working-but-on-GPU rather
 //     than 503. A GPU verdict always uses the GPU upstream.
 //
-// onGPU reports whether the chosen instance needs GPU admission; ok is false
-// when the chosen upstream has no proxy (slot not configured) so the caller can
-// return 503. The zero-value policy reports "gpu", so the default is the GPU
+// onGPU reports whether the chosen instance needs GPU admission. track is the
+// latency-tracker key for the chosen INSTANCE — the "auto" CPU twin records
+// under "<kind>-cpu" so its millisecond singles and the GPU instance's
+// multi-second batches never share one latency distribution (a mixed window
+// made the p99/p50 classifier report a false "critical" and 503 ALL embed
+// traffic during the 2026-07-08 cerid eval incident). ok is false when the
+// chosen upstream has no proxy (slot not configured) so the caller can return
+// 503. The zero-value policy reports "gpu", so the default is the GPU
 // upstream — identical to the pre-placement single-upstream path.
-func (g *Gateway) routeEmbed(kind SlotKind, batchN int) (entry upstreamEntry, onGPU bool, ok bool) {
+func (g *Gateway) routeEmbed(kind SlotKind, batchN int) (entry upstreamEntry, onGPU bool, track SlotKind, ok bool) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
+	track = kind
 	switch g.policy.Mode(string(kind)) {
 	case placement.ModeCPU:
 		entry = g.upstreams[kind]
@@ -326,7 +340,7 @@ func (g *Gateway) routeEmbed(kind SlotKind, batchN int) (entry upstreamEntry, on
 	case placement.ModeAuto:
 		if g.policy.RouteRequest(string(kind), batchN, g.autoThreshold) == placement.CPU {
 			if e, exists := g.cpuUpstreams[kind]; exists && e.proxy != nil {
-				return e, false, true
+				return e, false, cpuTrackKind(kind), true
 			}
 		}
 		entry = g.upstreams[kind]
@@ -336,7 +350,14 @@ func (g *Gateway) routeEmbed(kind SlotKind, batchN int) (entry upstreamEntry, on
 		onGPU = true
 	}
 	ok = entry.proxy != nil
-	return entry, onGPU, ok
+	return entry, onGPU, track, ok
+}
+
+// cpuTrackKind derives the latency-tracker key for the CPU twin instance of a
+// dual-placed kind. Kept as a helper so /health consumers and tests share one
+// naming rule ("embed-cpu", "code-embed-cpu").
+func cpuTrackKind(kind SlotKind) SlotKind {
+	return kind + "-cpu"
 }
 
 // countEmbedInputs returns the number of inputs in an embedding request, used
@@ -518,10 +539,12 @@ func (g *Gateway) handleRoot(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleHealth returns the gateway's overall status plus a per-slot
-// breakdown of rolling-window latency and error rate. Always 200 while
-// the gateway is reachable — consumers parse the JSON to decide whether
-// to throttle. The opt-in QUENCHFORGE_AUTO_BACKOFF flag is the only
-// thing that turns a `critical` snapshot into an actual 503 on the
+// breakdown of rolling-window latency and error rate. Dual-placed "auto"
+// kinds report their CPU twin under a separate "<kind>-cpu" key so the two
+// instances' latency distributions stay legible. Always 200 while the
+// gateway is reachable — consumers parse the JSON to decide whether to
+// throttle. The opt-in QUENCHFORGE_AUTO_BACKOFF flag turns a critical
+// ERROR RATE (only — never the latency ratio) into an actual 503 on the
 // upstream proxy paths; /health itself never blocks.
 //
 // Schema:
@@ -612,9 +635,11 @@ func (g *Gateway) handleTags(w http.ResponseWriter, _ *http.Request) {
 // Latency tracking: every upstream call records duration + error-flag in
 // the gateway's rolling per-kind tracker. /health surfaces the resulting
 // status (ok | degraded | critical). When QUENCHFORGE_AUTO_BACKOFF is on
-// and the slot is currently `critical`, the handler returns 503 +
-// Retry-After before forwarding — gives consumers a structured signal to
-// throttle before the family-B Metal crash tips the slot over.
+// and the slot's error rate is critical (the family-B crash signature —
+// SIGABRT → dead upstream → 5xx burst while AutoRespawn recovers), the
+// handler returns 503 + Retry-After before forwarding, giving consumers a
+// structured signal instead of a hang. Latency-ratio degradation is
+// observability-only and never sheds.
 func (g *Gateway) proxyHandler(kind SlotKind, rewriteTo string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		g.mu.RLock()
@@ -628,7 +653,7 @@ func (g *Gateway) proxyHandler(kind SlotKind, rewriteTo string) http.HandlerFunc
 		if g.shouldBackoff(kind) {
 			w.Header().Set("Retry-After", "2")
 			writeJSONError(w, http.StatusServiceUnavailable,
-				fmt.Sprintf("%s slot is at critical latency — back off (Retry-After: 2s)", kind))
+				fmt.Sprintf("%s slot is shedding load (critical error rate) — back off (Retry-After: 2s)", kind))
 			return
 		}
 		if rewriteTo != "" {
@@ -643,13 +668,48 @@ func (g *Gateway) proxyHandler(kind SlotKind, rewriteTo string) http.HandlerFunc
 }
 
 // shouldBackoff reports whether the gateway should preemptively 503 a
-// request to `kind`. Gated on cfg.AutoBackoffEnabled so the default
-// behaviour is observability-only.
+// request to the tracker key `kind` (a slot kind, or an instance key like
+// "embed-cpu"). Gated on cfg.AutoBackoffEnabled so the default behaviour is
+// observability-only.
+//
+// The trigger is the ERROR RATE only — the signal that actually precedes and
+// accompanies the family-B Metal crash (SIGABRT → dead upstream → 5xx burst
+// while AutoRespawn brings the slot back). The p99/p50 latency ratio remains
+// an observability status in /health but never sheds: it is workload-shape
+// sensitive (one 26s GPU batch against millisecond singles reads as
+// ratio≈1700 with zero failures — the 2026-07-08 false-critical incident),
+// and the roadmap principle is "degrade to working, not 503".
 func (g *Gateway) shouldBackoff(kind SlotKind) bool {
 	if !g.cfg.AutoBackoffEnabled {
 		return false
 	}
-	return g.latency.SnapshotKind(kind).Status == StatusCritical
+	snap := g.latency.SnapshotKind(kind)
+	on := snap.Samples >= statusMinSamples && snap.ErrorRate > statusCriticalErrorRate
+	g.logBackoffTransition(kind, on, snap)
+	return on
+}
+
+// logBackoffTransition emits one log line when a tracker key enters or
+// leaves the shedding state. Per-request logging would flood under a storm;
+// no logging at all is how the 2026-07-08 silent 503 storm cost hours to
+// diagnose from the caller's side.
+func (g *Gateway) logBackoffTransition(kind SlotKind, on bool, snap LatencySnapshot) {
+	g.backoffMu.Lock()
+	defer g.backoffMu.Unlock()
+	if g.backoffOn == nil {
+		g.backoffOn = make(map[SlotKind]bool)
+	}
+	if g.backoffOn[kind] == on {
+		return
+	}
+	g.backoffOn[kind] = on
+	if on {
+		log.Printf("quenchforge: auto-backoff ON for %s (error_rate=%.2f over %d samples) — shedding with 503 + Retry-After",
+			kind, snap.ErrorRate, snap.Samples)
+	} else {
+		log.Printf("quenchforge: auto-backoff OFF for %s (error_rate=%.2f over %d samples)",
+			kind, snap.ErrorRate, snap.Samples)
+	}
 }
 
 // serveAndTrack wraps ServeHTTP so the per-kind latency tracker sees
@@ -750,7 +810,7 @@ func (g *Gateway) handleOpenAIEmbeddings() http.HandlerFunc {
 		_ = json.Unmarshal(raw, &probe) // tolerate empty/invalid bodies; let upstream reject
 		kind := g.resolveEmbedKind(probe.Model)
 		batchN := countEmbedInputs(probe.Input, "")
-		entry, onGPU, ok := g.routeEmbed(kind, batchN)
+		entry, onGPU, track, ok := g.routeEmbed(kind, batchN)
 		if !ok {
 			writeJSONError(w, http.StatusServiceUnavailable,
 				fmt.Sprintf("no %s slot configured. Check `quenchforge doctor` for status.", kind))
@@ -759,13 +819,16 @@ func (g *Gateway) handleOpenAIEmbeddings() http.HandlerFunc {
 		// Re-attach the consumed body so the reverse-proxy can forward it.
 		r.Body = io.NopCloser(bytes.NewReader(raw))
 		r.ContentLength = int64(len(raw))
-		if g.shouldBackoff(kind) {
+		// Backoff is evaluated against the INSTANCE this request routes to —
+		// a struggling GPU instance must never shed traffic bound for the
+		// healthy CPU twin (and vice versa).
+		if g.shouldBackoff(track) {
 			w.Header().Set("Retry-After", "2")
 			writeJSONError(w, http.StatusServiceUnavailable,
-				fmt.Sprintf("%s slot is at critical latency — back off (Retry-After: 2s)", kind))
+				fmt.Sprintf("%s slot is shedding load (critical error rate) — back off (Retry-After: 2s)", track))
 			return
 		}
-		serve := func() { g.serveAndTrack(kind, entry.proxy, w, r) }
+		serve := func() { g.serveAndTrack(track, entry.proxy, w, r) }
 		if onGPU {
 			g.withGPUAdmission(kind, w, r, serve)
 		} else {
