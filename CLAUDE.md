@@ -141,6 +141,20 @@ flow and its copy must land in `internal/obs/` with a maintainer review.
 
 ## Operational gotchas
 
+0. **Never issue rapid successive restarts (`kickstart -k` twice, or any
+   overlapping restart) while slots are loading models.** Each restart
+   starts GPU model loads (embed slots push all layers onto the card);
+   overlapping load cycles on a display-active AMD-discrete Mac starve the
+   compositor — observed 2026-07-08 as a WindowServer
+   `userspace_watchdog_timeout` spin (GUI session crash; user-visible as a
+   "system crash"), the userspace cousin of the 2026-05-14 unload+load
+   kernel panic. One restart at a time; wait for `gateway listening` +
+   all `slot pid=` lines in `quenchforge.out.log` before issuing another.
+   Also: `launchctl` gui-domain `bootstrap`/`print` fail with "Domain does
+   not support specified action" from Background-session shells (agent
+   tools, SSH) — if a restart race unloads the job, recovery needs a
+   command from the user's own Aqua session.
+
 1. **Chat-slot AMD safety args do not apply to embed/rerank slots.**
    Sections 1 + 2 of `patches/README.md` document `--flash-attn off`,
    `--cache-ram 0`, and `--no-cache-prompt` as chat-specific (they
