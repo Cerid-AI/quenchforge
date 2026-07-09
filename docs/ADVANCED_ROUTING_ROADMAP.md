@@ -290,7 +290,14 @@ the AMD host.
 ## Phased TODO
 
 ### R-track — AMD-Metal GPU reclamation (parallel to P0–P3; different layer)
-- [ ] R1: fix `helper_mv_reduce_and_write_fb<NR0=2>` template compile; land 0003 (LayerNorm/softmax `_fb`) + 0004 (matmul `_fb`); BERT correctness bench green; staged relaxation test of `GGML_METAL_CONCURRENCY_DISABLE` / ubatch caps.
+- [x] R1 (core, 2026-07-08): compile failure root-caused (helper above the
+      FC_mul_mv_* declarations + threadgroup variable in non-kernel scope) and
+      fixed; 0003 + 0004 landed as live patches (drafts removed);
+      `bench-bert-correctness` all 4 probes PASS on Vega II GPU
+      (determinism cos_sim 1.000000 vs 0.07–0.29 broken baseline).
+- [ ] R1 (remaining): `bench-bert-sustained-load` soak on the new kernels
+      (display-asleep) → then deploy + staged relaxation test of
+      `GGML_METAL_CONCURRENCY_DISABLE` / ubatch caps, one knob at a time.
 - [ ] R2: patch 0005 quantized-matmul fallback; `bench-llama-sustained-load` p50 ≤ CPU + 7-day zero-SIGABRT soak → `chatParams` back to GPU.
 - [ ] R3: FA fallback kernel + LCP prompt-cache root-cause; remove the three chat safety flags one at a time, each behind the soak gate.
 - [ ] R4: rerank GPU-vs-CPU batched A/B (v0.9.1 batch defaults make GPU rerank runnable); extend "auto" placement to rerank if GPU wins.

@@ -8,6 +8,30 @@ patch bumps fix bugs or polish without behaviour change.
 
 ---
 
+## Unreleased — patches 0003/0004 landed: AMD-Metal BERT fallback kernels (2026-07-08)
+
+The two-month-parked `_fb` fallback kernels are live (roadmap R1, the first
+rung of the F0 GPU-reclamation track). The park-blocking compile failure in
+`helper_mv_reduce_and_write_fb<NR0=2>` was two MSL rules, not the template:
+the helper sat textually above the `FC_mul_mv_*` function constants it reads,
+and a `threadgroup` array was declared in non-kernel scope. Fixed by
+relocating the helper and hoisting a fixed 8 KiB `threadgroup` buffer into
+each `_fb` kernel entry (passed down as a parameter; the dynamic `shmem`
+entry parameter — the gfx-rs/wgpu#4500 hazard — stays unused by design).
+
+Validated on Mac Pro 2019 + Vega II: full patched Metal source compiles on
+device; `bench-bert-correctness` passes all 4 probes ON GPU with the
+fallback dispatchers active — same-batch and separate-call determinism
+cos_sim = 1.000000 (broken baseline: 0.07–0.29), paraphrase 0.9551 ≫
+unrelated 0.4430, L2 = 1.0000. The 3-way rebase onto current upstream
+(`a9883db`) is folded into the regenerated patches.
+
+Production deployment is gated on `bench-bert-sustained-load` (run
+display-asleep); the staged relaxation of `GGML_METAL_CONCURRENCY_DISABLE`
+and the ubatch caps is R1's remaining measurement.
+
+---
+
 ## v0.9.1 — CPU-slot batch sizing + instance-scoped error-rate backoff (2026-07-08)
 
 Root-caused from a downstream eval incident (cerid `/agent/query` burst):

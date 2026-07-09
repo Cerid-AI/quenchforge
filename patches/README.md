@@ -246,14 +246,26 @@ baseline: ~2.5× for nomic embed, ~1.7× for jina code-embed.
 The full empirical isolation and design rationale are captured in the
 sections above plus [`docs/METAL_AMD_BERT_CORRECTNESS.md`](../docs/METAL_AMD_BERT_CORRECTNESS.md).
 
-**Scope note — patches 0003 + 0004 parked.** The originally-planned
-`_fb` BERT fallback kernels (LayerNorm/softmax/matmul) parked to
-`patches/llama.cpp/drafts/.broken` pending a Metal kernel template
-signature fix (`helper_mv_reduce_and_write_fb<NR0=2>` doesn't
-compile). The critical path validated by the bench table above does
-NOT depend on those patches — patch 0001 (gates) + patch 0002 (pool)
-+ the env-var routing in `tuning.go` are sufficient. The `_fb`
-fallback kernels remain future optimization work.
+**Scope note — patches 0003 + 0004 LANDED (2026-07-08, roadmap R1).**
+Previously parked to `drafts/*.broken` on a compile failure in
+`helper_mv_reduce_and_write_fb<NR0=2>`. Root cause was two MSL rules,
+not the template itself: (a) the helper was inserted textually ABOVE
+the `FC_mul_mv_*` function-constant declarations it reads — Metal
+requires declaration-before-use; (b) `threadgroup float local_buf[1024]`
+was declared inside a non-kernel inline function — MSL only permits
+threadgroup variables in kernel scope. Fixed by relocating the helper
+below the FC block and hoisting a fixed `threadgroup float
+local_buf[2048]` (NR0=2 × tpg≤1024, 8 KiB) into each `_fb` kernel entry,
+threaded down as a parameter; the host's dynamic `shmem` stays unused by
+design (its entry-parameter path is the gfx-rs/wgpu#4500 hazard the
+fallbacks exist to avoid). Validated on Vega II 2026-07-08:
+`bench-bert-correctness` all 4 probes PASS on GPU with the fallback
+dispatchers active — same-batch and separate-call cos_sim = 1.000000
+(vs 0.07–0.29 broken baseline), paraphrase 0.9551 ≫ unrelated 0.4430,
+L2 = 1.0000. Production stays on the current binary until
+`bench-bert-sustained-load` also passes (run display-asleep); the
+staged relaxation of `GGML_METAL_CONCURRENCY_DISABLE` / ubatch caps is
+tracked as roadmap R1's remaining measurement.
 
 ## Honesty about whisper.cpp Metal
 

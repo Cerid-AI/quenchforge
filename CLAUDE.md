@@ -28,13 +28,15 @@ become a generic inference framework.
    Apple Silicon and Intel Mac are the only targets. If a PR adds non-Darwin
    code, the answer is no.
 3. **Minimise the patch surface.** The patch series is exactly the
-   load-bearing change(s) in `patches/<submodule>/`. As of 2026-05-25 that is:
-   - `llama.cpp`: `0001-metal-correctness-on-non-apple-silicon` + `0002-metal-staging-buffer-pool`
+   load-bearing change(s) in `patches/<submodule>/`. As of 2026-07-08 that is:
+   - `llama.cpp`: `0001-metal-correctness-on-non-apple-silicon` +
+     `0002-metal-staging-buffer-pool` + `0003-metal-amd-bert-fallback-kernels`
+     + `0004-metal-amd-bert-matmul-fallback` (0003/0004 un-parked and
+     correctness-validated on Vega II 2026-07-08 — roadmap R1)
    - `whisper.cpp`, `sd.cpp`, `bark.cpp`: `0001-metal-correctness-on-non-apple-silicon` each
-   Two further drafts (`0003`/`0004` BERT fallback kernels) are parked in
-   `patches/llama.cpp/drafts/*.broken` and are never applied. `GGML_METAL_N_CB`
-   is set via env, not a code patch. Adding any new patch requires a written
-   rationale in `patches/README.md`, a public upstream issue link, and review.
+   `GGML_METAL_N_CB` is set via env, not a code patch. Adding any new patch
+   requires a written rationale in `patches/README.md`, a public upstream
+   issue link, and review.
 4. **No `quenchforge doctor` paste = no bug-report triage.** The
    `.github/ISSUE_TEMPLATE/bug.yml` form makes this a hard requirement. Maintainer
    replies to triage-incomplete issues with the doctor-paste request and

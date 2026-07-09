@@ -1,4 +1,4 @@
-From 8e18911a20f9664bc4d66b40e52a67c6f86b6897 Mon Sep 17 00:00:00 2001
+From bd22c8a2b1d3fa560a9f2916aec7b8470b0ad39c Mon Sep 17 00:00:00 2001
 From: Quenchforge <maint@cerid-ai.com>
 Date: Mon, 18 May 2026 14:02:23 -0400
 Subject: [PATCH] metal: matmul fallback kernels for AMD-Mac BERT (v0.8.0
@@ -29,12 +29,12 @@ production path. Operators must opt back into Metal embed AFTER passing:
 
 Signed-off-by: Quenchforge Contributors <maint@cerid-ai.com>
 ---
- ggml/src/ggml-metal/ggml-metal-device.cpp |  21 +-
- ggml/src/ggml-metal/ggml-metal.metal      | 273 ++++++++++++++++++++++
- 2 files changed, 293 insertions(+), 1 deletion(-)
+ ggml/src/ggml-metal/ggml-metal-device.cpp |  22 +-
+ ggml/src/ggml-metal/ggml-metal.metal      | 283 ++++++++++++++++++++++
+ 2 files changed, 304 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
-index 9c84afb..4a5c0cf 100644
+index 9c84afb..e99b0df 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
 @@ -910,7 +910,27 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
@@ -67,12 +67,12 @@ index 9c84afb..4a5c0cf 100644
  
      ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
 diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
-index d9580f4..54d87f9 100644
+index d9580f4..e050f6e 100644
 --- a/ggml/src/ggml-metal/ggml-metal.metal
 +++ b/ggml/src/ggml-metal/ggml-metal.metal
-@@ -3648,6 +3648,72 @@ static inline void helper_mv_reduce_and_write(
-     }
- }
+@@ -3654,6 +3654,72 @@ constant short FC_mul_mv_ne12  [[function_constant(FC_MUL_MV + 2)]];
+ constant short FC_mul_mv_r2    [[function_constant(FC_MUL_MV + 3)]];
+ constant short FC_mul_mv_r3    [[function_constant(FC_MUL_MV + 4)]];
  
 +// ---------------------------------------------------------------------------
 +// Quenchforge patch 0004: matmul reduce-and-write fallback for non-Apple
@@ -86,9 +86,16 @@ index d9580f4..54d87f9 100644
 +// follows every QKV / FFN multiply.
 +//
 +// Same pattern as patch 0003 fallback kernels:
-+//   - fixed-size function-local threadgroup memory (no dynamic shared
-+//     memory as entry-point parameter; sidesteps gfx-rs/wgpu#4500)
++//   - fixed-size threadgroup memory declared in the KERNEL entry point
++//     (MSL forbids threadgroup variables in non-kernel functions, and the
++//     dynamic shared-memory entry parameter is what trips gfx-rs/wgpu#4500
++//     — the kernels pass their fixed-size array down instead)
 +//   - pure threadgroup tree-reduction (no simd_sum / simd_max)
++//
++// Placed AFTER the FC_mul_mv_* function-constant declarations above — the
++// helper reads FC_mul_mv_nsg, and Metal requires textual
++// declaration-before-use (the original draft sat above them and failed to
++// compile).
 +//
 +// Dispatched when has_simdgroup_reduction == false via the
 +// pipeline_mul_mv gating in ggml-metal-device.cpp.
@@ -101,16 +108,9 @@ index d9580f4..54d87f9 100644
 +        const int ne01,
 +        ushort tiisg,
 +        ushort sgitg,
-+        threadgroup char * shmem) {  // unused; kept for ABI symmetry
++        threadgroup float * local_buf) {  // kernel-declared fixed array, NR0*NSG*NW floats
 +    constexpr short NW = N_SIMDWIDTH;
 +    const short NSG = FC_mul_mv_nsg;
-+
-+    // Max threadgroup size is 1024 threads; NR0 is at most 4 in the
-+    // current dispatcher. Allocate the upper bound so the buffer fits
-+    // any (NW, NSG, NR0) combination the dispatcher can produce.
-+    threadgroup float local_buf[1024];
-+
-+    (void)shmem;
 +
 +    const ushort tid = sgitg*NW + tiisg;
 +    const ushort tpg = NSG*NW;
@@ -140,10 +140,10 @@ index d9580f4..54d87f9 100644
 +    }
 +}
 +
- constant short FC_mul_mv_nsg   [[function_constant(FC_MUL_MV + 0)]];
- constant short FC_mul_mv_nxpsg [[function_constant(FC_MUL_MV + 1)]];
- constant short FC_mul_mv_ne12  [[function_constant(FC_MUL_MV + 2)]];
-@@ -4399,6 +4465,108 @@ template [[host_name("kernel_mul_mv_bf16_f32")]]  kernel mul_mv_t_t kernel_mul_m
+ template<typename block_q_type, short NR0, typename args_t>
+ void mul_vec_q_n_f32_impl(
+         args_t args,
+@@ -4399,6 +4465,115 @@ template [[host_name("kernel_mul_mv_bf16_f32")]]  kernel mul_mv_t_t kernel_mul_m
  template [[host_name("kernel_mul_mv_bf16_bf16")]] kernel mul_mv_t_t kernel_mul_mv_t_t<bfloat, bfloat>;
  #endif
  
@@ -157,7 +157,7 @@ index d9580f4..54d87f9 100644
 +        device const char * src0,
 +        device const char * src1,
 +        device       char * dst,
-+        threadgroup  char * shmem,
++        threadgroup float * local_buf,
 +        uint3  tgpig,
 +        ushort tiisg,
 +        ushort sgitg) {
@@ -214,7 +214,7 @@ index d9580f4..54d87f9 100644
 +    }
 +
 +    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
-+    helper_mv_reduce_and_write_fb<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
++    helper_mv_reduce_and_write_fb<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, local_buf);
 +}
 +
 +template<typename T0, typename T1, typename args_t>
@@ -223,12 +223,12 @@ index d9580f4..54d87f9 100644
 +        device const char * src0,
 +        device const char * src1,
 +        device       char * dst,
-+        threadgroup  char * shmem,
++        threadgroup float * local_buf,
 +        uint3  tgpig,
 +        ushort tiisg,
 +        ushort sgitg) {
 +    switch (args.nr0) {
-+        case 2: kernel_mul_mv_t_t_fb_impl<T0, T1, 2, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
++        case 2: kernel_mul_mv_t_t_fb_impl<T0, T1, 2, args_t>(args, src0, src1, dst, local_buf, tgpig, tiisg, sgitg); break;
 +    }
 +}
 +
@@ -242,7 +242,14 @@ index d9580f4..54d87f9 100644
 +        uint3  tgpig[[threadgroup_position_in_grid]],
 +        ushort tiisg[[thread_index_in_simdgroup]],
 +        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-+    kernel_mul_mv_t_t_fb_disp<T0, T1, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
++    // Fixed-size threadgroup storage for the tree-reduce: NR0(=2) rows ×
++    // tpg(=NSG*NW ≤ 1024 threads) partials = 2048 floats / 8 KiB upper
++    // bound. Declared HERE because MSL only permits threadgroup variables
++    // in kernel scope; the host-provided dynamic `shmem` stays unused by
++    // design (its entry-parameter path is the gfx-rs/wgpu#4500 hazard).
++    threadgroup float local_buf[2048];
++    (void)shmem;
++    kernel_mul_mv_t_t_fb_disp<T0, T1, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, local_buf, tgpig, tiisg, sgitg);
 +}
 +
 +template [[host_name("kernel_mul_mv_f32_f32_fb")]] kernel mul_mv_t_t kernel_mul_mv_t_t_fb<float, float>;
@@ -252,7 +259,7 @@ index d9580f4..54d87f9 100644
  template<typename T0, typename T04, typename T1, typename T14, short NR0, typename args_t>
  void kernel_mul_mv_t_t_4_impl(
          args_t args,
-@@ -4523,6 +4691,111 @@ template [[host_name("kernel_mul_mv_bf16_f32_4")]]  kernel mul_mv_t_t_4 kernel_m
+@@ -4523,6 +4698,114 @@ template [[host_name("kernel_mul_mv_bf16_f32_4")]]  kernel mul_mv_t_t_4 kernel_m
  template [[host_name("kernel_mul_mv_bf16_bf16_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<bfloat, bfloat4, bfloat, bfloat4>;
  #endif
  
@@ -265,7 +272,7 @@ index d9580f4..54d87f9 100644
 +        device const char * src0,
 +        device const char * src1,
 +        device       char * dst,
-+        threadgroup  char * shmem,
++        threadgroup float * local_buf,
 +        uint3  tgpig,
 +        ushort tiisg,
 +        ushort sgitg) {
@@ -326,7 +333,7 @@ index d9580f4..54d87f9 100644
 +    }
 +
 +    device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
-+    helper_mv_reduce_and_write_fb<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
++    helper_mv_reduce_and_write_fb<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, local_buf);
 +}
 +
 +template<typename T0, typename T04, typename T1, typename T14, typename args_t>
@@ -335,12 +342,12 @@ index d9580f4..54d87f9 100644
 +        device const char * src0,
 +        device const char * src1,
 +        device       char * dst,
-+        threadgroup  char * shmem,
++        threadgroup float * local_buf,
 +        uint3  tgpig,
 +        ushort tiisg,
 +        ushort sgitg) {
 +    switch (args.nr0) {
-+        case 2: kernel_mul_mv_t_t_4_fb_impl<T0, T04, T1, T14, 2, args_t>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg); break;
++        case 2: kernel_mul_mv_t_t_4_fb_impl<T0, T04, T1, T14, 2, args_t>(args, src0, src1, dst, local_buf, tgpig, tiisg, sgitg); break;
 +    };
 +}
 +
@@ -354,7 +361,10 @@ index d9580f4..54d87f9 100644
 +        uint3  tgpig[[threadgroup_position_in_grid]],
 +        ushort tiisg[[thread_index_in_simdgroup]],
 +        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
-+    kernel_mul_mv_t_t_4_fb_disp<T0, T04, T1, T14, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
++    // See kernel_mul_mv_t_t_fb for the sizing/placement rationale.
++    threadgroup float local_buf[2048];
++    (void)shmem;
++    kernel_mul_mv_t_t_4_fb_disp<T0, T04, T1, T14, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, local_buf, tgpig, tiisg, sgitg);
 +}
 +
 +template [[host_name("kernel_mul_mv_f32_f32_4_fb")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4_fb<float, float4, float, float4>;
@@ -366,5 +376,4 @@ index d9580f4..54d87f9 100644
          args_t args,
 -- 
 2.50.1 (Apple Git-155)
- 
- 
+
