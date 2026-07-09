@@ -49,7 +49,7 @@ func TestShouldBackoff_LatencyRatioDoesNotShed(t *testing.T) {
 }
 
 func TestShouldBackoff_DisabledByDefault(t *testing.T) {
-	g := New(config.Config{}) // AutoBackoffEnabled false
+	g := New(config.Config{})                            // AutoBackoffEnabled false
 	recordN(g, KindEmbed, 30, 10*time.Millisecond, true) // 100% errors
 	if g.shouldBackoff(KindEmbed) {
 		t.Error("backoff must stay off without QUENCHFORGE_AUTO_BACKOFF")
