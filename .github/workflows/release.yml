@@ -99,11 +99,21 @@ jobs:
           # the secret was empty, wrapped, or corrupt.
           echo "decoded P12 size: $(wc -c <"$CERT_PATH") bytes"
 
+          # OpenSSL 3.x on current runner images cannot decrypt the legacy
+          # (SHA-1 MAC + 3DES/RC2) PKCS#12 format without -legacy — which is
+          # exactly the format macOS `security import` requires (see step 3
+          # below). Try the default provider first (openssl 1.1 / LibreSSL
+          # have no -legacy flag), then retry with -legacy so this preflight
+          # doesn't false-fail on the blessed format. First observed
+          # 2026-07-09: the v0.10.0 run reported "passphrase does not match"
+          # with the real error being "RC2-40-CBC ... unsupported".
+          p12() { openssl pkcs12 "$@" 2>/dev/null || openssl pkcs12 -legacy "$@"; }
+
           # Step 1: structural check (does it look like a PKCS#12 at all).
           # `openssl pkcs12 -info -nokeys -noout` reads the outer SEQUENCE
           # but doesn't validate the password. So it catches truncation
           # and "wrong file in secret" but not "wrong passphrase".
-          if ! openssl pkcs12 -info -in "$CERT_PATH" \
+          if ! p12 -info -in "$CERT_PATH" \
                  -passin "pass:bogus-not-the-real-one" \
                  -nokeys -noout >/dev/null 2>&1 && \
              [ "$(head -c2 "$CERT_PATH" | xxd -p)" != "3082" ]; then
@@ -119,7 +129,7 @@ jobs:
           # verification — so a wrong passphrase fails here with a clear
           # signal long before security import gives us its cryptic
           # message.
-          if ! openssl pkcs12 -in "$CERT_PATH" \
+          if ! p12 -in "$CERT_PATH" \
                  -passin "pass:$APPLE_DEVELOPER_ID_CERT_PASSWORD" \
                  -noout 2>/tmp/pkcs12-err.log; then
             echo "::error::APPLE_DEVELOPER_ID_CERT_PASSWORD does not match the .p12's passphrase."
@@ -140,7 +150,7 @@ jobs:
           # the SHA-1 + PBE-SHA1-3DES legacy format with `-legacy` on the
           # export step. This pre-flight catches the algorithm mismatch
           # before `security import` produces its misleading password error.
-          MAC_INFO=$(openssl pkcs12 -in "$CERT_PATH" \
+          MAC_INFO=$(p12 -in "$CERT_PATH" \
                        -passin "pass:$APPLE_DEVELOPER_ID_CERT_PASSWORD" \
                        -info -nokeys -noout 2>&1 | grep -i '^MAC:' || true)
           echo "P12 MAC line: ${MAC_INFO:-<none>}"
