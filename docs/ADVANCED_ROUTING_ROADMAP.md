@@ -323,7 +323,14 @@ the AMD host.
       fast-chat path is F1's remote CUDA backend. Residual R2 value:
       quantized-matmul `_fb` kernels as crash-margin hardening for
       operators who force GPU chat — LOW priority.
-- [ ] R3: FA fallback kernel + LCP prompt-cache root-cause; remove the three chat safety flags one at a time, each behind the soak gate.
+- [x] R3 (2026-07-08): all three chat safety flags RETIRED by measurement —
+      no fallback kernel needed. FA throttle inverted upstream (FA=auto
+      3.7-3.8 tok/s vs 2.6 FA-off, +42%, deterministic); LCP prompt-save
+      GGML_ASSERT(buf_dst) was the staging class patch 0002 pools (6
+      LCP-similar requests clean, cache working prompt_n 83->17, 8-min
+      sustained 56 reqs / 0 fail / RSS 1.00x). chatParams now passes only
+      --gpu-layers 999; regression tests pin the retirement. GPU decode
+      ceiling (serial dispatch) unchanged -> chat stays CPU-placed.
 - [x] R4 (2026-07-08): CLOSED — CPU wins decisively. 20-doc bge-reranker
       requests: CPU p50 7.2s / 2.7 docs/s vs GPU p50 21.2s / 0.9 docs/s
       (serialized dispatch + 568M-param forward passes dominate). Rerank

@@ -57,6 +57,19 @@ back in for testing (verified to reproduce the cos_sim ~0.117 failure on
 demand). The series is now 5 patches and round-trips clean from pristine
 upstream.
 
+### Changed — R3: the three chat-slot AMD safety flags retired
+
+Measurement on the 5-patch build inverted both rationales. FA: `--flash-attn
+auto` now decodes 3.7–3.8 tok/s vs 2.6 with `off` (+42%), deterministic and
+GPU-resident — the historical CPU-fallback throttle is gone upstream.
+Prompt cache: the LCP prompt-save `GGML_ASSERT(buf_dst)` crash was the same
+staging-allocation class patch 0002 pools — 6 LCP-similar requests run
+clean, the cache works (prompt_n 83→17 on a shared prefix), and an 8-min
+sustained chat run passed (56 reqs, 0 failures, RSS 1.00×).
+`chatParams` now passes only `--gpu-layers 999`; regression tests pin the
+retirement. GPU decode remains serial-dispatch-capped, so chat stays
+CPU-placed by default on AMD-discrete.
+
 The new llama-server (upstream `a9883db` + the 4-patch series) is deployed
 to production: gateway embed (4/4 probes), rerank determinism, chat
 completion, and a cerid end-to-end ingest all verified post-restart.

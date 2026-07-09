@@ -157,12 +157,14 @@ flow and its copy must land in `internal/obs/` with a maintainer review.
    tools, SSH) — if a restart race unloads the job, recovery needs a
    command from the user's own Aqua session.
 
-1. **Chat-slot AMD safety args do not apply to embed/rerank slots.**
-   Sections 1 + 2 of `patches/README.md` document `--flash-attn off`,
-   `--cache-ram 0`, and `--no-cache-prompt` as chat-specific (they
-   address LCP-prompt-save and FA-CPU-fallback bugs absent on
-   embed/rerank). Adding them to embed/rerank would force a sub-optimal
-   attention path with no safety win.
+1. **The three chat-slot AMD safety flags are RETIRED (2026-07-08, R3).**
+   `--flash-attn off` (FA-fallback throttle inverted upstream: FA=auto is
+   +42% faster and correct) and `--cache-ram 0` / `--no-cache-prompt`
+   (the LCP prompt-save GGML_ASSERT was the staging-allocation class
+   patch 0002 pools; cache verified working) are gone from
+   `tuning.go::chatParams` with regression tests pinning their absence.
+   Do not re-add them to any slot without new evidence — sections 1 + 2
+   of `patches/README.md` carry the retirement data.
 
 2. **Embed/rerank slots have their own AMD safety surface — section 3.**
    The family-B graph-compute buffer-corruption crash hits embed/rerank

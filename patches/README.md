@@ -1,10 +1,11 @@
 # Patch series
 
-Quenchforge carries six patches across four submodules — all address Metal-on-AMD correctness. Applied at build time by `scripts/apply-patches.sh`; submodule SHAs in `.gitmodules` stay clean.
+Quenchforge carries eight patches across four submodules — all address Metal-on-AMD correctness. Applied at build time by `scripts/apply-patches.sh`; submodule SHAs in `.gitmodules` stay clean.
 
 | File | Submodule path | Target file | Upstream |
 |---|---|---|---|
 | `llama.cpp/0001-metal-correctness-on-non-apple-silicon.patch` | `llama.cpp/` | `ggml/src/ggml-metal/ggml-metal-device.m` | [`ggml-org/llama.cpp`](https://github.com/ggml-org/llama.cpp) |
+| `llama.cpp/0002-metal-staging-buffer-pool.patch` | `llama.cpp/` | `ggml/src/ggml-metal/ggml-metal-device.m` | in-tree (v0.8.0 — bounded MTLBuffer staging pool) |
 | `llama.cpp/0003-metal-amd-bert-fallback-kernels.patch` | `llama.cpp/` | `ggml/src/ggml-metal/ggml-metal.metal` + `ggml-metal-device.cpp` | in-tree (v0.7.1 — LayerNorm + softmax fallback) |
 | `llama.cpp/0004-metal-amd-bert-matmul-fallback.patch` | `llama.cpp/` | `ggml/src/ggml-metal/ggml-metal.metal` + `ggml-metal-device.cpp` | in-tree (v0.8.0 candidate — matmul fallback) |
 | `llama.cpp/0005-metal-serial-dispatch-non-uma.patch` | `llama.cpp/` | `ggml/src/ggml-metal/ggml-metal-context.m` | in-tree (2026-07-08 — non-UMA serial-dispatch default; see § patch 0005 below) |
@@ -42,9 +43,11 @@ disabling FA outright it schedules the FA tensor on CPU each decode
 step. Result: a GPU↔CPU copy every token, throttling chat to ~3 tok/s
 on Vega II despite all 29/29 model layers being resident on MTL0.
 
-Supervisor passes `--flash-attn off` for the chat slot on AMD
-profiles. Standard attention is slower per kernel than FA but
-stays GPU-resident, yielding a net throughput win.
+**RETIRED 2026-07-08 (roadmap R3).** The throttle inverted under
+upstream FA evolution: on the 5-patch build (upstream `a9883db`),
+`--flash-attn auto` decodes 3.7–3.8 tok/s vs 2.6 with FA off (+42%),
+deterministic, GPU-resident. `tuning.go::chatParams` no longer passes
+the flag; regression tests pin its absence.
 
 ### 2. Prompt-cache `GGML_ASSERT(buf_dst)` crash
 
@@ -71,6 +74,16 @@ Supervisor passes **two** flags on AMD chat slots:
 per-slot prompt cache, but the crash is in the server-side
 LCP-similarity cache that runs during slot picking
 (`get_available_slot`).
+
+**RETIRED 2026-07-08 (roadmap R3).** The `GGML_ASSERT(buf_dst)` at
+`ggml-metal-device.m:1736` sits in the `get_tensor` range
+(`:1719-1755`) that patch 0002's staging pool covers — the crash was
+the same IOMMU/staging allocation-failure class. Verified on the
+5-patch build: 6 LCP-similar requests run clean (the crash historically
+fired on #2), the cache WORKS (prompt_n 83 → 17 on a shared prefix —
+a real TTFT win), and an 8-min sustained chat run passed with 56 reqs /
+0 failures / 0 drift / RSS 1.00×. Both flags removed from
+`tuning.go::chatParams`; regression tests pin their absence.
 
 Embed and rerank slots don't touch either cache, so they keep the
 upstream defaults for the LCP/prompt-cache surface. (They do, however,

@@ -224,19 +224,26 @@ func chatParams(profile hardware.Profile, vramGB int) SlotTuning {
 	ctxCap, _ := amdSizing(vramGB)
 	// AMD-discrete chat slot runs on GPU as of v0.8.0. The MTLDispatchTypeConcurrent
 	// race that produced cross-call non-determinism is disabled via
-	// MetalConcurrencyDisable -> GGML_METAL_CONCURRENCY_DISABLE=1. The family-B
-	// IOMMU exhaustion that produced sustained-load SIGABRTs is mitigated by
-	// patch 0002 (staging-buffer pool). AutoRespawn stays as defense in depth.
+	// MetalConcurrencyDisable -> GGML_METAL_CONCURRENCY_DISABLE=1 (and intrinsically
+	// by patch 0005 on any binary built from this tree). The family-B IOMMU
+	// exhaustion that produced sustained-load SIGABRTs is mitigated by patch 0002
+	// (staging-buffer pool). AutoRespawn stays as defense in depth.
 	//
-	// Chat-specific safety flags retained from the CPU-route era:
-	//   --flash-attn off    — FA's GPU path is unsafe with simdgroup_reduction off
-	//   --cache-ram 0       — disables LCP-similarity slot cache (CLAUDE.md gotcha #1)
-	//   --no-cache-prompt   — disables per-slot prompt cache
+	// The three CPU-route-era safety flags were RETIRED 2026-07-08 (roadmap R3),
+	// both obsoleted by measurement on the 5-patch build (Vega II):
+	//   --flash-attn off    — the FA CPU-fallback throttle inverted: FA=auto now
+	//                         decodes 3.7-3.8 tok/s vs 2.6 with FA off (+42%),
+	//                         deterministic and GPU-resident.
+	//   --cache-ram 0 /     — the LCP prompt-save GGML_ASSERT(buf_dst) crash was
+	//   --no-cache-prompt     the same staging-allocation failure class patch 0002
+	//                         pools; with the pool, 6 LCP-similar requests (the
+	//                         historical crash fired on #2) run clean and the
+	//                         cache WORKS (prompt_n 83 -> 17 on the shared
+	//                         prefix). 8-min sustained chat: 56 reqs, 0 failures,
+	//                         0 drift, RSS 1.00x.
+	// See docs/bench-reports/ + patches/README.md sections 1-2 for the data.
 	return SlotTuning{
 		ExtraArgs: []string{
-			"--flash-attn", "off",
-			"--cache-ram", "0",
-			"--no-cache-prompt",
 			"--gpu-layers", "999",
 		},
 		ContextSize:             ctxCap,

@@ -78,18 +78,24 @@ func TestKernelParams_ChatAMDDefaultsToCPU(t *testing.T) {
 }
 
 func TestKernelParams_ChatAMDGPUOverrideRestoresSafetyTuning(t *testing.T) {
+	// R3 (2026-07-08) retired the three CPU-route-era flags: FA=auto now
+	// decodes +42% faster and correct (the CPU-fallback throttle inverted
+	// upstream), and the LCP prompt-save GGML_ASSERT crash was fixed by
+	// patch 0002's staging pool (prompt cache verified WORKING on Vega II).
+	// The retired flags must not reappear; the Metal env + respawn safety
+	// tuning stays.
 	cfg := config.Config{MaxContext: 8192, PlaceChat: "gpu"}
 	for _, p := range amdProfiles {
 		t.Run(string(p), func(t *testing.T) {
 			tn := KernelParams(p, vramHigh, gateway.KindChat, cfg)
-			wantExtra := []string{
-				"--flash-attn", "off",
-				"--cache-ram", "0",
-				"--no-cache-prompt",
-				"--gpu-layers", "999",
-			}
+			wantExtra := []string{"--gpu-layers", "999"}
 			if !slices.Equal(tn.ExtraArgs, wantExtra) {
 				t.Errorf("chat AMD %s (PlaceChat=gpu) ExtraArgs = %v, want %v", p, tn.ExtraArgs, wantExtra)
+			}
+			for _, retired := range []string{"--flash-attn", "--cache-ram", "--no-cache-prompt"} {
+				if slices.Contains(tn.ExtraArgs, retired) {
+					t.Errorf("chat AMD %s (gpu) re-grew retired flag %s (R3 regression)", p, retired)
+				}
 			}
 			if tn.UbatchSize != 0 || tn.BatchSize != 0 || tn.MetalNCB != 0 {
 				t.Errorf("chat AMD %s unexpected non-zero tuning: %+v", p, tn)
