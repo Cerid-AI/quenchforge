@@ -7,6 +7,7 @@ Quenchforge carries six patches across four submodules — all address Metal-on-
 | `llama.cpp/0001-metal-correctness-on-non-apple-silicon.patch` | `llama.cpp/` | `ggml/src/ggml-metal/ggml-metal-device.m` | [`ggml-org/llama.cpp`](https://github.com/ggml-org/llama.cpp) |
 | `llama.cpp/0003-metal-amd-bert-fallback-kernels.patch` | `llama.cpp/` | `ggml/src/ggml-metal/ggml-metal.metal` + `ggml-metal-device.cpp` | in-tree (v0.7.1 — LayerNorm + softmax fallback) |
 | `llama.cpp/0004-metal-amd-bert-matmul-fallback.patch` | `llama.cpp/` | `ggml/src/ggml-metal/ggml-metal.metal` + `ggml-metal-device.cpp` | in-tree (v0.8.0 candidate — matmul fallback) |
+| `llama.cpp/0005-metal-serial-dispatch-non-uma.patch` | `llama.cpp/` | `ggml/src/ggml-metal/ggml-metal-context.m` | in-tree (2026-07-08 — non-UMA serial-dispatch default; see § patch 0005 below) |
 | `whisper.cpp/0001-metal-correctness-on-non-apple-silicon.patch` | `whisper.cpp/` | `ggml/src/ggml-metal/ggml-metal-device.m` | [`ggml-org/whisper.cpp`](https://github.com/ggml-org/whisper.cpp) |
 | `sd.cpp/0001-metal-correctness-on-non-apple-silicon.patch` | `sd.cpp/` | `ggml/src/ggml-metal/ggml-metal-device.m` (via nested `ggml-org/ggml` submodule) | [`leejet/stable-diffusion.cpp`](https://github.com/leejet/stable-diffusion.cpp) |
 | `bark.cpp/0001-metal-correctness-on-non-apple-silicon.patch` | `bark.cpp/` | `encodec.cpp/ggml/src/ggml-metal.m` (via two-level nested submodules; older single-file `ggml-metal.m` layout, different API: `support_*` not `has_*`) | [`PABannier/bark.cpp`](https://github.com/PABannier/bark.cpp) → [`PABannier/encodec.cpp`](https://github.com/PABannier/encodec.cpp) |
@@ -266,6 +267,29 @@ L2 = 1.0000. Production stays on the current binary until
 `bench-bert-sustained-load` also passes (run display-asleep); the
 staged relaxation of `GGML_METAL_CONCURRENCY_DISABLE` / ubatch caps is
 tracked as roadmap R1's remaining measurement.
+
+## Patch 0005 — serial dispatch by default on non-UMA devices (2026-07-08)
+
+The R1 soak's relaxation phase (Phase B, `docs/bench-reports/2026-07-08-*`)
+empirically separated TWO independent Metal-on-AMD defects that had been
+conflated: (1) the simdgroup-reduction miscompile — fixed by the 0003/0004
+fallback kernels; (2) unreliable command-buffer ordering on the
+**concurrent-dispatch** path of non-UMA drivers — NOT fixed by any kernel.
+Reproducer: with the fallback kernels active and correct, enabling
+concurrency flips BERT embedding determinism from cos_sim 1.000000 to
+~0.117 within 60 seconds; toggling `GGML_METAL_CONCURRENCY_DISABLE` flips
+it back. Prior to 0005 correctness therefore depended on every operator
+knowing to set that env var (quenchforge's supervisor sets it via
+`tuning.go::MetalConcurrencyDisable`, but bare llama-server users get
+garbage by default).
+
+0005 makes the workaround intrinsic: `use_concurrency` defaults to false
+when `has_unified_memory == false` (device-property-driven, matching how
+patch 0001 gates the kernel families), with
+`GGML_METAL_CONCURRENCY_FORCE=1` as the opt-back-in for testing — verified
+to reproduce the failure on demand. Upstream submission target: the same
+#19563 thread (the reproducer is a one-env-var toggle on stock
+llama-server + any BERT GGUF on AMD-Mac).
 
 ## Honesty about whisper.cpp Metal
 

@@ -47,6 +47,16 @@ session's bench report):
 - **D — bge-reranker deterministic on GPU** — the rerank GPU A/B (R4) is
   unblocked.
 
+### Added — patch 0005: serial dispatch by default on non-UMA devices
+
+The Phase-B finding, made intrinsic: `use_concurrency` now defaults to
+false when the Metal device lacks unified memory, so BERT correctness on
+AMD-Mac no longer depends on operators setting
+`GGML_METAL_CONCURRENCY_DISABLE`. `GGML_METAL_CONCURRENCY_FORCE=1` opts
+back in for testing (verified to reproduce the cos_sim ~0.117 failure on
+demand). The series is now 5 patches and round-trips clean from pristine
+upstream.
+
 The new llama-server (upstream `a9883db` + the 4-patch series) is deployed
 to production: gateway embed (4/4 probes), rerank determinism, chat
 completion, and a cerid end-to-end ingest all verified post-restart.
