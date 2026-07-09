@@ -26,9 +26,30 @@ cos_sim = 1.000000 (broken baseline: 0.07–0.29), paraphrase 0.9551 ≫
 unrelated 0.4430, L2 = 1.0000. The 3-way rebase onto current upstream
 (`a9883db`) is folded into the regenerated patches.
 
-Production deployment is gated on `bench-bert-sustained-load` (run
-display-asleep); the staged relaxation of `GGML_METAL_CONCURRENCY_DISABLE`
-and the ubatch caps is R1's remaining measurement.
+Soak matrix (same day, display-asleep, isolated server; full data under the
+session's bench report):
+
+- **A — prod-parity 30-min gate: PASS.** 1033 reqs, 0 SIGABRTs, p50 5.10s /
+  p95 9.89s @ concurrency 4 × batch 8 (0.59 req/s ≈ 4.7 embeds/s), RSS
+  216→516 MB (2.38×, under the 4× leak floor), interleaved drift probe
+  steady at 0.9989 over 30 min (no cumulative GPU-state corruption).
+- **B — relaxation answer: NO.** Without `GGML_METAL_CONCURRENCY_DISABLE=1`
+  output is immediate garbage (cos_sim 0.117) even with the fb kernels —
+  the non-UMA AMD concurrent-dispatch command-buffer ordering bug is an
+  INDEPENDENT defect from the simdgroup miscompile. One-env-var, 60-second
+  reproducer; serialization stays load-bearing. Follow-up (roadmap R1.5):
+  make the workaround intrinsic by gating `MTLDispatchTypeSerial` on
+  `!has_unified_memory` in ggml-metal-device.m.
+- **C — ubatch 8192 (the v0.5.x ~2-min-crash config): 15-min PASS.** Crash
+  class closed by pool + fb kernels; no throughput win vs 1024 (p50 7.02s
+  vs 5.10s, tighter p95) — the VRAM-tier caps are now performance tuning,
+  not crash guards.
+- **D — bge-reranker deterministic on GPU** — the rerank GPU A/B (R4) is
+  unblocked.
+
+The new llama-server (upstream `a9883db` + the 4-patch series) is deployed
+to production: gateway embed (4/4 probes), rerank determinism, chat
+completion, and a cerid end-to-end ingest all verified post-restart.
 
 ---
 

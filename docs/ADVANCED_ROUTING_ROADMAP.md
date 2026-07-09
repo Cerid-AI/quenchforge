@@ -295,9 +295,25 @@ the AMD host.
       fixed; 0003 + 0004 landed as live patches (drafts removed);
       `bench-bert-correctness` all 4 probes PASS on Vega II GPU
       (determinism cos_sim 1.000000 vs 0.07–0.29 broken baseline).
-- [ ] R1 (remaining): `bench-bert-sustained-load` soak on the new kernels
-      (display-asleep) → then deploy + staged relaxation test of
-      `GGML_METAL_CONCURRENCY_DISABLE` / ubatch caps, one knob at a time.
+- [x] R1 (soak + deploy, 2026-07-08): 4-phase display-asleep matrix on the
+      fb kernels — **A** prod-parity 30-min gate PASS (1033 reqs, p50 5.10s /
+      p95 9.89s, 0.59 req/s, RSS 2.38× < 4× floor, drift steady 0.9989);
+      **B** relaxation answer: **NO — serialization is load-bearing.**
+      Without `GGML_METAL_CONCURRENCY_DISABLE=1` output is instant garbage
+      (cos_sim 0.117) even with fb kernels ⇒ the concurrent-dispatch
+      command-buffer ordering bug on non-UMA AMD is an INDEPENDENT defect
+      from the simdgroup miscompile, with a 60-second one-env-var
+      reproducer; **C** ubatch 8192 (the v0.5.x ~2-min-crash config) 15-min
+      PASS — crash class closed, but no throughput win (p50 7.02s vs 5.10s;
+      tighter p95 7.67s) ⇒ keep 1024 default, caps are now perf-tuning not
+      crash-guards; **D** bge-reranker deterministic on GPU ⇒ R4 unblocked.
+      New llama-server (upstream a9883db + 4 patches) DEPLOYED to
+      production; gateway embed/rerank/chat + cerid e2e verified.
+- [ ] R1.5 — patch candidate from the B finding: make the serial-dispatch
+      workaround intrinsic — gate `MTLDispatchTypeSerial` on
+      `!has_unified_memory` in ggml-metal-device.m (device-property-driven
+      instead of the `GGML_METAL_CONCURRENCY_DISABLE` env crutch), and
+      offer it upstream with the Phase-B reproducer.
 - [ ] R2: patch 0005 quantized-matmul fallback; `bench-llama-sustained-load` p50 ≤ CPU + 7-day zero-SIGABRT soak → `chatParams` back to GPU.
 - [ ] R3: FA fallback kernel + LCP prompt-cache root-cause; remove the three chat safety flags one at a time, each behind the soak gate.
 - [ ] R4: rerank GPU-vs-CPU batched A/B (v0.9.1 batch defaults make GPU rerank runnable); extend "auto" placement to rerank if GPU wins.

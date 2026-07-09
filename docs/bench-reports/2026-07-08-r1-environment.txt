@@ -1,0 +1,37 @@
+=== date ===
+Wed Jul  8 20:15:31 EDT 2026
+=== sw_vers ===
+ProductName:		macOS
+ProductVersion:		26.5.1
+BuildVersion:		25F80
+=== uname ===
+Darwin Justins-Mac-Pro.local 25.5.0 Darwin Kernel Version 25.5.0: Mon Apr 27 20:31:18 PDT 2026; root:xnu-12377.121.6~2/RELEASE_X86_64 x86_64
+=== GPU ===
+Graphics/Displays:
+
+    AMD Radeon Pro Vega II:
+
+      Chipset Model: AMD Radeon Pro Vega II
+      Type: GPU
+      Bus: PCIe
+      Slot: Slot-1
+      PCIe Lane Width: x16
+      VRAM (Total): 32 GB
+      Vendor: AMD (0x1002)
+      Device ID: 0x66a3
+      Revision ID: 0x0000
+      ROM Revision: 113-D160BW-465
+      VBIOS Version: 113-D163A1XT-047
+      Option ROM Version: 113-D163A1XT-047
+      EFI Driver Version: 01.01.186
+      Metal Support: Metal 3
+
+=== llama.cpp submodule ===
+a9883db opencl: add opt-in Adreno xmem F16xF32 GEMM for prefill (#22755)
+=== patch series ===
+/Users/sunrunner/Develop/quenchforge/patches/llama.cpp/0001-metal-correctness-on-non-apple-silicon.patch
+/Users/sunrunner/Develop/quenchforge/patches/llama.cpp/0002-metal-staging-buffer-pool.patch
+/Users/sunrunner/Develop/quenchforge/patches/llama.cpp/0003-metal-amd-bert-fallback-kernels.patch
+/Users/sunrunner/Develop/quenchforge/patches/llama.cpp/0004-metal-amd-bert-matmul-fallback.patch
+=== quenchforge repo ===
+f074676 patches: land 0003/0004 AMD-Metal BERT fallback kernels (roadmap R1)

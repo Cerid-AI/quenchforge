@@ -1,0 +1,28 @@
+[20:15:32] environment fingerprint written
+[20:15:32] [A] starting server: model=soaktest.gguf ubatch=1024 mode=embed env=[GGML_METAL_N_CB=1 GGML_METAL_CONCURRENCY_DISABLE=1]
+[20:15:35] [A] server up (pid=25900) after ~6s
+[20:15:36] [A] correctness(pre) exit=0:   [PASS] same-batch determinism (n=10)  (0.17s)   [PASS] separate-call determinism (n=10)  (0.48s)   [PASS] semantic sanity  (0.10s)   [PASS] L2 norm bounds  (0.05s) 
+[20:15:36] [A] sustained load: 1800s concurrency=4 batch=8
+[20:45:43] [A] soak exit=0:  === sustained-load bench PASSED === Daemon survived sustained load without crash / drift / leak signals. 
+[20:45:44] [A] correctness(post) exit=0:   [PASS] same-batch determinism (n=10)  (0.17s)   [PASS] separate-call determinism (n=10)  (0.43s)   [PASS] semantic sanity  (0.09s)   [PASS] L2 norm bounds  (0.04s) 
+[20:45:46] [B] starting server: model=soaktest.gguf ubatch=1024 mode=embed env=[__QF_NOOP=1]
+[20:45:49] [B] server up (pid=30091) after ~6s
+[20:45:50] [B] correctness(pre) exit=1:   [FAIL] same-batch determinism (n=10)  (0.18s)   [FAIL] separate-call determinism (n=10)  (0.42s)   [FAIL] semantic sanity  (0.09s)   [PASS] L2 norm bounds  (0.04s) 
+[20:45:50] [B] sustained load: 1200s concurrency=4 batch=8
+[20:46:55] [B] soak exit=1:      t=   60s  reqs=    35  fail=   0  p50=4.98s  drift_cos_sim=0.117172 [FAIL]     [FAIL] catastrophic output drift — reference cos_sim 0.117172 below fail floor 0.95; this is the Metal-on-AMD non-determinism class 
+[20:46:56] [B] correctness(post) exit=1:   [FAIL] same-batch determinism (n=10)  (0.18s)   [FAIL] separate-call determinism (n=10)  (0.42s)   [PASS] semantic sanity  (0.09s)   [PASS] L2 norm bounds  (0.04s) 
+[20:46:58] [C] starting server: model=soaktest.gguf ubatch=8192 mode=embed env=[GGML_METAL_N_CB=1 GGML_METAL_CONCURRENCY_DISABLE=1]
+[20:47:01] [C] server up (pid=30275) after ~6s
+[20:47:02] [C] correctness(pre) exit=0:   [PASS] same-batch determinism (n=10)  (0.17s)   [PASS] separate-call determinism (n=10)  (0.41s)   [PASS] semantic sanity  (0.09s)   [PASS] L2 norm bounds  (0.04s) 
+[20:47:02] [C] sustained load: 900s concurrency=4 batch=8
+[21:02:09] [C] soak exit=0:  === sustained-load bench PASSED === Daemon survived sustained load without crash / drift / leak signals. 
+[21:02:09] [C] correctness(post) exit=0:   [PASS] same-batch determinism (n=10)  (0.17s)   [PASS] separate-call determinism (n=10)  (0.41s)   [PASS] semantic sanity  (0.09s)   [PASS] L2 norm bounds  (0.04s) 
+[21:02:11] [D] starting server: model=soakrerank.gguf ubatch=1024 mode=rerank env=[GGML_METAL_N_CB=1 GGML_METAL_CONCURRENCY_DISABLE=1]
+[21:02:15] [D] server up (pid=32316) after ~6s
+[21:02:17] [D] correctness(rerank) exit=0:   [PASS] rerank determinism  (2.48s) 
+[21:02:19] ==== MATRIX COMPLETE ====
+A: pre=0 soak=0 post=0
+B: pre=1 soak=1 post=1
+C: pre=0 soak=0 post=0
+D: rerank-correctness=0
+[21:02:19] results in <bench-workdir>

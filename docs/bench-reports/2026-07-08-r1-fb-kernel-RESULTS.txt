@@ -1,0 +1,4 @@
+A: pre=0 soak=0 post=0
+B: pre=1 soak=1 post=1
+C: pre=0 soak=0 post=0
+D: rerank-correctness=0
