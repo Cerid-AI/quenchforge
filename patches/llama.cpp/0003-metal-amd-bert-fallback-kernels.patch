@@ -1,7 +1,11 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From aca4a37f78fadc6f41a992e256630fc2f21c9f5b Mon Sep 17 00:00:00 2001
 From: Quenchforge Contributors <maintainers@cerid-ai.com>
-Date: Sat, 17 May 2026 13:00:00 -0400
-Subject: [PATCH] metal: norm + softmax fallback kernels for non-Apple GPUs (v0.7.1 partial)
+Date: Sun, 17 May 2026 13:00:00 -0400
+Subject: [PATCH] metal: norm + softmax fallback kernels for non-Apple GPUs
+ (v0.7.1 partial)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
 
 Adds fallback Metal kernels for `kernel_norm_fuse_impl` (LayerNorm) and
 `kernel_soft_max{,_4}` (bidirectional-attention softmax) that use
@@ -42,6 +46,10 @@ fallback-patched (v0.8.0 candidate).
 
 Signed-off-by: Quenchforge Contributors <maintainers@cerid-ai.com>
 ---
+ ggml/src/ggml-metal/ggml-metal-device.cpp |  26 +-
+ ggml/src/ggml-metal/ggml-metal.metal      | 297 ++++++++++++++++++++++
+ 2 files changed, 319 insertions(+), 4 deletions(-)
+
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
 index f0147af..9c84afb 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.cpp
@@ -404,5 +412,6 @@ index 3882b95..d9580f4 100644
  // F == 1 : rms_norm (no fuse)
  // F == 2 : rms_norm + mul
  // F == 3 : rms_norm + mul + add
---
-2.42.0
+-- 
+2.50.1 (Apple Git-155)
+

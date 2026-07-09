@@ -66,47 +66,62 @@ func TestRouteEmbed_GPUMode(t *testing.T) {
 	g := routeEmbedFixture(t, placement.ModeGPU, false)
 	// Both single and batch go to the GPU upstream, governed.
 	for _, batchN := range []int{1, 32} {
-		entry, onGPU, ok := g.routeEmbed(KindEmbed, batchN)
+		entry, onGPU, track, ok := g.routeEmbed(KindEmbed, batchN)
 		if !ok || !onGPU {
 			t.Fatalf("batchN=%d: ok=%v onGPU=%v, want true/true", batchN, ok, onGPU)
 		}
 		if entry.url.String() != gpuEmbedURL {
 			t.Errorf("batchN=%d: routed to %s, want %s", batchN, entry.url, gpuEmbedURL)
 		}
+		if track != KindEmbed {
+			t.Errorf("batchN=%d: track=%s, want %s", batchN, track, KindEmbed)
+		}
 	}
 }
 
 func TestRouteEmbed_CPUMode(t *testing.T) {
 	g := routeEmbedFixture(t, placement.ModeCPU, false)
-	// cpu mode always uses the (single) registered upstream, ungoverned.
-	entry, onGPU, ok := g.routeEmbed(KindEmbed, 64)
+	// cpu mode always uses the (single) registered upstream, ungoverned. The
+	// tracker key stays the kind — a single homogeneous instance.
+	entry, onGPU, track, ok := g.routeEmbed(KindEmbed, 64)
 	if !ok || onGPU {
 		t.Fatalf("ok=%v onGPU=%v, want true/false", ok, onGPU)
 	}
 	if entry.url.String() != gpuEmbedURL {
 		t.Errorf("cpu mode routed to %s, want the primary upstream %s", entry.url, gpuEmbedURL)
 	}
+	if track != KindEmbed {
+		t.Errorf("track=%s, want %s (single instance keeps the kind key)", track, KindEmbed)
+	}
 }
 
 func TestRouteEmbed_AutoRoutesByBatch(t *testing.T) {
 	g := routeEmbedFixture(t, placement.ModeAuto, true)
 
-	// Single (<= threshold 1) -> CPU instance, ungoverned.
-	entry, onGPU, ok := g.routeEmbed(KindEmbed, 1)
+	// Single (<= threshold 1) -> CPU instance, ungoverned, tracked under the
+	// "-cpu" instance key so its millisecond latencies never mix with the GPU
+	// instance's multi-second batches (the 2026-07-08 false-critical bug).
+	entry, onGPU, track, ok := g.routeEmbed(KindEmbed, 1)
 	if !ok || onGPU {
 		t.Fatalf("single: ok=%v onGPU=%v, want true/false", ok, onGPU)
 	}
 	if entry.url.String() != cpuEmbedURL {
 		t.Errorf("single auto routed to %s, want CPU %s", entry.url, cpuEmbedURL)
 	}
+	if track != cpuTrackKind(KindEmbed) {
+		t.Errorf("single auto track=%s, want %s", track, cpuTrackKind(KindEmbed))
+	}
 
-	// Batch (> threshold) -> GPU instance, governed.
-	entry, onGPU, ok = g.routeEmbed(KindEmbed, 8)
+	// Batch (> threshold) -> GPU instance, governed, tracked under the kind.
+	entry, onGPU, track, ok = g.routeEmbed(KindEmbed, 8)
 	if !ok || !onGPU {
 		t.Fatalf("batch: ok=%v onGPU=%v, want true/true", ok, onGPU)
 	}
 	if entry.url.String() != gpuEmbedURL {
 		t.Errorf("batch auto routed to %s, want GPU %s", entry.url, gpuEmbedURL)
+	}
+	if track != KindEmbed {
+		t.Errorf("batch auto track=%s, want %s", track, KindEmbed)
 	}
 }
 
@@ -114,19 +129,22 @@ func TestRouteEmbed_AutoFallsBackToGPUWhenNoCPU(t *testing.T) {
 	// No CPU upstream registered: a single request that would route CPU must
 	// fall back to the GPU instance (degrade to working, not 503).
 	g := routeEmbedFixture(t, placement.ModeAuto, false)
-	entry, onGPU, ok := g.routeEmbed(KindEmbed, 1)
+	entry, onGPU, track, ok := g.routeEmbed(KindEmbed, 1)
 	if !ok || !onGPU {
 		t.Fatalf("ok=%v onGPU=%v, want true/true (GPU fallback)", ok, onGPU)
 	}
 	if entry.url.String() != gpuEmbedURL {
 		t.Errorf("auto fallback routed to %s, want GPU %s", entry.url, gpuEmbedURL)
 	}
+	if track != KindEmbed {
+		t.Errorf("fallback track=%s, want %s (it IS the GPU instance)", track, KindEmbed)
+	}
 }
 
 func TestRouteEmbed_NoUpstreamIsNotOK(t *testing.T) {
 	g := New(config.Config{})
 	g.SetPlacement(placement.NewPolicy(false, nil), 1)
-	if _, _, ok := g.routeEmbed(KindEmbed, 1); ok {
+	if _, _, _, ok := g.routeEmbed(KindEmbed, 1); ok {
 		t.Error("routeEmbed ok=true with no upstream registered")
 	}
 }
@@ -138,10 +156,13 @@ func TestRouteEmbed_ZeroPolicyDefaultsToGPUUpstream(t *testing.T) {
 	if err := g.SetUpstream(KindEmbed, gpuEmbedURL); err != nil {
 		t.Fatalf("SetUpstream: %v", err)
 	}
-	entry, onGPU, ok := g.routeEmbed(KindEmbed, 1)
+	entry, onGPU, track, ok := g.routeEmbed(KindEmbed, 1)
 	if !ok || !onGPU || entry.url.String() != gpuEmbedURL {
 		t.Fatalf("zero policy: entry=%v onGPU=%v ok=%v, want gpu upstream/true/true",
 			entry.url, onGPU, ok)
+	}
+	if track != KindEmbed {
+		t.Errorf("zero-policy track=%s, want %s", track, KindEmbed)
 	}
 }
 

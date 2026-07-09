@@ -1,12 +1,14 @@
 # Patch series
 
-Quenchforge carries six patches across four submodules — all address Metal-on-AMD correctness. Applied at build time by `scripts/apply-patches.sh`; submodule SHAs in `.gitmodules` stay clean.
+Quenchforge carries eight patches across four submodules — all address Metal-on-AMD correctness. Applied at build time by `scripts/apply-patches.sh`; submodule SHAs in `.gitmodules` stay clean.
 
 | File | Submodule path | Target file | Upstream |
 |---|---|---|---|
 | `llama.cpp/0001-metal-correctness-on-non-apple-silicon.patch` | `llama.cpp/` | `ggml/src/ggml-metal/ggml-metal-device.m` | [`ggml-org/llama.cpp`](https://github.com/ggml-org/llama.cpp) |
+| `llama.cpp/0002-metal-staging-buffer-pool.patch` | `llama.cpp/` | `ggml/src/ggml-metal/ggml-metal-device.m` | in-tree (v0.8.0 — bounded MTLBuffer staging pool) |
 | `llama.cpp/0003-metal-amd-bert-fallback-kernels.patch` | `llama.cpp/` | `ggml/src/ggml-metal/ggml-metal.metal` + `ggml-metal-device.cpp` | in-tree (v0.7.1 — LayerNorm + softmax fallback) |
 | `llama.cpp/0004-metal-amd-bert-matmul-fallback.patch` | `llama.cpp/` | `ggml/src/ggml-metal/ggml-metal.metal` + `ggml-metal-device.cpp` | in-tree (v0.8.0 candidate — matmul fallback) |
+| `llama.cpp/0005-metal-serial-dispatch-non-uma.patch` | `llama.cpp/` | `ggml/src/ggml-metal/ggml-metal-context.m` | in-tree (2026-07-08 — non-UMA serial-dispatch default; see § patch 0005 below) |
 | `whisper.cpp/0001-metal-correctness-on-non-apple-silicon.patch` | `whisper.cpp/` | `ggml/src/ggml-metal/ggml-metal-device.m` | [`ggml-org/whisper.cpp`](https://github.com/ggml-org/whisper.cpp) |
 | `sd.cpp/0001-metal-correctness-on-non-apple-silicon.patch` | `sd.cpp/` | `ggml/src/ggml-metal/ggml-metal-device.m` (via nested `ggml-org/ggml` submodule) | [`leejet/stable-diffusion.cpp`](https://github.com/leejet/stable-diffusion.cpp) |
 | `bark.cpp/0001-metal-correctness-on-non-apple-silicon.patch` | `bark.cpp/` | `encodec.cpp/ggml/src/ggml-metal.m` (via two-level nested submodules; older single-file `ggml-metal.m` layout, different API: `support_*` not `has_*`) | [`PABannier/bark.cpp`](https://github.com/PABannier/bark.cpp) → [`PABannier/encodec.cpp`](https://github.com/PABannier/encodec.cpp) |
@@ -41,9 +43,11 @@ disabling FA outright it schedules the FA tensor on CPU each decode
 step. Result: a GPU↔CPU copy every token, throttling chat to ~3 tok/s
 on Vega II despite all 29/29 model layers being resident on MTL0.
 
-Supervisor passes `--flash-attn off` for the chat slot on AMD
-profiles. Standard attention is slower per kernel than FA but
-stays GPU-resident, yielding a net throughput win.
+**RETIRED 2026-07-08 (roadmap R3).** The throttle inverted under
+upstream FA evolution: on the 5-patch build (upstream `a9883db`),
+`--flash-attn auto` decodes 3.7–3.8 tok/s vs 2.6 with FA off (+42%),
+deterministic, GPU-resident. `tuning.go::chatParams` no longer passes
+the flag; regression tests pin its absence.
 
 ### 2. Prompt-cache `GGML_ASSERT(buf_dst)` crash
 
@@ -70,6 +74,16 @@ Supervisor passes **two** flags on AMD chat slots:
 per-slot prompt cache, but the crash is in the server-side
 LCP-similarity cache that runs during slot picking
 (`get_available_slot`).
+
+**RETIRED 2026-07-08 (roadmap R3).** The `GGML_ASSERT(buf_dst)` at
+`ggml-metal-device.m:1736` sits in the `get_tensor` range
+(`:1719-1755`) that patch 0002's staging pool covers — the crash was
+the same IOMMU/staging allocation-failure class. Verified on the
+5-patch build: 6 LCP-similar requests run clean (the crash historically
+fired on #2), the cache WORKS (prompt_n 83 → 17 on a shared prefix —
+a real TTFT win), and an 8-min sustained chat run passed with 56 reqs /
+0 failures / 0 drift / RSS 1.00×. Both flags removed from
+`tuning.go::chatParams`; regression tests pin their absence.
 
 Embed and rerank slots don't touch either cache, so they keep the
 upstream defaults for the LCP/prompt-cache surface. (They do, however,
@@ -246,14 +260,49 @@ baseline: ~2.5× for nomic embed, ~1.7× for jina code-embed.
 The full empirical isolation and design rationale are captured in the
 sections above plus [`docs/METAL_AMD_BERT_CORRECTNESS.md`](../docs/METAL_AMD_BERT_CORRECTNESS.md).
 
-**Scope note — patches 0003 + 0004 parked.** The originally-planned
-`_fb` BERT fallback kernels (LayerNorm/softmax/matmul) parked to
-`patches/llama.cpp/drafts/.broken` pending a Metal kernel template
-signature fix (`helper_mv_reduce_and_write_fb<NR0=2>` doesn't
-compile). The critical path validated by the bench table above does
-NOT depend on those patches — patch 0001 (gates) + patch 0002 (pool)
-+ the env-var routing in `tuning.go` are sufficient. The `_fb`
-fallback kernels remain future optimization work.
+**Scope note — patches 0003 + 0004 LANDED (2026-07-08, roadmap R1).**
+Previously parked to `drafts/*.broken` on a compile failure in
+`helper_mv_reduce_and_write_fb<NR0=2>`. Root cause was two MSL rules,
+not the template itself: (a) the helper was inserted textually ABOVE
+the `FC_mul_mv_*` function-constant declarations it reads — Metal
+requires declaration-before-use; (b) `threadgroup float local_buf[1024]`
+was declared inside a non-kernel inline function — MSL only permits
+threadgroup variables in kernel scope. Fixed by relocating the helper
+below the FC block and hoisting a fixed `threadgroup float
+local_buf[2048]` (NR0=2 × tpg≤1024, 8 KiB) into each `_fb` kernel entry,
+threaded down as a parameter; the host's dynamic `shmem` stays unused by
+design (its entry-parameter path is the gfx-rs/wgpu#4500 hazard the
+fallbacks exist to avoid). Validated on Vega II 2026-07-08:
+`bench-bert-correctness` all 4 probes PASS on GPU with the fallback
+dispatchers active — same-batch and separate-call cos_sim = 1.000000
+(vs 0.07–0.29 broken baseline), paraphrase 0.9551 ≫ unrelated 0.4430,
+L2 = 1.0000. Production stays on the current binary until
+`bench-bert-sustained-load` also passes (run display-asleep); the
+staged relaxation of `GGML_METAL_CONCURRENCY_DISABLE` / ubatch caps is
+tracked as roadmap R1's remaining measurement.
+
+## Patch 0005 — serial dispatch by default on non-UMA devices (2026-07-08)
+
+The R1 soak's relaxation phase (Phase B, `docs/bench-reports/2026-07-08-*`)
+empirically separated TWO independent Metal-on-AMD defects that had been
+conflated: (1) the simdgroup-reduction miscompile — fixed by the 0003/0004
+fallback kernels; (2) unreliable command-buffer ordering on the
+**concurrent-dispatch** path of non-UMA drivers — NOT fixed by any kernel.
+Reproducer: with the fallback kernels active and correct, enabling
+concurrency flips BERT embedding determinism from cos_sim 1.000000 to
+~0.117 within 60 seconds; toggling `GGML_METAL_CONCURRENCY_DISABLE` flips
+it back. Prior to 0005 correctness therefore depended on every operator
+knowing to set that env var (quenchforge's supervisor sets it via
+`tuning.go::MetalConcurrencyDisable`, but bare llama-server users get
+garbage by default).
+
+0005 makes the workaround intrinsic: `use_concurrency` defaults to false
+when `has_unified_memory == false` (device-property-driven, matching how
+patch 0001 gates the kernel families), with
+`GGML_METAL_CONCURRENCY_FORCE=1` as the opt-back-in for testing — verified
+to reproduce the failure on demand. Upstream submission target: the same
+#19563 thread (the reproducer is a one-env-var toggle on stock
+llama-server + any BERT GGUF on AMD-Mac).
 
 ## Honesty about whisper.cpp Metal
 

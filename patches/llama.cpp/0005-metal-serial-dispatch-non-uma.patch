@@ -1,0 +1,49 @@
+From b901f42cfcf7d5fe44a1e76ec71e77348dec043d Mon Sep 17 00:00:00 2001
+From: Quenchforge Contributors <maintainers@cerid-ai.com>
+Date: Wed, 8 Jul 2026 21:17:58 -0400
+Subject: [PATCH] metal: default to serial dispatch on non-UMA devices
+
+Non-UMA Metal devices (AMD discrete, Intel iGPU) have unreliable
+command-buffer ordering on the concurrent-dispatch path. Reproducer
+(Mac Pro 2019 + Radeon Pro Vega II): BERT-family embeddings return
+cos_sim ~0.12 against a correct reference the moment concurrency is
+enabled, independent of the simdgroup-reduction fallback kernels (which
+were active and correct in the same measurement with concurrency off).
+
+Default use_concurrency to false when the device lacks unified memory so
+correctness does not depend on operators setting
+GGML_METAL_CONCURRENCY_DISABLE; GGML_METAL_CONCURRENCY_FORCE=1 opts back
+in for testing.
+---
+ ggml/src/ggml-metal/ggml-metal-context.m | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index 32d97cd..6169a7e 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -136,6 +136,21 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
+     res->use_fusion      = getenv("GGML_METAL_FUSION_DISABLE") == nil;
+     res->use_concurrency = getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil;
+ 
++    // Quenchforge patch 0005: non-UMA Metal devices (AMD discrete, Intel iGPU)
++    // have unreliable command-buffer ordering on the concurrent-dispatch path.
++    // 60-second reproducer (Mac Pro 2019 + Vega II, 2026-07-08): BERT
++    // embeddings return cos_sim ~0.12 against a correct reference the moment
++    // concurrency is enabled — independent of the simdgroup-reduction
++    // miscompile addressed by the fallback kernels (patches 0001/0003/0004),
++    // which were active and correct in the same measurement with concurrency
++    // off. Default to serial dispatch on these devices so correctness does
++    // not depend on operators knowing an env var; opt back in for testing
++    // with GGML_METAL_CONCURRENCY_FORCE=1 (same convention as the
++    // GGML_METAL_FORCE_* gates in patch 0001).
++    if (!props_dev->has_unified_memory && getenv("GGML_METAL_CONCURRENCY_FORCE") == nil) {
++        res->use_concurrency = false;
++    }
++
+     {
+         const char * val = getenv("GGML_METAL_GRAPH_DEBUG");
+         res->debug_graph = val ? atoi(val) : 0;
+-- 
+2.50.1 (Apple Git-155)
+

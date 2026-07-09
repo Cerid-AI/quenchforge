@@ -28,13 +28,15 @@ become a generic inference framework.
    Apple Silicon and Intel Mac are the only targets. If a PR adds non-Darwin
    code, the answer is no.
 3. **Minimise the patch surface.** The patch series is exactly the
-   load-bearing change(s) in `patches/<submodule>/`. As of 2026-05-25 that is:
-   - `llama.cpp`: `0001-metal-correctness-on-non-apple-silicon` + `0002-metal-staging-buffer-pool`
+   load-bearing change(s) in `patches/<submodule>/`. As of 2026-07-08 that is:
+   - `llama.cpp`: `0001-metal-correctness-on-non-apple-silicon` +
+     `0002-metal-staging-buffer-pool` + `0003-metal-amd-bert-fallback-kernels`
+     + `0004-metal-amd-bert-matmul-fallback` (0003/0004 un-parked and
+     correctness-validated on Vega II 2026-07-08 — roadmap R1)
    - `whisper.cpp`, `sd.cpp`, `bark.cpp`: `0001-metal-correctness-on-non-apple-silicon` each
-   Two further drafts (`0003`/`0004` BERT fallback kernels) are parked in
-   `patches/llama.cpp/drafts/*.broken` and are never applied. `GGML_METAL_N_CB`
-   is set via env, not a code patch. Adding any new patch requires a written
-   rationale in `patches/README.md`, a public upstream issue link, and review.
+   `GGML_METAL_N_CB` is set via env, not a code patch. Adding any new patch
+   requires a written rationale in `patches/README.md`, a public upstream
+   issue link, and review.
 4. **No `quenchforge doctor` paste = no bug-report triage.** The
    `.github/ISSUE_TEMPLATE/bug.yml` form makes this a hard requirement. Maintainer
    replies to triage-incomplete issues with the doctor-paste request and
@@ -141,12 +143,28 @@ flow and its copy must land in `internal/obs/` with a maintainer review.
 
 ## Operational gotchas
 
-1. **Chat-slot AMD safety args do not apply to embed/rerank slots.**
-   Sections 1 + 2 of `patches/README.md` document `--flash-attn off`,
-   `--cache-ram 0`, and `--no-cache-prompt` as chat-specific (they
-   address LCP-prompt-save and FA-CPU-fallback bugs absent on
-   embed/rerank). Adding them to embed/rerank would force a sub-optimal
-   attention path with no safety win.
+0. **Never issue rapid successive restarts (`kickstart -k` twice, or any
+   overlapping restart) while slots are loading models.** Each restart
+   starts GPU model loads (embed slots push all layers onto the card);
+   overlapping load cycles on a display-active AMD-discrete Mac starve the
+   compositor — observed 2026-07-08 as a WindowServer
+   `userspace_watchdog_timeout` spin (GUI session crash; user-visible as a
+   "system crash"), the userspace cousin of the 2026-05-14 unload+load
+   kernel panic. One restart at a time; wait for `gateway listening` +
+   all `slot pid=` lines in `quenchforge.out.log` before issuing another.
+   Also: `launchctl` gui-domain `bootstrap`/`print` fail with "Domain does
+   not support specified action" from Background-session shells (agent
+   tools, SSH) — if a restart race unloads the job, recovery needs a
+   command from the user's own Aqua session.
+
+1. **The three chat-slot AMD safety flags are RETIRED (2026-07-08, R3).**
+   `--flash-attn off` (FA-fallback throttle inverted upstream: FA=auto is
+   +42% faster and correct) and `--cache-ram 0` / `--no-cache-prompt`
+   (the LCP prompt-save GGML_ASSERT was the staging-allocation class
+   patch 0002 pools; cache verified working) are gone from
+   `tuning.go::chatParams` with regression tests pinning their absence.
+   Do not re-add them to any slot without new evidence — sections 1 + 2
+   of `patches/README.md` carry the retirement data.
 
 2. **Embed/rerank slots have their own AMD safety surface — section 3.**
    The family-B graph-compute buffer-corruption crash hits embed/rerank
@@ -162,7 +180,7 @@ flow and its copy must land in `internal/obs/` with a maintainer review.
    ```
    QUENCHFORGE_EMBED_UBATCH_SIZE=1024   # override tier ubatch — caps Metal staging-buffer pressure
    QUENCHFORGE_EMBED_METAL_N_CB=1       # serialise command-buffer submission
-   QUENCHFORGE_AUTO_BACKOFF=true        # auto-503 before SIGABRT
+   QUENCHFORGE_AUTO_BACKOFF=true        # auto-503 on critical ERROR RATE (crash signature) — v0.9.1: latency ratio is observability-only, never sheds
    ```
 
    The ≥ 12 GB tier keeps the bench-validated Vega II values verbatim;

@@ -8,6 +8,119 @@ patch bumps fix bugs or polish without behaviour change.
 
 ---
 
+## Unreleased — patches 0003/0004 landed: AMD-Metal BERT fallback kernels (2026-07-08)
+
+The two-month-parked `_fb` fallback kernels are live (roadmap R1, the first
+rung of the F0 GPU-reclamation track). The park-blocking compile failure in
+`helper_mv_reduce_and_write_fb<NR0=2>` was two MSL rules, not the template:
+the helper sat textually above the `FC_mul_mv_*` function constants it reads,
+and a `threadgroup` array was declared in non-kernel scope. Fixed by
+relocating the helper and hoisting a fixed 8 KiB `threadgroup` buffer into
+each `_fb` kernel entry (passed down as a parameter; the dynamic `shmem`
+entry parameter — the gfx-rs/wgpu#4500 hazard — stays unused by design).
+
+Validated on Mac Pro 2019 + Vega II: full patched Metal source compiles on
+device; `bench-bert-correctness` passes all 4 probes ON GPU with the
+fallback dispatchers active — same-batch and separate-call determinism
+cos_sim = 1.000000 (broken baseline: 0.07–0.29), paraphrase 0.9551 ≫
+unrelated 0.4430, L2 = 1.0000. The 3-way rebase onto current upstream
+(`a9883db`) is folded into the regenerated patches.
+
+Soak matrix (same day, display-asleep, isolated server; full data under the
+session's bench report):
+
+- **A — prod-parity 30-min gate: PASS.** 1033 reqs, 0 SIGABRTs, p50 5.10s /
+  p95 9.89s @ concurrency 4 × batch 8 (0.59 req/s ≈ 4.7 embeds/s), RSS
+  216→516 MB (2.38×, under the 4× leak floor), interleaved drift probe
+  steady at 0.9989 over 30 min (no cumulative GPU-state corruption).
+- **B — relaxation answer: NO.** Without `GGML_METAL_CONCURRENCY_DISABLE=1`
+  output is immediate garbage (cos_sim 0.117) even with the fb kernels —
+  the non-UMA AMD concurrent-dispatch command-buffer ordering bug is an
+  INDEPENDENT defect from the simdgroup miscompile. One-env-var, 60-second
+  reproducer; serialization stays load-bearing. Follow-up (roadmap R1.5):
+  make the workaround intrinsic by gating `MTLDispatchTypeSerial` on
+  `!has_unified_memory` in ggml-metal-device.m.
+- **C — ubatch 8192 (the v0.5.x ~2-min-crash config): 15-min PASS.** Crash
+  class closed by pool + fb kernels; no throughput win vs 1024 (p50 7.02s
+  vs 5.10s, tighter p95) — the VRAM-tier caps are now performance tuning,
+  not crash guards.
+- **D — bge-reranker deterministic on GPU** — the rerank GPU A/B (R4) is
+  unblocked.
+
+### Added — patch 0005: serial dispatch by default on non-UMA devices
+
+The Phase-B finding, made intrinsic: `use_concurrency` now defaults to
+false when the Metal device lacks unified memory, so BERT correctness on
+AMD-Mac no longer depends on operators setting
+`GGML_METAL_CONCURRENCY_DISABLE`. `GGML_METAL_CONCURRENCY_FORCE=1` opts
+back in for testing (verified to reproduce the cos_sim ~0.117 failure on
+demand). The series is now 5 patches and round-trips clean from pristine
+upstream.
+
+### Changed — R3: the three chat-slot AMD safety flags retired
+
+Measurement on the 5-patch build inverted both rationales. FA: `--flash-attn
+auto` now decodes 3.7–3.8 tok/s vs 2.6 with `off` (+42%), deterministic and
+GPU-resident — the historical CPU-fallback throttle is gone upstream.
+Prompt cache: the LCP prompt-save `GGML_ASSERT(buf_dst)` crash was the same
+staging-allocation class patch 0002 pools — 6 LCP-similar requests run
+clean, the cache works (prompt_n 83→17 on a shared prefix), and an 8-min
+sustained chat run passed (56 reqs, 0 failures, RSS 1.00×).
+`chatParams` now passes only `--gpu-layers 999`; regression tests pin the
+retirement. GPU decode remains serial-dispatch-capped, so chat stays
+CPU-placed by default on AMD-discrete.
+
+The new llama-server (upstream `a9883db` + the 4-patch series) is deployed
+to production: gateway embed (4/4 probes), rerank determinism, chat
+completion, and a cerid end-to-end ingest all verified post-restart.
+
+---
+
+## v0.9.1 — CPU-slot batch sizing + instance-scoped error-rate backoff (2026-07-08)
+
+Root-caused from a downstream eval incident (cerid `/agent/query` burst):
+three interacting defects turned a routine retrieval workload into
+deterministic 500s and a 60-second 503 storm.
+
+### Fixed — CPU-placed slots reverted to llama-server's 512-token batch
+
+`cpuTuning` returned only `--gpu-layers 0`, so every CPU-placed slot (rerank
++ the "auto" embed/code-embed CPU twins — CPU placement shipped in v0.9.0)
+ran at llama-server's 512 default physical batch. The embedding and rerank
+pooling paths reject any single sequence longer than n_ubatch, so every
+>512-token (query, doc) pair or single input returned HTTP 500 "input too
+large to process" — reintroducing the v0.5.0 512-token-limit bug on the CPU
+path, and silently dropping the documented `QUENCHFORGE_RERANK_BATCH_SIZE` /
+`QUENCHFORGE_EMBED_UBATCH_SIZE` overrides (dead knobs on CPU-placed slots).
+
+Now: CPU-placed embed/code-embed/rerank slots size the physical batch to the
+context (no Metal staging pressure exists on CPU; fits-context ⇒ fits-batch,
+the same principle the non-AMD embed path always used), and operator
+overrides reach CPU-placed slots. GPU-placed rerank also gains a real
+default (non-AMD: context-sized; AMD-discrete: the bench-validated amdSizing
+ubatch as a staging cap) — the old "no default" shipped llama-server's 512,
+a strictly-worse deterministic 500 generator.
+
+### Fixed — auto-backoff false positives: 503 storms from healthy slots
+
+The v0.6.0 p99/p50-ratio classifier assumed one homogeneous instance per
+kind. v0.9.0's "auto" placement made embed latency bimodal by design
+(millisecond CPU singles + multi-second governed GPU batches) — one mixed
+60-second window pushed the ratio past 5x and flipped "critical" with a 0.00
+error rate, after which `QUENCHFORGE_AUTO_BACKOFF=true` shed ALL embed
+traffic (including requests bound for the idle, healthy CPU twin) with 503s.
+
+Now: (a) the dual-placed CPU twin records under its own tracker key
+(`embed-cpu` / `code-embed-cpu`, visible in `/health`), so the two
+instances' distributions never mix and backoff is evaluated against the
+instance a request actually routes to; (b) shedding fires on a critical
+ERROR RATE only — the actual family-B crash signature — while latency-ratio
+degradation remains observability-only in `/health` ("degrade to working,
+not 503"); (c) backoff state transitions log once (`auto-backoff ON/OFF for
+<slot>`), so the next storm is diagnosable from the gateway's own log.
+
+---
+
 ## v0.9.0 — GPU resource-control framework: placement + governor (2026-06-08)
 
 A two-part control plane so sustained inference on a single-GPU Mac can't

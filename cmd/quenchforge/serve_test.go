@@ -82,15 +82,13 @@ func TestBuildSlotArgs_BaseShape(t *testing.T) {
 }
 
 func TestBuildSlotArgs_AMDChatGetsCorrectnessFlags(t *testing.T) {
-	// All four AMD-discrete profiles must add the three correctness
-	// flags to the chat slot:
-	//   --flash-attn off     keeps attention GPU-resident (no FA tensor
-	//                        CPU fallback per decode step)
-	//   --cache-ram 0        disables the server-side LCP-similarity
-	//                        slot cache (the prompt_save → buf_dst=NULL
-	//                        GGML_ASSERT path)
-	//   --no-cache-prompt    disables per-slot prompt caching as a
-	//                        belt-and-suspenders companion
+	// R3 (2026-07-08): the three CPU-route-era chat flags were RETIRED —
+	// FA=auto is now +42% faster and correct on the patched build (the
+	// CPU-fallback throttle inverted upstream), and the LCP prompt-save
+	// GGML_ASSERT(buf_dst) crash was fixed by patch 0002's staging pool
+	// (prompt cache verified working: prompt_n 83→17 on a shared prefix;
+	// 8-min sustained chat 56 reqs / 0 failures / RSS 1.00x). The GPU chat
+	// slot keeps only --gpu-layers 999; the retired flags must NOT return.
 	for _, profile := range []hardware.Profile{
 		hardware.ProfileVegaPro,
 		hardware.ProfileW6800X,
@@ -107,17 +105,14 @@ func TestBuildSlotArgs_AMDChatGetsCorrectnessFlags(t *testing.T) {
 			}
 			args := buildSlotArgs(cfg, info, spec, "/tmp/chat.gguf")
 
-			if !containsArgPair(args, "--flash-attn", "off") {
-				t.Errorf("chat slot on %s missing --flash-attn off: %v",
-					profile, args)
+			if !containsArgPair(args, "--gpu-layers", "999") {
+				t.Errorf("chat slot on %s missing --gpu-layers 999: %v", profile, args)
 			}
-			if !containsArgPair(args, "--cache-ram", "0") {
-				t.Errorf("chat slot on %s missing --cache-ram 0: %v",
-					profile, args)
-			}
-			if !containsArg(args, "--no-cache-prompt") {
-				t.Errorf("chat slot on %s missing --no-cache-prompt: %v",
-					profile, args)
+			for _, retired := range []string{"--flash-attn", "--cache-ram", "--no-cache-prompt"} {
+				if containsArg(args, retired) {
+					t.Errorf("chat slot on %s re-grew retired flag %s (R3 regression): %v",
+						profile, retired, args)
+				}
 			}
 		})
 	}
@@ -373,22 +368,34 @@ func TestBuildSlotArgs_LowVRAMAMDCapsContextAndUbatch(t *testing.T) {
 	}
 }
 
-func TestBuildSlotArgs_NonEmbedKindsSkipBatchOverride(t *testing.T) {
-	// Chat / rerank / whisper slots don't need the embed batch override
-	// (they decode autoregressively or operate per-pair). Adding it
-	// would waste VRAM on the chat slot in particular.
+func TestBuildSlotArgs_ChatSkipsBatchOverride(t *testing.T) {
+	// The chat slot doesn't need the embed batch override — it decodes
+	// autoregressively and its prompt path splits across ubatches; adding it
+	// would waste VRAM. (Rerank USED to be in this list; since v0.9.1 it
+	// carries a context-sized batch because llama-server's rerank pooling
+	// path 500s any (query, doc) pair longer than n_ubatch — see
+	// tuning.rerankParams and the 2026-07-08 incident regression tests.)
 	cfg := config.Config{MaxContext: 8192}
 	info := hardware.Info{Profile: hardware.ProfileVegaPro}
 
-	for _, kind := range []gateway.SlotKind{gateway.KindChat, gateway.KindRerank} {
-		t.Run(string(kind), func(t *testing.T) {
-			spec := slotSpec{Kind: kind, Name: string(kind), Port: 11500}
-			args := buildSlotArgs(cfg, info, spec, "/tmp/model.gguf")
+	spec := slotSpec{Kind: gateway.KindChat, Name: "chat", Port: 11500}
+	args := buildSlotArgs(cfg, info, spec, "/tmp/model.gguf")
+	if containsArgPair(args, "--batch-size", "8192") {
+		t.Errorf("chat slot must not pass --batch-size 8192: %v", args)
+	}
+}
 
-			if containsArgPair(args, "--batch-size", "8192") {
-				t.Errorf("%s slot must not pass --batch-size 8192: %v", kind, args)
-			}
-		})
+func TestBuildSlotArgs_RerankCarriesContextSizedBatch(t *testing.T) {
+	// Regression (2026-07-08): the CPU-placed rerank slot spawned with no
+	// batch flags, reverting to llama-server's 512 default — every
+	// >512-token (query, doc) pair returned HTTP 500 "input too large".
+	cfg := config.Config{MaxContext: 8192}
+	info := hardware.Info{Profile: hardware.ProfileVegaPro}
+
+	spec := slotSpec{Kind: gateway.KindRerank, Name: "rerank", Port: 11502}
+	args := buildSlotArgs(cfg, info, spec, "/tmp/model.gguf")
+	if !containsArgPair(args, "--batch-size", "8192") || !containsArgPair(args, "--ubatch-size", "8192") {
+		t.Errorf("CPU-placed rerank slot must carry context-sized batch args: %v", args)
 	}
 }
 
