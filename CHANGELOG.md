@@ -8,7 +8,7 @@ patch bumps fix bugs or polish without behaviour change.
 
 ---
 
-## Unreleased — patches 0003/0004 landed: AMD-Metal BERT fallback kernels (2026-07-08)
+## v0.10.0 — AMD-Metal reclamation: fallback kernels, intrinsic serial dispatch, measured placement (2026-07-09)
 
 The two-month-parked `_fb` fallback kernels are live (roadmap R1, the first
 rung of the F0 GPU-reclamation track). The park-blocking compile failure in
