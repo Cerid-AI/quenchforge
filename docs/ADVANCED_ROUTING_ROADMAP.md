@@ -315,9 +315,19 @@ the AMD host.
       no-env correctness 4/4 PASS (was 3/4 FAIL pre-patch);
       FORCE=1 reproduces the failure on demand. 5-patch series round-trips
       clean. Upstream submission (vs #19563) still to be filed.
-- [ ] R2: patch 0005 quantized-matmul fallback; `bench-llama-sustained-load` p50 ≤ CPU + 7-day zero-SIGABRT soak → `chatParams` back to GPU.
+- [ ] R2 (RE-SCOPED 2026-07-08 by measurement): chat decode on the new
+      binary = GPU 2.6 tok/s vs CPU 9.5 tok/s (3.7× CPU) with correctness
+      already intact — and the Phase-B finding forbids lifting the serial
+      dispatch that caps GPU decode. Parity ("p50 ≤ CPU") is empirically
+      unreachable on vega-pro; chat's CPU placement is CORRECT, and the
+      fast-chat path is F1's remote CUDA backend. Residual R2 value:
+      quantized-matmul `_fb` kernels as crash-margin hardening for
+      operators who force GPU chat — LOW priority.
 - [ ] R3: FA fallback kernel + LCP prompt-cache root-cause; remove the three chat safety flags one at a time, each behind the soak gate.
-- [ ] R4: rerank GPU-vs-CPU batched A/B (v0.9.1 batch defaults make GPU rerank runnable); extend "auto" placement to rerank if GPU wins.
+- [x] R4 (2026-07-08): CLOSED — CPU wins decisively. 20-doc bge-reranker
+      requests: CPU p50 7.2s / 2.7 docs/s vs GPU p50 21.2s / 0.9 docs/s
+      (serialized dispatch + 568M-param forward passes dominate). Rerank
+      stays CPU-placed; no "auto" extension warranted on this hardware.
 - [ ] R5: multi-device Metal scheduling (`MTLCopyAllDevices` round-robin, per-device admission) — with F2's `Target`.
 - [ ] R6: whisper encoder kernel debug (opt-in `QUENCHFORGE_WHISPER_GPU` stays until fixed).
 - [ ] Each landed kernel: upstream PR referencing #19563.
