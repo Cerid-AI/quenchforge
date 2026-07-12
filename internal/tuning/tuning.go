@@ -192,6 +192,14 @@ func PolicyFor(profile hardware.Profile, cfg config.Config) placement.Policy {
 // dead knobs on CPU-placed slots (2026-07-08 cerid eval incident).
 func cpuTuning(kind gateway.SlotKind, cfg config.Config) SlotTuning {
 	t := SlotTuning{ExtraArgs: []string{"--gpu-layers", "0"}}
+	// Respawn-on-crash is device-independent lifecycle robustness, not a
+	// GPU-safety knob. Before 2026-07-12 only the AMD-GPU param builders
+	// set AutoRespawn (motivated by the family-B Metal SIGABRT), which
+	// silently left every placement-CPU slot — chat and rerank on
+	// AMD-discrete defaults — with no restart policy. The 2026-07-11
+	// incident's jetsam-class kill took out exactly such a CPU-placed
+	// chat slot, and it stayed dead until the next full restart.
+	t.AutoRespawn = true
 	switch kind {
 	case gateway.KindEmbed, gateway.KindCodeEmbed:
 		b := cfg.MaxContext

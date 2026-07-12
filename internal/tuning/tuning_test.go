@@ -552,18 +552,23 @@ func TestKernelParams_UbatchOverrideBeatsTierButCapStands(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestKernelParamsForDevice_ExplicitCPU(t *testing.T) {
-	// An explicit CPU device yields CPU tuning: --gpu-layers 0, no Metal env,
-	// no respawn — but embedding-family kinds still get the context-sized
-	// batch (llama-server's embedding/rerank pooling paths reject any single
+	// An explicit CPU device yields CPU tuning: --gpu-layers 0 and no Metal
+	// env — but embedding-family kinds still get the context-sized batch
+	// (llama-server's embedding/rerank pooling paths reject any single
 	// sequence longer than n_ubatch, and CPU has no staging-pressure reason
 	// to cap it — the v0.9.1 fix for the 2026-07-08 512-token 500s).
+	// AutoRespawn stays ON: process death (jetsam, OOM) is device-
+	// independent — see the 2026-07-11 incident note in cpuTuning.
 	cfg := config.Config{MaxContext: 8192}
 	tn := KernelParamsForDevice(hardware.ProfileVegaPro, vramHigh, gateway.KindEmbed, cfg, placement.CPU)
 	if !slices.Equal(tn.ExtraArgs, []string{"--gpu-layers", "0"}) {
 		t.Errorf("explicit CPU ExtraArgs = %v, want [--gpu-layers 0]", tn.ExtraArgs)
 	}
-	if tn.MetalConcurrencyDisable || tn.AutoRespawn || tn.MetalNCB != 0 {
-		t.Errorf("explicit CPU should emit no Metal/respawn tuning, got %+v", tn)
+	if tn.MetalConcurrencyDisable || tn.MetalNCB != 0 {
+		t.Errorf("explicit CPU should emit no Metal tuning, got %+v", tn)
+	}
+	if !tn.AutoRespawn {
+		t.Errorf("explicit CPU must keep AutoRespawn (device-independent lifecycle), got %+v", tn)
 	}
 	if tn.UbatchSize != 8192 || tn.BatchSize != 8192 {
 		t.Errorf("explicit CPU embed batch = %d/%d, want 8192/8192 (MaxContext)",
@@ -575,6 +580,20 @@ func TestKernelParamsForDevice_ExplicitCPU(t *testing.T) {
 	if chat.UbatchSize != 0 || chat.BatchSize != 0 {
 		t.Errorf("explicit CPU chat batch = %d/%d, want 0/0 (minimal)",
 			chat.UbatchSize, chat.BatchSize)
+	}
+}
+
+func TestKernelParams_PlacementCPUSlotsGetAutoRespawn(t *testing.T) {
+	// The placement policy on AMD-discrete routes chat and rerank to the
+	// CPU by default. Regression for the 2026-07-11 incident: those slots
+	// used to come back with no restart policy, so a jetsam-class kill
+	// left them dead (and, pre-reaping, zombied) until a full restart.
+	cfg := config.Config{MaxContext: 8192}
+	for _, k := range []gateway.SlotKind{gateway.KindChat, gateway.KindRerank} {
+		tn := KernelParams(hardware.ProfileVegaPro, vramHigh, k, cfg)
+		if !tn.AutoRespawn {
+			t.Errorf("%s (placement-CPU on vega-pro) must request AutoRespawn", k)
+		}
 	}
 }
 

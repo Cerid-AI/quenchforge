@@ -15,6 +15,12 @@ kill during a host-wide memory crunch left the chat slot's llama-server dead
 — and, because only auto-respawn slots were ever `Wait()`ed, unreaped as a
 zombie for days while the gateway kept routing chat requests at a corpse.
 
+- **CPU-placed slots get auto-respawn.** `cpuTuning` treated AutoRespawn
+  as a GPU-safety knob and never set it, so the placement policy's CPU
+  routes — chat and rerank on the AMD-discrete defaults — ran with no
+  restart policy at all. This, not the GPU path, is what left the
+  incident's chat slot dead; caught live when a SIGKILLed rerank slot
+  logged "no restart policy — slot stays down" during deploy validation.
 - **Every slot child is reaped by an unconditional watcher**, whatever its
   `RestartPolicy`. A dead, un-respawned slot also releases its log handle
   and removes its pidfile immediately instead of leaking both until the
