@@ -8,7 +8,7 @@ patch bumps fix bugs or polish without behaviour change.
 
 ---
 
-## Unreleased — supervisor lifecycle hardening (post-incident)
+## v0.10.1 — supervisor lifecycle hardening (post-incident) (2026-07-12)
 
 Driven by the 2026-07-11 incident on the reference Mac Pro: a jetsam-class
 kill during a host-wide memory crunch left the chat slot's llama-server dead
