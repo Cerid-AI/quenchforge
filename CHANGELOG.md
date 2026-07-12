@@ -8,6 +8,37 @@ patch bumps fix bugs or polish without behaviour change.
 
 ---
 
+## Unreleased — supervisor lifecycle hardening (post-incident)
+
+Driven by the 2026-07-11 incident on the reference Mac Pro: a jetsam-class
+kill during a host-wide memory crunch left the chat slot's llama-server dead
+— and, because only auto-respawn slots were ever `Wait()`ed, unreaped as a
+zombie for days while the gateway kept routing chat requests at a corpse.
+
+- **Every slot child is reaped by an unconditional watcher**, whatever its
+  `RestartPolicy`. A dead, un-respawned slot also releases its log handle
+  and removes its pidfile immediately instead of leaking both until the
+  next Start/Stop.
+- **The crash-storm cap no longer gives up forever.** After 3 respawns in
+  the rolling 60-second window the slot cools off (5 minutes) and probes
+  again with a fresh window — transient host memory pressure no longer
+  converts into a permanent slot outage.
+- **`Stop()` consumes the watcher's wait result** instead of double-
+  `Wait()`ing and signalling already-dead children (the source of the
+  "SIGTERM: operation not permitted" shutdown noise). A Stop that lands
+  during a pending respawn cancels the respawn.
+- **`Slot.PID()` reports 0 for a reaped child** instead of the stale PID,
+  so status surfaces never point operators at a dead process.
+- **`doctor` gained a "Running server binary" section** that flags the
+  upgrade-while-running footgun: `brew upgrade` replaces the Cellar binary
+  under the live server, whose next text-page fault SIGKILLs it with
+  "Code Signature Invalid" (observed 2026-07-08) — and until that lands it
+  silently keeps executing the old version. Formula caveats and the ops
+  gotchas document the one-restart remediation.
+- **Fixed the AMD-discrete startup banner** that still announced the three
+  retired chat safety flags (R3, 2026-07-08) long after `tuning.go`
+  stopped applying them.
+
 ## v0.10.0 — AMD-Metal reclamation: fallback kernels, intrinsic serial dispatch, measured placement (2026-07-09)
 
 The two-month-parked `_fb` fallback kernels are live (roadmap R1, the first

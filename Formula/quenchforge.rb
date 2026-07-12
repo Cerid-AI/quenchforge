@@ -82,6 +82,18 @@ class Quenchforge < Formula
           show a "find devices on your local network" prompt for mDNSResponder.
           Approve it for cerid-ai LAN autodiscovery; decline if you only want
           loopback access.
+
+      Upgrading while the service is running:
+        brew upgrade replaces the Cellar binary UNDER the live server. macOS
+        codesign validation can then SIGKILL it mid-flight ("Code Signature
+        Invalid"), and until restarted it keeps executing the old version.
+        After every upgrade, restart the service exactly once and wait for
+        "gateway listening" in the log before doing anything else:
+
+          brew services restart quenchforge    # brew-services installs
+          launchctl kickstart -k gui/$(id -u)/com.cerid.quenchforge    # custom LaunchAgent
+
+        `quenchforge doctor` reports this state under "Running server binary".
     EOS
   end
 

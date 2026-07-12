@@ -195,6 +195,18 @@ flow and its copy must land in `internal/obs/` with a maintainer review.
    adding a new `if hwInfo.IsAMDDiscrete() && spec.Kind == ...` block
    to `buildSlotArgs`.
 
+4. **Never `brew upgrade` (or reinstall) while the service is running
+   without restarting it immediately after.** Replacing the Cellar
+   binary under the live process invalidates its codesigned text pages —
+   the next page-in SIGKILLs it with "Code Signature Invalid" (observed
+   2026-07-08, quenchforge 0.9.0 killed 25s after launch mid-upgrade).
+   Until that kill lands, the server silently keeps running the OLD
+   version. After any upgrade: exactly ONE `launchctl kickstart -k
+   gui/$(id -u)/com.cerid.quenchforge` (see gotcha 0 for the
+   one-restart-at-a-time rule). `quenchforge doctor` surfaces the state
+   under "Running server binary" (stale/removed exec path vs the
+   installed binary).
+
 ## Anti-patterns to reject
 
 - Adding a Linux build tag for any non-test file

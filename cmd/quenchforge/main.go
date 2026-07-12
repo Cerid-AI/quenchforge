@@ -261,10 +261,11 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) error {
 	// the runtime behavior stay in sync.
 	fmt.Fprintln(stdout, "Port 11434")
 	fmt.Fprintln(stdout, "----------")
+	pcCtx, pcCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	pcRes, pcErr := portcheck.Check(pcCtx, "127.0.0.1:11434")
+	pcCancel()
 	{
-		pcCtx, pcCancel := context.WithTimeout(context.Background(), 3*time.Second)
-		res, err := portcheck.Check(pcCtx, "127.0.0.1:11434")
-		pcCancel()
+		res, err := pcRes, pcErr
 		if err != nil {
 			fmt.Fprintf(stdout, "  could not probe: %v\n", err)
 		} else {
@@ -286,6 +287,17 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) error {
 	}
 	fmt.Fprintln(stdout)
 
+	// Running server binary — detects the upgrade-while-running footgun:
+	// `brew upgrade` replaces the Cellar path under the live server, whose
+	// next binary page-in fails codesign validation and SIGKILLs it
+	// ("Code Signature Invalid", observed 2026-07-08). Even while the
+	// process survives, it is still executing the pre-upgrade binary.
+	// Either way the remedy is exactly one restart.
+	fmt.Fprintln(stdout, "Running server binary")
+	fmt.Fprintln(stdout, "---------------------")
+	fmt.Fprintln(stdout, "  "+checkRunningServerBinary(pcRes, pcErr, *redacted))
+	fmt.Fprintln(stdout)
+
 	// --explain — per-finding remediation steps, so a bug-report triage
 	// reply can quote the doctor output AND the next action in one paste.
 	// Framed as a "Common remediations" reference (not "Remediation") so
@@ -304,6 +316,8 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) error {
 		fmt.Fprintln(stdout, `  - Slot log CRITICAL:            : > <path-to-log>  (Layer 1c rotation should prevent recurrence)`)
 		fmt.Fprintln(stdout, `  - Port 11434 held by Ollama:    see "Ollama LaunchAgent" remediation`)
 		fmt.Fprintln(stdout, `  - Port 11434 unknown holder:    lsof -i :11434 -sTCP:LISTEN  (resolve manually)`)
+		fmt.Fprintln(stdout, `  - Running server binary stale:  launchctl kickstart -k gui/$(id -u)/com.cerid.quenchforge`)
+		fmt.Fprintln(stdout, `                                  (ONE restart; wait for "gateway listening" before anything else)`)
 		fmt.Fprintln(stdout)
 	}
 
@@ -455,6 +469,59 @@ func checkSlotLogSizes() []string {
 	return out
 }
 
+// checkRunningServerBinary compares the exec path of the quenchforge that
+// holds :11434 (from the doctor's port probe) against this binary's own
+// path. A mismatch means the install was upgraded — or removed — under
+// the running server.
+func checkRunningServerBinary(res portcheck.Result, probeErr error, redacted bool) string {
+	if probeErr != nil || res.Verdict != portcheck.VerdictHeldByStaleQuenchforge {
+		return "n/a — no running quenchforge holds :11434"
+	}
+	running := res.Holder.ExecPath
+	if running == "" {
+		return "UNKNOWN — could not resolve the running server's executable path"
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return fmt.Sprintf("UNKNOWN — could not resolve this binary's path: %v", err)
+	}
+	return staleBinaryStatus(running, self, redacted)
+}
+
+// staleBinaryStatus classifies running-vs-current binary paths. Symlinks
+// are resolved on both sides so `/usr/local/bin/quenchforge` (opt symlink)
+// and its Cellar target compare equal.
+func staleBinaryStatus(running, current string, redacted bool) string {
+	rp := resolveSymlinksBestEffort(running)
+	cp := resolveSymlinksBestEffort(current)
+	if rp == cp {
+		return fmt.Sprintf("PASS — running server matches this binary (%s)",
+			redactPath(cp, redacted))
+	}
+	const restartHint = "Restart ONCE and wait for \"gateway listening\": " +
+		"launchctl kickstart -k gui/$(id -u)/com.cerid.quenchforge"
+	if _, err := os.Stat(running); err != nil {
+		// The path the live server was started from is gone: the next
+		// page-in of an evicted text page fails codesign validation and
+		// the kernel SIGKILLs the server (Code Signature Invalid).
+		return fmt.Sprintf("CRITICAL — running server was started from %s, which no longer "+
+			"exists (upgraded/removed while running; the server can be SIGKILLed at any "+
+			"moment). %s", redactPath(running, redacted), restartHint)
+	}
+	return fmt.Sprintf("WARN — running server binary (%s) differs from this binary (%s); "+
+		"the live server has not picked up the installed version. %s",
+		redactPath(rp, redacted), redactPath(cp, redacted), restartHint)
+}
+
+// resolveSymlinksBestEffort resolves symlinks, falling back to the input
+// when resolution fails (dangling link, permission, nonexistent path).
+func resolveSymlinksBestEffort(p string) string {
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	return p
+}
+
 // ---------------------------------------------------------------------------
 // serve — gateway + (optional) supervised llama-server slot.
 // ---------------------------------------------------------------------------
@@ -555,11 +622,14 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 			hwErr)
 	}
 	if hwInfo.IsAMDDiscrete() {
+		// Keep this banner in sync with tuning.go::chatParams — it used to
+		// announce the three retired chat safety flags (R3, 2026-07-08)
+		// long after tuning stopped applying them, which misled incident
+		// analysis into believing the flags were still active.
 		fmt.Fprintf(stdout,
-			"quenchforge: detected %s profile — chat slot will use "+
-				"--flash-attn off --cache-ram 0 --no-cache-prompt\n"+
-				"  (avoids GPU↔CPU flash-attn fallback throttling + Vega II "+
-				"prompt-cache GGML_ASSERT crash; embed/rerank slots are unaffected)\n",
+			"quenchforge: detected %s profile — AMD-discrete tuning active "+
+				"(patched Metal kernels; VRAM-tier-adaptive embed sizing; "+
+				"auto-respawn on embed/rerank/chat slots)\n",
 			hwInfo.Profile)
 	}
 

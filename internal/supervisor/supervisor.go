@@ -15,6 +15,8 @@
 //     cleanly tears down hung children plus any subprocesses they spawned.
 //  4. Stream stdout/stderr to per-slot log files and to a ring buffer the
 //     gateway can expose for the doctor command.
+//  5. Reap every child on exit via an unconditional watcher (no zombies,
+//     whatever the RestartPolicy) and auto-respawn when policy allows.
 //
 // MVP-stage scope: single chat slot. The Slot abstraction is designed
 // to support N slots (chat + embed + rerank + whisper) but the supervisor
@@ -51,10 +53,14 @@ const (
 	PolicyNone RestartPolicy = iota
 
 	// PolicyExpBackoff retries Start after 2s, 4s, 8s on each
-	// successive crash within a 60-second window. After 3 attempts
-	// without a successful 60-second run, the supervisor gives up
-	// and leaves the slot dead (logs a warning). Resets the attempt
-	// counter when a slot runs cleanly for >=60s.
+	// successive crash within a rolling 60-second window. After 3
+	// attempts inside the window the slot cools off for
+	// crashStormCooloff (default 5m) and then probes again with a
+	// fresh window — a supervised slot never stays dead permanently.
+	// A jetsam kill-storm on a memory-pressured host passes; a slot
+	// that gave up permanently turned the 2026-07-11 transient crunch
+	// into a days-long dead chat slot. Resets to fast backoff when
+	// crashes stop clustering.
 	PolicyExpBackoff
 )
 
@@ -107,6 +113,9 @@ type Slot struct {
 	logFile     io.WriteCloser
 	pidPath     string
 	started     time.Time
+	waitCh      chan error  // watcher publishes the child's Wait result; closed after reap
+	stopping    bool        // Stop() in progress — watcher must not respawn
+	exited      bool        // watcher reaped the current cmd (avoids racing on cmd.ProcessState)
 	respawnMu   sync.Mutex  // serialises respawn attempts
 	respawnHist []time.Time // crash timestamps within last 60s
 }
@@ -123,7 +132,7 @@ func NewSlot(name string) *Slot {
 func (s *Slot) Start(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.cmd != nil && s.cmd.Process != nil && s.cmd.ProcessState == nil {
+	if s.cmd != nil && s.cmd.Process != nil && !s.exited {
 		return nil // already running
 	}
 	if s.Name == "" {
@@ -172,40 +181,72 @@ func (s *Slot) Start(ctx context.Context) error {
 		fmt.Fprintf(os.Stderr, "quenchforge: warn: write pidfile %q: %v\n", s.pidPath, err)
 	}
 
-	// If the caller asked for auto-respawn, spawn a watcher goroutine
-	// that waits for the process to exit and re-Starts it when policy
-	// allows. Without this, a SIGABRT on the embed slot (family-B Metal
-	// crash) would leave the slot dead until manual restart.
-	if s.RestartPolicy != PolicyNone {
-		go s.watchAndRespawn(ctx, cmd)
-	}
+	// Every slot gets a watcher that Wait()s the child — reaping is
+	// unconditional. A PolicyNone slot whose child dies (jetsam SIGKILL,
+	// Metal SIGABRT) must not linger as a zombie: the 2026-07-11 incident
+	// left a dead chat llama-server unreaped for days because only
+	// respawning slots were ever Wait()ed. The watcher also owns the
+	// respawn decision when policy allows.
+	s.stopping = false
+	s.exited = false
+	s.waitCh = make(chan error, 1)
+	go s.watch(ctx, cmd, s.waitCh)
 	return nil
 }
 
-// watchAndRespawn blocks until the supervised process exits, then
-// applies the RestartPolicy to decide whether to bring it back. Runs
-// in its own goroutine; the goroutine exits when ctx is cancelled (the
-// supervisor is shutting down) or when policy gives up.
-//
-// Crash-storm protection: we accept at most 3 respawns within any
-// rolling 60-second window. On the 4th, we leave the slot dead and log
-// a warning — protects against tight loops on a permanently-wedged GPU.
-func (s *Slot) watchAndRespawn(ctx context.Context, cmd *exec.Cmd) {
+// crashStormCooloff is how long a slot that exceeded the crash-storm cap
+// (3 respawns in a rolling 60-second window) waits before probing again.
+// respawnBackoffUnit scales the fast-path exponential backoff (2·unit,
+// 4·unit, 8·unit). Package vars so tests can shrink them.
+var (
+	crashStormCooloff  = 5 * time.Minute
+	respawnBackoffUnit = time.Second
+)
+
+// watch reaps the supervised process when it exits, publishes the Wait
+// result to waitCh (consumed by Stop), and applies the RestartPolicy.
+// Exactly one watcher runs per spawned process; a respawn starts a new
+// process and with it a new watcher.
+func (s *Slot) watch(ctx context.Context, cmd *exec.Cmd, waitCh chan<- error) {
 	err := cmd.Wait()
+	waitCh <- err
+	close(waitCh)
 
-	// If the parent context is done the supervisor is shutting down;
-	// don't respawn.
-	if ctx.Err() != nil {
+	s.mu.Lock()
+	stopping := s.stopping
+	if s.cmd == cmd {
+		s.exited = true
+		if !stopping {
+			// The child died on its own — release its log handle and
+			// pidfile now rather than leaking them until the next
+			// Start/Stop.
+			s.cleanupLocked()
+		}
+	}
+	s.mu.Unlock()
+
+	// Stop() owns shutdown-path cleanup; a cancelled ctx means the
+	// supervisor itself is going down; a clean exit (code 0) is operator
+	// intent. None of the three respawns.
+	if stopping || ctx.Err() != nil || err == nil {
 		return
 	}
-	// Clean exit (exit code 0) means an operator told the slot to stop;
-	// don't respawn that either.
-	if err == nil {
+	if s.RestartPolicy == PolicyNone {
+		fmt.Fprintf(os.Stderr,
+			"quenchforge: slot %s exited (%v); no restart policy — slot stays down\n",
+			s.Name, err)
 		return
 	}
+	s.respawnAfterCrash(ctx, err)
+}
 
+// respawnAfterCrash applies exponential backoff (2s, 4s, 8s) within a
+// rolling 60-second window. Exceeding 3 attempts in the window means a
+// crash storm (permanently-wedged GPU, jetsam kill-storm): rather than
+// leaving the slot dead forever, cool off for crashStormCooloff and
+// probe again with a fresh window.
+func (s *Slot) respawnAfterCrash(ctx context.Context, waitErr error) {
 	s.respawnMu.Lock()
-	defer s.respawnMu.Unlock()
 
 	// Trim crash history older than 60s.
 	now := time.Now()
@@ -218,22 +259,24 @@ func (s *Slot) watchAndRespawn(ctx context.Context, cmd *exec.Cmd) {
 	}
 	s.respawnHist = keep
 
+	var delay time.Duration
 	if len(s.respawnHist) >= 3 {
+		delay = crashStormCooloff
+		s.respawnHist = s.respawnHist[:0]
 		fmt.Fprintf(os.Stderr,
-			"quenchforge: slot %s crashed %d times in last 60s — giving up "+
-				"(restart quenchforge to bring it back). Last error: %v\n",
-			s.Name, len(s.respawnHist), err)
-		return
+			"quenchforge: slot %s crashed more than 3 times in 60s — cooling off %s "+
+				"before the next attempt. Last error: %v\n",
+			s.Name, delay, waitErr)
+	} else {
+		// 2·unit on first crash this window, 4·unit on second, 8·unit
+		// on third (unit is 1s in production).
+		delay = time.Duration(2<<len(s.respawnHist)) * respawnBackoffUnit
+		s.respawnHist = append(s.respawnHist, now)
+		fmt.Fprintf(os.Stderr,
+			"quenchforge: slot %s exited (%v); respawn in %s (%d/3 in window)\n",
+			s.Name, waitErr, delay, len(s.respawnHist))
 	}
-
-	// Exponential backoff: 2s on first crash this window, 4s on second,
-	// 8s on third. The cap is the 3-attempt limit above.
-	delay := time.Duration(2<<len(s.respawnHist)) * time.Second
-	s.respawnHist = append(s.respawnHist, now)
-
-	fmt.Fprintf(os.Stderr,
-		"quenchforge: slot %s exited (%v); respawn in %s (%d/3 in window)\n",
-		s.Name, err, delay, len(s.respawnHist))
+	s.respawnMu.Unlock()
 
 	select {
 	case <-ctx.Done():
@@ -242,9 +285,12 @@ func (s *Slot) watchAndRespawn(ctx context.Context, cmd *exec.Cmd) {
 	}
 
 	// Reset state under the slot's mutex so the next Start() sees a
-	// clean slate.
+	// clean slate. Skip if an operator started a Stop during the wait.
 	s.mu.Lock()
-	s.cleanupLocked()
+	if s.stopping {
+		s.mu.Unlock()
+		return
+	}
 	s.cmd = nil
 	s.logFile = nil
 	s.mu.Unlock()
@@ -255,44 +301,77 @@ func (s *Slot) watchAndRespawn(ctx context.Context, cmd *exec.Cmd) {
 	}
 }
 
-// Stop sends SIGTERM, waits up to grace, then SIGKILLs and reaps. Returns
-// the process's wait error (often *exec.ExitError) so callers can decide
-// whether the exit was clean.
+// Stop sends SIGTERM to the child's process group, waits up to grace for
+// the watcher to reap it, then SIGKILLs. Returns the child's Wait error
+// (often *exec.ExitError) so callers can decide whether the exit was
+// clean. The watcher owns Wait(); Stop consumes its result via waitCh —
+// never double-Waiting and never signalling a child that already exited
+// (the source of the "SIGTERM: operation not permitted" shutdown noise
+// when slots had died earlier in the run).
 func (s *Slot) Stop(grace time.Duration) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.cmd == nil || s.cmd.Process == nil {
+		s.mu.Unlock()
 		return nil
 	}
-	defer s.cleanupLocked()
+	s.stopping = true
+	cmd := s.cmd
+	waitCh := s.waitCh
+	pid := cmd.Process.Pid
+	exited := s.exited
+	s.mu.Unlock()
 
-	// Try graceful first
-	if err := signalGroup(s.cmd.Process.Pid, syscall.SIGTERM); err != nil {
-		return fmt.Errorf("supervisor: SIGTERM %s: %w", s.Name, err)
+	var err error
+	switch {
+	case exited:
+		// Already reaped by the watcher; collect the buffered result
+		// (a closed, drained channel yields nil).
+		if waitCh != nil {
+			err = <-waitCh
+		}
+	case waitCh == nil:
+		// No watcher exists (hand-constructed Slot); reap directly so a
+		// nil channel can't block Stop forever.
+		_ = signalGroup(pid, syscall.SIGTERM)
+		err = cmd.Wait()
+	default:
+		// Signal errors (ESRCH on an already-gone group) are not fatal:
+		// the watcher's result below is the ground truth.
+		_ = signalGroup(pid, syscall.SIGTERM)
+		select {
+		case err = <-waitCh:
+		case <-time.After(grace):
+			_ = signalGroup(pid, syscall.SIGKILL)
+			select {
+			case err = <-waitCh:
+			case <-time.After(2 * time.Second):
+				// A hung child must not block supervisor exit.
+				err = fmt.Errorf("supervisor: %s (pid %d) did not exit after SIGKILL",
+					s.Name, pid)
+			}
+		}
 	}
-	done := make(chan error, 1)
-	go func() { done <- s.cmd.Wait() }()
-	select {
-	case err := <-done:
-		return err
-	case <-time.After(grace):
-		_ = signalGroup(s.cmd.Process.Pid, syscall.SIGKILL)
-		return <-done
-	}
+
+	s.mu.Lock()
+	s.cleanupLocked()
+	s.mu.Unlock()
+	return err
 }
 
 // Running returns true if the child is still up.
 func (s *Slot) Running() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.cmd != nil && s.cmd.Process != nil && s.cmd.ProcessState == nil
+	return s.cmd != nil && s.cmd.Process != nil && !s.exited
 }
 
-// PID returns the child's PID, or 0 if not running.
+// PID returns the child's PID, or 0 if not running. A reaped child
+// reports 0 rather than its stale PID so status surfaces (doctor,
+// startup banners) never point operators at a dead process.
 func (s *Slot) PID() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.cmd == nil || s.cmd.Process == nil {
+	if s.cmd == nil || s.cmd.Process == nil || s.exited {
 		return 0
 	}
 	return s.cmd.Process.Pid

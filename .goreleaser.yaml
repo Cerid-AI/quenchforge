@@ -212,6 +212,19 @@ brews:
       environment_variables QUENCHFORGE_LOG_DIR: "#{var}/log/quenchforge"
     extra_install: |
       (var/"log/quenchforge").mkpath
+    # Keep in sync with Formula/quenchforge.rb (the scaffold). The live tap
+    # formula is regenerated from THIS block on every release.
+    caveats: |
+      Upgrading while the service is running: brew upgrade replaces the
+      Cellar binary UNDER the live server. macOS codesign validation can
+      then SIGKILL it mid-flight ("Code Signature Invalid"), and until
+      restarted it keeps executing the old version. After every upgrade,
+      restart the service exactly once and wait for "gateway listening"
+      in the log:
+
+        brew services restart quenchforge
+
+      `quenchforge doctor` reports this state under "Running server binary".
 
 # ---------------------------------------------------------------------------
 # Release publication
