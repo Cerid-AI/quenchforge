@@ -8,6 +8,7 @@
 //	GET  /                         — landing JSON {service, version, slots, routes}
 //	GET  /health                   — liveness probe (always 200 if reachable)
 //	GET  /api/tags                 — Ollama: list locally available models
+//	GET  /v1/models                — OpenAI: list locally available models
 //	POST /api/chat                 — Ollama: chat completion       → KindChat
 //	POST /api/generate             — Ollama: text completion       → KindChat
 //	POST /v1/chat/completions      — OpenAI: chat (streams SSE)    → KindChat
@@ -406,6 +407,7 @@ func (g *Gateway) Start(ctx context.Context) error {
 	mux.HandleFunc("/", g.handleRoot)
 	mux.HandleFunc("/health", g.handleHealth)
 	mux.HandleFunc("/api/tags", g.handleTags)
+	mux.HandleFunc("/v1/models", g.handleOpenAIModels)
 	// chat (Ollama + OpenAI surfaces).  llama-server only speaks the
 	// OpenAI wire — /api/chat and /api/generate are translated by the
 	// handlers in ollama_translate.go so Ollama clients work end-to-end.
@@ -521,6 +523,7 @@ func (g *Gateway) handleRoot(w http.ResponseWriter, r *http.Request) {
 		"routes": []string{
 			"GET /health",
 			"GET /api/tags",
+			"GET /v1/models",
 			"POST /api/chat",
 			"POST /api/generate",
 			"POST /v1/chat/completions",
@@ -621,6 +624,28 @@ func (g *Gateway) handleTags(w http.ResponseWriter, _ *http.Request) {
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"models": out})
+}
+
+// handleOpenAIModels returns the local model registry in OpenAI's /v1/models
+// wire format. The id is the same display name used by /api/tags, created is
+// the model file's mtime as a Unix timestamp, and owned_by is "quenchforge".
+func (g *Gateway) handleOpenAIModels(w http.ResponseWriter, _ *http.Request) {
+	models, err := EnumerateModels(g.cfg.ModelsDir)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// OpenAI returns: {"object":"list","data":[{"id","object","created","owned_by"}]}
+	out := make([]map[string]any, 0, len(models))
+	for _, m := range models {
+		out = append(out, map[string]any{
+			"id":       m.Name,
+			"object":   "model",
+			"created":  m.ModifiedAt.Unix(),
+			"owned_by": "quenchforge",
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": out})
 }
 
 // proxyHandler returns an http.HandlerFunc that reverse-proxies to the
