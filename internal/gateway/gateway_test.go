@@ -173,6 +173,86 @@ func TestTagsEmptyWhenModelsDirMissing(t *testing.T) {
 	}
 }
 
+func TestOpenAIModelsListsGGUFsInModelsDir(t *testing.T) {
+	cfg := newTestConfig(t)
+	cfg.ListenAddr = pickListenAddr(t)
+	if err := os.MkdirAll(cfg.ModelsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"qwen2.5-7b.gguf", "llama-3.2-3b-q4.gguf"} {
+		if err := os.WriteFile(filepath.Join(cfg.ModelsDir, name), []byte("not a real model"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	newRunningGateway(t, cfg)
+
+	resp, err := http.Get("http://" + cfg.ListenAddr + "/v1/models")
+	if err != nil {
+		t.Fatalf("GET /v1/models: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	var got struct {
+		Object string `json:"object"`
+		Data   []struct {
+			ID      string `json:"id"`
+			Object  string `json:"object"`
+			Created int64  `json:"created"`
+			OwnedBy string `json:"owned_by"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode /v1/models: %v", err)
+	}
+	if got.Object != "list" {
+		t.Errorf("object = %q, want list", got.Object)
+	}
+	if len(got.Data) != 2 {
+		t.Fatalf("data length = %d, want 2 (got %+v)", len(got.Data), got)
+	}
+	ids := map[string]bool{}
+	for _, m := range got.Data {
+		ids[m.ID] = true
+		if m.Object != "model" {
+			t.Errorf("model %q object = %q, want model", m.ID, m.Object)
+		}
+		if m.Created == 0 {
+			t.Errorf("model %q created = 0", m.ID)
+		}
+		if m.OwnedBy != "quenchforge" {
+			t.Errorf("model %q owned_by = %q, want quenchforge", m.ID, m.OwnedBy)
+		}
+	}
+	if !ids["qwen2.5-7b"] || !ids["llama-3.2-3b-q4"] {
+		t.Errorf("expected ids not present: %v", ids)
+	}
+}
+
+func TestOpenAIModelsEmptyWhenModelsDirMissing(t *testing.T) {
+	cfg := newTestConfig(t)
+	cfg.ListenAddr = pickListenAddr(t)
+	newRunningGateway(t, cfg)
+
+	resp, err := http.Get("http://" + cfg.ListenAddr + "/v1/models")
+	if err != nil {
+		t.Fatalf("GET /v1/models: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), `"object":"list"`) {
+		t.Errorf("body %q lacks object=list", body)
+	}
+	if !strings.Contains(string(body), `"data":[]`) {
+		t.Errorf("body %q lacks data=[]", body)
+	}
+}
+
 func TestChatProxyReturns503WithoutUpstream(t *testing.T) {
 	cfg := newTestConfig(t)
 	cfg.ListenAddr = pickListenAddr(t)
