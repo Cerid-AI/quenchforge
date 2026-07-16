@@ -98,8 +98,14 @@ func classifyProfile(i Info) Profile {
 		return ProfileVegaPro
 	case strings.Contains(gpu, "w6800x"):
 		return ProfileW6800X
+	// RDNA1: consumer mobile (5500M / 5700M), consumer desktop (RX 5500 /
+	// RX 5700), and the Mac Pro 2019 MPX modules (Radeon Pro W5500X /
+	// W5700X). The w5500/w5700 arms name the MPX modules explicitly so the
+	// mapping is intentional and regression-tested rather than relying on
+	// the bare "5700" substring incidentally matching "W5700X".
 	case strings.Contains(gpu, "rx 5500") || strings.Contains(gpu, "rx 5700") ||
-		strings.Contains(gpu, "5500m") || strings.Contains(gpu, "5700"):
+		strings.Contains(gpu, "5500m") || strings.Contains(gpu, "5700") ||
+		strings.Contains(gpu, "w5500") || strings.Contains(gpu, "w5700"):
 		return ProfileRDNA1
 	case strings.Contains(gpu, "rx 6700") || strings.Contains(gpu, "6700m") ||
 		strings.Contains(gpu, "w6600") || strings.Contains(gpu, "w6800"):

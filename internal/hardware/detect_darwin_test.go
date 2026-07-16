@@ -21,6 +21,8 @@ func TestClassifyProfileBuckets(t *testing.T) {
 		{"AMD Radeon Pro W6800X Duo", true, ProfileW6800X},
 		{"AMD Radeon Pro 5500M", true, ProfileRDNA1},
 		{"AMD Radeon RX 5700 XT", true, ProfileRDNA1},
+		{"AMD Radeon Pro W5700X", true, ProfileRDNA1},
+		{"AMD Radeon Pro W5500X", true, ProfileRDNA1},
 		{"AMD Radeon RX 6700M", true, ProfileRDNA2},
 		{"Intel Iris Plus Graphics", true, ProfileIGPU},
 		{"Intel UHD Graphics 630", true, ProfileIGPU},
