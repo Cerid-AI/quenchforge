@@ -27,7 +27,8 @@ const (
 	// ProfileW6800X covers W6800X and W6800X Duo MPX modules.
 	ProfileW6800X Profile = "w6800x"
 
-	// ProfileRDNA1 covers RDNA1 mobile / discrete on Intel Mac (5500M, 5700).
+	// ProfileRDNA1 covers RDNA1 on Intel Mac: consumer mobile / discrete
+	// (5500M, 5700) and the Mac Pro 2019 MPX modules (W5500X, W5700X).
 	ProfileRDNA1 Profile = "rdna1"
 
 	// ProfileRDNA2 covers RDNA2 mobile / discrete on Intel Mac (6700M).
