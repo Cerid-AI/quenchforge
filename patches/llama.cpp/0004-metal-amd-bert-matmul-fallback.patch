@@ -1,4 +1,4 @@
-From bd22c8a2b1d3fa560a9f2916aec7b8470b0ad39c Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Quenchforge <maint@cerid-ai.com>
 Date: Mon, 18 May 2026 14:02:23 -0400
 Subject: [PATCH] metal: matmul fallback kernels for AMD-Mac BERT (v0.8.0
@@ -34,10 +34,10 @@ Signed-off-by: Quenchforge Contributors <maint@cerid-ai.com>
  2 files changed, 304 insertions(+), 1 deletion(-)
 
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
-index 9c84afb..e99b0df 100644
+index 655964a1d..ad6961bff 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
-@@ -910,7 +910,27 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
+@@ -936,7 +936,27 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
      const int16_t r2 = (int16_t) (ne12 / ne02);
      const int16_t r3 = (int16_t) (ne13 / ne03);
  
@@ -67,10 +67,10 @@ index 9c84afb..e99b0df 100644
  
      ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
 diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
-index d9580f4..e050f6e 100644
+index 24377876d..f77bf4903 100644
 --- a/ggml/src/ggml-metal/ggml-metal.metal
 +++ b/ggml/src/ggml-metal/ggml-metal.metal
-@@ -3654,6 +3654,72 @@ constant short FC_mul_mv_ne12  [[function_constant(FC_MUL_MV + 2)]];
+@@ -3825,6 +3825,72 @@ constant short FC_mul_mv_ne12  [[function_constant(FC_MUL_MV + 2)]];
  constant short FC_mul_mv_r2    [[function_constant(FC_MUL_MV + 3)]];
  constant short FC_mul_mv_r3    [[function_constant(FC_MUL_MV + 4)]];
  
@@ -143,7 +143,7 @@ index d9580f4..e050f6e 100644
  template<typename block_q_type, short NR0, typename args_t>
  void mul_vec_q_n_f32_impl(
          args_t args,
-@@ -4399,6 +4465,115 @@ template [[host_name("kernel_mul_mv_bf16_f32")]]  kernel mul_mv_t_t kernel_mul_m
+@@ -4655,6 +4721,115 @@ template [[host_name("kernel_mul_mv_bf16_f32")]]  kernel mul_mv_t_t kernel_mul_m
  template [[host_name("kernel_mul_mv_bf16_bf16")]] kernel mul_mv_t_t kernel_mul_mv_t_t<bfloat, bfloat>;
  #endif
  
@@ -259,7 +259,7 @@ index d9580f4..e050f6e 100644
  template<typename T0, typename T04, typename T1, typename T14, short NR0, typename args_t>
  void kernel_mul_mv_t_t_4_impl(
          args_t args,
-@@ -4523,6 +4698,114 @@ template [[host_name("kernel_mul_mv_bf16_f32_4")]]  kernel mul_mv_t_t_4 kernel_m
+@@ -4779,6 +4954,114 @@ template [[host_name("kernel_mul_mv_bf16_f32_4")]]  kernel mul_mv_t_t_4 kernel_m
  template [[host_name("kernel_mul_mv_bf16_bf16_4")]] kernel mul_mv_t_t_4 kernel_mul_mv_t_t_4<bfloat, bfloat4, bfloat, bfloat4>;
  #endif
  
@@ -375,5 +375,5 @@ index d9580f4..e050f6e 100644
  void kernel_mul_mv_t_t_short_impl(
          args_t args,
 -- 
-2.50.1 (Apple Git-155)
+2.55.0
 

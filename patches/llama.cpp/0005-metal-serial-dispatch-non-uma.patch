@@ -1,4 +1,4 @@
-From b901f42cfcf7d5fe44a1e76ec71e77348dec043d Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Quenchforge Contributors <maintainers@cerid-ai.com>
 Date: Wed, 8 Jul 2026 21:17:58 -0400
 Subject: [PATCH] metal: default to serial dispatch on non-UMA devices
@@ -19,7 +19,7 @@ in for testing.
  1 file changed, 15 insertions(+)
 
 diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
-index 32d97cd..6169a7e 100644
+index 32d97cd5d..6169a7e67 100644
 --- a/ggml/src/ggml-metal/ggml-metal-context.m
 +++ b/ggml/src/ggml-metal/ggml-metal-context.m
 @@ -136,6 +136,21 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
@@ -45,5 +45,5 @@ index 32d97cd..6169a7e 100644
          const char * val = getenv("GGML_METAL_GRAPH_DEBUG");
          res->debug_graph = val ? atoi(val) : 0;
 -- 
-2.50.1 (Apple Git-155)
+2.55.0
 
