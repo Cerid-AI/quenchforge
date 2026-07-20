@@ -1,4 +1,4 @@
-From aca4a37f78fadc6f41a992e256630fc2f21c9f5b Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Quenchforge Contributors <maintainers@cerid-ai.com>
 Date: Sun, 17 May 2026 13:00:00 -0400
 Subject: [PATCH] metal: norm + softmax fallback kernels for non-Apple GPUs
@@ -51,10 +51,10 @@ Signed-off-by: Quenchforge Contributors <maintainers@cerid-ai.com>
  2 files changed, 319 insertions(+), 4 deletions(-)
 
 diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
-index f0147af..9c84afb 100644
+index 270c1411a..655964a1d 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.cpp
 +++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
-@@ -446,7 +446,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max(ggml_me
+@@ -464,7 +464,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max(ggml_me
  
      const ggml_type tsrc1 = op->src[1] ? op->src[1]->type : GGML_TYPE_F32;
  
@@ -70,7 +70,7 @@ index f0147af..9c84afb 100644
      snprintf(name, 256, "%s", base);
  
      ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
-@@ -1655,12 +1662,23 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm(ggml_metal_
+@@ -1686,12 +1693,23 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm(ggml_metal_
          suffix = "_4";
      }
  
@@ -98,10 +98,10 @@ index f0147af..9c84afb 100644
              } break;
          case GGML_OP_RMS_NORM:
 diff --git a/ggml/src/ggml-metal/ggml-metal.metal b/ggml/src/ggml-metal/ggml-metal.metal
-index 3882b95..d9580f4 100644
+index 969fddfa5..24377876d 100644
 --- a/ggml/src/ggml-metal/ggml-metal.metal
 +++ b/ggml/src/ggml-metal/ggml-metal.metal
-@@ -2073,6 +2073,187 @@ template [[host_name("kernel_soft_max_f32")]]   kernel kernel_soft_max_t   kerne
+@@ -2168,6 +2168,187 @@ template [[host_name("kernel_soft_max_f32")]]   kernel kernel_soft_max_t   kerne
  template [[host_name("kernel_soft_max_f16_4")]] kernel kernel_soft_max_4_t kernel_soft_max_4<half4>;
  template [[host_name("kernel_soft_max_f32_4")]] kernel kernel_soft_max_4_t kernel_soft_max_4<float4>;
  
@@ -289,7 +289,7 @@ index 3882b95..d9580f4 100644
  // ref: ggml.c:ggml_compute_forward_ssm_conv_f32
  kernel void kernel_ssm_conv_f32_f32(
          constant ggml_metal_kargs_ssm_conv & args,
-@@ -2983,6 +3164,122 @@ template [[host_name("kernel_norm_f32_4")]]         kernel kernel_norm_fuse_t ke
+@@ -3105,6 +3286,122 @@ template [[host_name("kernel_norm_f32_4")]]         kernel kernel_norm_fuse_t ke
  template [[host_name("kernel_norm_mul_f32_4")]]     kernel kernel_norm_fuse_t kernel_norm_fuse_impl<float4, 2>;
  template [[host_name("kernel_norm_mul_add_f32_4")]] kernel kernel_norm_fuse_t kernel_norm_fuse_impl<float4, 3>;
  
@@ -413,5 +413,5 @@ index 3882b95..d9580f4 100644
  // F == 2 : rms_norm + mul
  // F == 3 : rms_norm + mul + add
 -- 
-2.50.1 (Apple Git-155)
+2.55.0
 
