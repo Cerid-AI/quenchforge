@@ -3,28 +3,42 @@
 
 // Package gateway is Quenchforge's HTTP front door.
 //
-// Routes:
+// Routes (the authoritative table is Gateway.routes, which drives both mux
+// registration and the advertisement served at GET /):
 //
 //	GET  /                         — landing JSON {service, version, slots, routes}
-//	GET  /health                   — liveness probe (always 200 if reachable)
-//	GET  /api/tags                 — Ollama: list locally available models
+//	GET  /health                   — per-slot readiness + rolling latency
+//	GET  /api/tags                 — Ollama: models in the registry
 //	POST /api/chat                 — Ollama: chat completion       → KindChat
 //	POST /api/generate             — Ollama: text completion       → KindChat
 //	POST /v1/chat/completions      — OpenAI: chat (streams SSE)    → KindChat
-//	POST /api/embeddings           — Ollama: embeddings            → KindEmbed
-//	POST /v1/embeddings            — OpenAI: embeddings            → KindEmbed
-//	POST /api/pull                 — Ollama: model pull (stub 501 in MVP)
+//	POST /api/embeddings           — Ollama: embeddings            → KindEmbed / KindCodeEmbed
+//	POST /api/embed                — Ollama: embeddings (new shape)→ KindEmbed / KindCodeEmbed
+//	POST /v1/embeddings            — OpenAI: embeddings            → KindEmbed / KindCodeEmbed
+//	POST /v1/rerank                — OpenAI-style rerank           → KindRerank
+//	POST /rerank                   — llama-server native rerank    → KindRerank
+//	POST /v1/audio/transcriptions  — OpenAI: transcription         → KindWhisper
+//	POST /v1/audio/translations    — OpenAI: translation           → KindWhisper
+//	POST /inference                — whisper-server native         → KindWhisper
+//	POST /v1/images/generations    — OpenAI: image generation      → KindImageGen
+//	POST /sdapi/v1/txt2img         — sd.cpp native txt2img         → KindImageGen
+//	POST /sdapi/v1/img2img         — sd.cpp native img2img         → KindImageGen
+//	POST /v1/audio/speech          — OpenAI: TTS                   → KindTTS
+//	POST /tts                      — bark.cpp native TTS           → KindTTS
+//	POST /api/pull                 — Ollama: model pull (stub 501)
 //
-// Upstream resolution is keyed by SlotKind. The supervisor calls
+// The /v1/* routes are inference-endpoint compatibility only: quenchforge
+// serves what its slots have loaded, so there is deliberately no OpenAI
+// model-management surface (/v1/models). Use GET /api/tags for the
+// registry and GET /health for what each slot can actually serve.
+//
+// Upstream resolution is keyed by SlotKind. `quenchforge serve` calls
 // `gateway.SetUpstream(KindChat, "http://127.0.0.1:11500")` once the chat
-// slot is ready; the same call for KindEmbed when the embedding slot lands.
-// /api/chat against an unconfigured chat slot returns 503; same for embed.
-// /api/tags reads the model registry directly so it works without any slot.
-//
-// v0.2 swaps the routing layer for the vendored Olla gateway in
-// internal/gateway/olla/ — the public surface here is designed to be the
-// shim Olla feeds into. Pinned SHA for the future vendoring:
-// thushan/olla @ b11b81868504d07603e3815c6e38ddda068f862c.
+// slot is ready, and the same call per kind as the other slots land. A kind
+// with no upstream 503s and reports its readiness at GET /health; an
+// upstream that proves dead is deregistered and retried after a cool-off
+// (see markUpstreamUnreachable). /api/tags reads the model registry
+// directly so it works without any slot.
 package gateway
 
 import (
@@ -86,10 +100,32 @@ const (
 // String implements fmt.Stringer.
 func (k SlotKind) String() string { return string(k) }
 
+// knownSlotKinds is every kind the gateway mounts routes for, in report
+// order. handleRoot and handleHealth both enumerate it so a kind with no
+// upstream shows up as unavailable instead of being silently absent.
+var knownSlotKinds = []SlotKind{
+	KindChat, KindEmbed, KindCodeEmbed, KindBackground, KindRerank, KindWhisper, KindImageGen, KindTTS,
+}
+
 // upstreamEntry holds the URL + ready-to-use proxy for one slot kind.
 type upstreamEntry struct {
 	url   *url.URL
 	proxy *httputil.ReverseProxy
+}
+
+// downUpstream is a deregistered upstream awaiting a retry.
+type downUpstream struct {
+	raw    string
+	since  time.Time
+	reason string
+}
+
+// probedModel is one cached /v1/models answer. An empty model means the
+// probe failed; it is retried after slotModelProbeRetry so a slot that was
+// still loading when we first asked doesn't stay unknown forever.
+type probedModel struct {
+	model string
+	at    time.Time
 }
 
 // Gateway is the HTTP server. Construct via New.
@@ -256,6 +292,15 @@ func (g *Gateway) maxCooldown() time.Duration {
 	return time.Duration(ms) * time.Millisecond
 }
 
+// syncUpstreamTimeout bounds one embed or rerank call. Both are
+// non-streaming and sub-minute, so an unbounded wait can only ever be a
+// wedged slot (the AMDRadeonX5000 kernel-mutex stall in patches/README.md
+// section 3) hanging the caller forever with no error, no latency sample
+// and no /health movement. Chat (streams for as long as the user wants),
+// transcription and image generation are deliberately NOT bounded by it.
+// Package var so tests can shorten it.
+var syncUpstreamTimeout = 120 * time.Second
+
 // SetUpstream points the proxy for the given slot kind at a URL. Passing an
 // empty raw URL clears the entry (chat/embed/rerank routes for that kind
 // will go back to returning 503). The compatibility-friendly variant for
@@ -396,6 +441,87 @@ func countEmbedInputs(input interface{}, prompt string) int {
 	return 1
 }
 
+// route is one mounted HTTP route. The table returned by Gateway.routes is
+// the single source of truth for BOTH mux registration and the capability
+// advertisement served at GET /, so what the gateway advertises cannot
+// drift from what it actually serves.
+type route struct {
+	method  string
+	pattern string
+	note    string // advertisement annotation, e.g. "(stub)"
+	handler http.HandlerFunc
+}
+
+// routes is the mounted HTTP surface.
+//
+// Chat: llama-server only speaks the OpenAI wire, so /api/chat and
+// /api/generate are translated by the handlers in ollama_translate.go;
+// /v1/chat/completions is OpenAI-native and takes the reverse-proxy path.
+//
+// Embeddings self-admit: those handlers route per request (resolving the
+// embed kind and, under "auto" placement, the GPU/CPU instance) and apply
+// GPU admission only to the GPU branch, so a CPU-routed embed runs
+// ungoverned. Wrapping them in gated(KindEmbed, …) would double-admit and
+// misclassify code-embed traffic, so their registration is bare. They are
+// bounded by syncUpstreamTimeout instead — a wedged embed or rerank slot
+// must fail the caller rather than hang it.
+//
+// Rerank, transcription, image generation and TTS are pass-through proxies;
+// where the upstream's native path differs from the OpenAI path (whisper's
+// /inference, llama-server's /rerank, bark's /tts) the handler rewrites it
+// on the way through.
+func (g *Gateway) routes() []route {
+	return []route{
+		{"GET", "/", "", g.handleRoot},
+		{"GET", "/health", "", g.handleHealth},
+		{"GET", "/api/tags", "", g.handleTags},
+
+		// Chat self-admits: the handlers resolve KindChat or KindBackground
+		// from the request's model and apply GPU admission for that kind, so
+		// wrapping them in gated(KindChat, …) would misprioritise background
+		// traffic.
+		{"POST", "/api/chat", "", g.handleOllamaChat(false)},
+		{"POST", "/api/generate", "", g.handleOllamaChat(true)},
+		{"POST", "/v1/chat/completions", "", g.handleOpenAIChat()},
+
+		// Embeddings self-admit too: GPU admission applies only to the GPU
+		// branch, so a CPU-routed embed runs ungoverned.
+
+		{"POST", "/api/embeddings", "", withRequestTimeout(g.handleOllamaEmbeddings())},
+		{"POST", "/api/embed", "", withRequestTimeout(g.handleOllamaEmbeddings())},
+		{"POST", "/v1/embeddings", "", withRequestTimeout(g.handleOpenAIEmbeddings())},
+
+		{"POST", "/v1/rerank", "", withRequestTimeout(g.gated(KindRerank, g.proxyHandler(KindRerank, "/rerank")))},
+		{"POST", "/rerank", "", withRequestTimeout(g.gated(KindRerank, g.proxyHandler(KindRerank, "")))},
+
+		{"POST", "/v1/audio/transcriptions", "", g.gated(KindWhisper, g.proxyHandler(KindWhisper, "/inference"))},
+		{"POST", "/v1/audio/translations", "", g.gated(KindWhisper, g.proxyHandler(KindWhisper, "/inference"))},
+		{"POST", "/inference", "", g.gated(KindWhisper, g.proxyHandler(KindWhisper, ""))},
+
+		{"POST", "/v1/images/generations", "", g.gated(KindImageGen, g.proxyHandler(KindImageGen, ""))},
+		{"POST", "/sdapi/v1/txt2img", "", g.gated(KindImageGen, g.proxyHandler(KindImageGen, ""))},
+		{"POST", "/sdapi/v1/img2img", "", g.gated(KindImageGen, g.proxyHandler(KindImageGen, ""))},
+
+		{"POST", "/v1/audio/speech", "", g.gated(KindTTS, g.proxyHandler(KindTTS, "/tts"))},
+		{"POST", "/tts", "", g.gated(KindTTS, g.proxyHandler(KindTTS, ""))},
+
+		{"POST", "/api/pull", "(stub — see `quenchforge migrate-from-ollama`)", g.handlePull},
+	}
+}
+
+// withRequestTimeout bounds a non-streaming route with syncUpstreamTimeout.
+// Applied to the embed and rerank routes only: they are the short,
+// synchronous calls where an unbounded wait can only mean a wedged slot.
+// Chat streams, transcription and image generation legitimately run long
+// and stay unbounded.
+func withRequestTimeout(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), syncUpstreamTimeout)
+		defer cancel()
+		h(w, r.WithContext(ctx))
+	}
+}
+
 // Start binds the listener and begins serving. The call returns once the
 // listener is ready; Serve runs in a goroutine. Use Stop to shut down.
 //
@@ -413,61 +539,9 @@ func (g *Gateway) Start(ctx context.Context) error {
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", g.handleRoot)
-	mux.HandleFunc("/health", g.handleHealth)
-	mux.HandleFunc("/api/tags", g.handleTags)
-	// chat (Ollama + OpenAI surfaces).  llama-server only speaks the
-	// OpenAI wire — /api/chat and /api/generate are translated by the
-	// handlers in ollama_translate.go so Ollama clients work end-to-end.
-	// /v1/chat/completions is OpenAI-native and goes through a peek-and-proxy
-	// handler.
-	// Chat self-admits: the handlers resolve the chat kind (KindChat vs
-	// KindBackground) from the request's `model` field and apply GPU
-	// admission via gated() for that resolved kind — so a background-slot
-	// request is gated/prioritised independently of the primary chat slot.
-	// Wrapping the route registration in gated(KindChat, …) would apply the
-	// wrong kind's placement/priority to background traffic, so the route
-	// registration is bare.
-	mux.HandleFunc("/api/chat", g.handleOllamaChat(false))
-	mux.HandleFunc("/api/generate", g.handleOllamaChat(true))
-	mux.HandleFunc("/v1/chat/completions", g.handleOpenAIChat())
-	// embeddings (Ollama + OpenAI surfaces).  Same translation story:
-	// /api/embeddings and /api/embed are Ollama wire, translated to
-	// /v1/embeddings on the upstream embed slot; /v1/embeddings is
-	// pass-through.
-	// Embeddings self-admit: the handlers route per request (resolving the
-	// embed kind and, under "auto" placement, the GPU/CPU instance) and apply
-	// GPU admission only to the GPU branch — so a CPU-routed embed runs
-	// ungoverned. Wrapping them in gated(KindEmbed, …) would double-admit and
-	// misclassify code-embed traffic, so the route registration is bare.
-	mux.HandleFunc("/api/embeddings", g.handleOllamaEmbeddings())
-	mux.HandleFunc("/api/embed", g.handleOllamaEmbeddings())
-	mux.HandleFunc("/v1/embeddings", g.handleOpenAIEmbeddings())
-	// rerank (OpenAI-style /v1/rerank; llama-server speaks its own /rerank
-	// when launched with --reranking; we route both to the same slot).
-	mux.HandleFunc("/v1/rerank", g.gated(KindRerank, g.proxyHandler(KindRerank, "/rerank")))
-	mux.HandleFunc("/rerank", g.gated(KindRerank, g.proxyHandler(KindRerank, "")))
-	// whisper audio transcription. OpenAI's /v1/audio/transcriptions and
-	// whisper.cpp's /inference take the same multipart shape but on
-	// different paths — rewrite the OpenAI path to /inference on the way
-	// through. /v1/audio/translations same surface (English-only output).
-	mux.HandleFunc("/v1/audio/transcriptions", g.gated(KindWhisper, g.proxyHandler(KindWhisper, "/inference")))
-	mux.HandleFunc("/v1/audio/translations", g.gated(KindWhisper, g.proxyHandler(KindWhisper, "/inference")))
-	mux.HandleFunc("/inference", g.gated(KindWhisper, g.proxyHandler(KindWhisper, ""))) // whisper-native path
-	// image generation — sd-server speaks OpenAI's /v1/images/generations
-	// natively, so no path rewrite needed.
-	mux.HandleFunc("/v1/images/generations", g.gated(KindImageGen, g.proxyHandler(KindImageGen, "")))
-	// stable-diffusion.cpp also exposes its own SD-API surface; expose
-	// /sdapi/ unchanged for clients that prefer the AUTOMATIC1111-style API.
-	mux.HandleFunc("/sdapi/v1/txt2img", g.gated(KindImageGen, g.proxyHandler(KindImageGen, "")))
-	mux.HandleFunc("/sdapi/v1/img2img", g.gated(KindImageGen, g.proxyHandler(KindImageGen, "")))
-	// text-to-speech (bark.cpp server). Its native route is /tts (returns
-	// audio/wav); OpenAI's /v1/audio/speech POSTs JSON { input, voice, ... }.
-	// We pass-through; client format-translation is a v0.4 concern.
-	mux.HandleFunc("/v1/audio/speech", g.gated(KindTTS, g.proxyHandler(KindTTS, "/tts")))
-	mux.HandleFunc("/tts", g.gated(KindTTS, g.proxyHandler(KindTTS, "")))
-	// pull (stub — points users at migrate-from-ollama)
-	mux.HandleFunc("/api/pull", g.handlePull)
+	for _, rt := range g.routes() {
+		mux.HandleFunc(rt.pattern, rt.handler)
+	}
 
 	g.mu.Lock()
 	g.server = &http.Server{
@@ -544,48 +618,67 @@ func (g *Gateway) handleRoot(w http.ResponseWriter, r *http.Request) {
 	}
 	// Always include known kinds in the report so consumers can see which
 	// ones aren't configured.
-	for _, k := range []SlotKind{KindChat, KindEmbed, KindCodeEmbed, KindBackground, KindRerank, KindWhisper, KindImageGen, KindTTS} {
+	for _, k := range knownSlotKinds {
 		if _, ok := slots[string(k)]; !ok {
 			slots[string(k)] = map[string]any{"configured": false}
 		}
 	}
+	version := g.version
+	g.mu.RUnlock()
 	resp := map[string]any{
 		"service": "quenchforge",
-		"version": g.version,
+		"version": version,
 		"slots":   slots,
-		"routes": []string{
-			"GET /health",
-			"GET /api/tags",
-			"POST /api/chat",
-			"POST /api/generate",
-			"POST /v1/chat/completions",
-			"POST /api/embeddings",
-			"POST /v1/embeddings",
-			"POST /v1/rerank",
-			"POST /v1/audio/transcriptions",
-			"POST /v1/audio/translations",
-			"POST /v1/images/generations (501 reserved)",
-			"POST /v1/audio/speech (501 reserved)",
-			"POST /api/pull (stub)",
-		},
+		"routes":  g.advertisedRoutes(),
 	}
-	g.mu.RUnlock()
 	writeJSON(w, http.StatusOK, resp)
 }
 
+// advertisedRoutes renders the mounted route table for GET /. Derived from
+// the same table Start registers, so an operator (or install.sh, which
+// tells them to curl this) reads the surface that actually exists.
+func (g *Gateway) advertisedRoutes() []string {
+	rts := g.routes()
+	out := make([]string, 0, len(rts))
+	for _, rt := range rts {
+		line := rt.method + " " + rt.pattern
+		if rt.note != "" {
+			line += " " + rt.note
+		}
+		out = append(out, line)
+	}
+	return out
+}
+
 // handleHealth returns the gateway's overall status plus a per-slot
-// breakdown of rolling-window latency and error rate. Dual-placed "auto"
-// kinds report their CPU twin under a separate "<kind>-cpu" key so the two
+// breakdown: rolling-window latency and error rate for slots that are
+// serving, and readiness for those that are not. Dual-placed "auto" kinds
+// report their CPU twin under a separate "<kind>-cpu" key so the two
 // instances' latency distributions stay legible. Always 200 while the
 // gateway is reachable — consumers parse the JSON to decide whether to
-// throttle. The opt-in QUENCHFORGE_AUTO_BACKOFF flag turns a critical
-// ERROR RATE (only — never the latency ratio) into an actual 503 on the
-// upstream proxy paths; /health itself never blocks.
+// throttle or to stop retrying a lane. The opt-in QUENCHFORGE_AUTO_BACKOFF
+// flag turns a critical ERROR RATE (only — never the latency ratio) into an
+// actual 503 on the upstream proxy paths; /health itself never blocks.
 //
-// Schema:
+// Readiness is the half this endpoint used to be blind to. It was built
+// entirely from the latency tracker, which only knows about slots that have
+// served traffic — so a route with no upstream (never started, or the slot
+// died) produced no samples, no slots entry, and an overall "ok" while
+// every request to it returned 503. Per-slot status now also carries:
+//
+//	unconfigured — the operator configured a model for this kind but no
+//	               upstream is registered. Degrades the overall status.
+//	unreachable  — an upstream was registered and proved dead; it has been
+//	               deregistered and will be retried. Degrades the overall.
+//	disabled     — no model configured for this kind. The route is mounted
+//	               and 503s, which is the documented behaviour, so this does
+//	               NOT degrade the overall status — but a consumer can still
+//	               see the lane is unavailable and stop retrying it.
+//
+// Schema (the latency keys are unchanged; readiness keys are additive):
 //
 //	{
-//	  "status": "ok",
+//	  "status": "degraded",
 //	  "slots": {
 //	    "embed": {
 //	      "kind": "embed",

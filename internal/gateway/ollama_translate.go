@@ -29,7 +29,9 @@ package gateway
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -444,6 +446,15 @@ func (g *Gateway) handleOllamaEmbeddings() http.HandlerFunc {
 			resp, err := translateHTTPClient.Do(upReq)
 			if err != nil {
 				g.latency.Record(track, time.Since(started), true)
+				// The embed routes carry a syncUpstreamTimeout deadline, so a
+				// slot that wedged rather than crashed fails the caller
+				// instead of hanging it forever.
+				if errors.Is(err, context.DeadlineExceeded) {
+					writeJSONError(w, http.StatusGatewayTimeout,
+						fmt.Sprintf("embed upstream %s did not respond within %s — the slot is wedged. "+
+							"Check `quenchforge doctor` for slot status.", entry.url.Host, syncUpstreamTimeout))
+					return
+				}
 				writeJSONError(w, http.StatusBadGateway,
 					fmt.Sprintf("embed upstream %s unreachable: %v",
 						entry.url.Host, err))
