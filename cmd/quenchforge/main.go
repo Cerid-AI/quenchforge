@@ -680,13 +680,24 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 	// so no upstream is registered for a lane that will never answer.
 	unavailable := preflightSlotModels(cfg, chatModel, !*noSlot, stderr)
 
+	// Device-placement policy. Built from the hardware profile plus operator
+	// overrides, and resolved here because the VRAM pre-flight below needs to
+	// know which kinds actually land on the GPU. The gateway gets the same
+	// policy via SetPlacement, so placement, tuning and the budget never
+	// disagree.
+	pol := tuning.PolicyFor(hwInfo.Profile, cfg)
+
 	// VRAM pre-flight (v0.4.0). Refuse to spawn slots whose combined
 	// model weights would over-subscribe VRAM. Operator-friendly error
 	// is better than three Metal-load failures in a row.
 	if !*noSlot && !vramCheckDisabled() {
-		if err := checkVRAMBudget(cfg, hwInfo, stdout); err != nil {
+		if err := checkVRAMBudget(cfg, hwInfo, pol, stdout); err != nil {
 			fmt.Fprintf(stderr, "quenchforge: %v\n", err)
-			return fmt.Errorf("VRAM pre-flight failed")
+			// Clean exit, like the pre-bind port check: no restart can make an
+			// over-subscribed configuration fit, and a non-zero exit against
+			// KeepAlive{SuccessfulExit:false} + ThrottleInterval 10 would
+			// respawn-loop this message every ten seconds forever.
+			return nil
 		}
 	}
 
@@ -706,9 +717,6 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 	g.SetVersion(Version)
 	// Install the device-placement policy so the gateway can route "auto"
 	// embedding kinds per request and skip GPU admission for CPU-placed kinds.
-	// Built from the same hardware profile + operator overrides the tuning
-	// module uses, so placement and slot tuning never disagree.
-	pol := tuning.PolicyFor(hwInfo.Profile, cfg)
 	g.SetPlacement(pol, cfg.AutoBatchThreshold)
 	if governorEnabled(cfg, hwInfo.Profile) {
 		g.SetScheduler(startGovernor(ctx, pressure.NewSensor(), cfg, stdout))
