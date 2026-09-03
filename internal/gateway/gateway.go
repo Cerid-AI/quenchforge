@@ -59,6 +59,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/cerid-ai/quenchforge/internal/config"
@@ -125,6 +126,15 @@ type Gateway struct {
 	mu        sync.RWMutex
 	server    *http.Server
 	upstreams map[SlotKind]upstreamEntry
+	// downUpstreams parks the URL of an upstream that proved dead
+	// (connection refused) after markUpstreamUnreachable deregistered it, so
+	// the next request past the cool-off can re-register the same address
+	// when the slot respawns on it.
+	downUpstreams map[SlotKind]downUpstream
+	// slotModels caches the model name each slot reports as loaded, probed
+	// from the upstream's /v1/models. Cleared whenever the kind's upstream is
+	// re-registered (a new registration may be a different model).
+	slotModels map[SlotKind]probedModel
 	// cpuUpstreams holds the CPU instance of a dual-placed ("auto") kind. Only
 	// embedding kinds populate it today, via SetCPUUpstream; routeEmbed sends a
 	// single/small request here when the placement policy routes it to the CPU.
@@ -155,11 +165,13 @@ type Gateway struct {
 // call Start to bind and serve.
 func New(cfg config.Config) *Gateway {
 	return &Gateway{
-		cfg:          cfg,
-		version:      "0.0.0-dev",
-		upstreams:    make(map[SlotKind]upstreamEntry),
-		cpuUpstreams: make(map[SlotKind]upstreamEntry),
-		latency:      newLatencyTracker(),
+		cfg:           cfg,
+		version:       "0.0.0-dev",
+		upstreams:     make(map[SlotKind]upstreamEntry),
+		cpuUpstreams:  make(map[SlotKind]upstreamEntry),
+		downUpstreams: make(map[SlotKind]downUpstream),
+		slotModels:    make(map[SlotKind]probedModel),
+		latency:       newLatencyTracker(),
 	}
 }
 
@@ -293,12 +305,15 @@ var syncUpstreamTimeout = 120 * time.Second
 
 // SetUpstream points the proxy for the given slot kind at a URL. Passing an
 // empty raw URL clears the entry (chat/embed/rerank routes for that kind
-// will go back to returning 503). The compatibility-friendly variant for
-// the original single-slot call style is in compat.go.
+// will go back to returning 503) — that is the deregistration path
+// markUpstreamUnreachable uses when a slot proves dead. Registering a URL
+// also clears any parked "dead" record and the cached slot model, because a
+// fresh registration may be a different process serving a different model.
 func (g *Gateway) SetUpstream(kind SlotKind, raw string) error {
 	if raw == "" {
 		g.mu.Lock()
 		delete(g.upstreams, kind)
+		delete(g.slotModels, kind)
 		g.mu.Unlock()
 		return nil
 	}
@@ -308,13 +323,118 @@ func (g *Gateway) SetUpstream(kind SlotKind, raw string) error {
 	}
 	proxy := httputil.NewSingleHostReverseProxy(u)
 	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		g.markUpstreamUnreachable(kind, err)
+		if errors.Is(err, context.DeadlineExceeded) {
+			writeJSONError(w, http.StatusGatewayTimeout,
+				fmt.Sprintf("%s upstream %s timed out after %s", kind, u.Host, syncUpstreamTimeout))
+			return
+		}
 		writeJSONError(w, http.StatusBadGateway,
 			fmt.Sprintf("%s upstream %s unreachable: %v", kind, u.Host, err))
 	}
 	g.mu.Lock()
 	g.upstreams[kind] = upstreamEntry{url: u, proxy: proxy}
+	delete(g.downUpstreams, kind)
+	delete(g.slotModels, kind)
 	g.mu.Unlock()
 	return nil
+}
+
+// upstreamRetryCooloff is how long a deregistered (proved-dead) upstream
+// stays parked before the next request for that kind re-registers it and
+// tries again. Long enough that a crash loop doesn't turn into a dial
+// storm, short enough that a respawned slot is picked up without an
+// operator restart. Package var so tests can shorten it.
+var upstreamRetryCooloff = 15 * time.Second
+
+// markUpstreamUnreachable deregisters an upstream that proved dead so the
+// gateway stops proxying at a corpse. Only a refused connection counts:
+// that means nothing is listening on the slot's port (the shape a crashed
+// or never-restarted slot leaves behind). Timeouts, resets mid-response and
+// client cancellations are NOT treated as death — a wedged or slow slot is
+// still a process we can reach, and a cancelled request says nothing about
+// the upstream.
+//
+// The URL is parked so the next request past upstreamRetryCooloff
+// re-registers it: a slot that respawns on the same port is picked up
+// without an operator restart. Until then the kind's routes return the
+// documented 503 + doctor hint instead of an ErrorHandler 502, and /health
+// reports the kind "unreachable".
+func (g *Gateway) markUpstreamUnreachable(kind SlotKind, cause error) {
+	if !isConnectionRefused(cause) {
+		return
+	}
+	g.mu.Lock()
+	entry, ok := g.upstreams[kind]
+	if !ok || entry.url == nil {
+		g.mu.Unlock()
+		return
+	}
+	raw := entry.url.String()
+	g.mu.Unlock()
+
+	// Clear first, then park — SetUpstream("") drops the entry, and the
+	// parked record is what makes the retry (and /health) possible.
+	_ = g.SetUpstream(kind, "")
+	g.mu.Lock()
+	g.downUpstreams[kind] = downUpstream{raw: raw, since: time.Now(), reason: cause.Error()}
+	g.mu.Unlock()
+	log.Printf("quenchforge: %s upstream %s is not accepting connections (%v) — deregistered; "+
+		"%s requests return 503 until the slot is back (retrying in %s)",
+		kind, raw, cause, kind, upstreamRetryCooloff)
+}
+
+// lookupUpstream resolves the registered upstream for a kind, first giving
+// a parked (proved-dead) upstream its retry once the cool-off has elapsed.
+// ok is false when the kind has no usable upstream; callers render the
+// reason with unavailableReason.
+func (g *Gateway) lookupUpstream(kind SlotKind) (upstreamEntry, bool) {
+	g.retryUpstreamIfDue(kind)
+	g.mu.RLock()
+	entry, ok := g.upstreams[kind]
+	g.mu.RUnlock()
+	return entry, ok && entry.proxy != nil
+}
+
+// retryUpstreamIfDue re-registers a parked upstream once upstreamRetryCooloff
+// has passed since it was deregistered. If the slot is still dead the next
+// request marks it unreachable again, so a crash loop costs one dial per
+// cool-off rather than one per request.
+func (g *Gateway) retryUpstreamIfDue(kind SlotKind) {
+	g.mu.Lock()
+	down, parked := g.downUpstreams[kind]
+	if !parked || time.Since(down.since) < upstreamRetryCooloff {
+		g.mu.Unlock()
+		return
+	}
+	delete(g.downUpstreams, kind)
+	g.mu.Unlock()
+	if err := g.SetUpstream(kind, down.raw); err != nil {
+		log.Printf("quenchforge: re-registering %s upstream %s failed: %v", kind, down.raw, err)
+		return
+	}
+	log.Printf("quenchforge: retrying %s upstream %s after cool-off", kind, down.raw)
+}
+
+// unavailableReason is the 503 body for a kind with no usable upstream. It
+// distinguishes "never configured" from "was configured and died", because
+// the operator action differs.
+func (g *Gateway) unavailableReason(kind SlotKind) string {
+	g.mu.RLock()
+	down, parked := g.downUpstreams[kind]
+	g.mu.RUnlock()
+	if parked {
+		return fmt.Sprintf("%s upstream %s is unreachable (%s) — deregistered %s ago, retrying after %s. "+
+			"Check `quenchforge doctor` for slot status.",
+			kind, down.raw, down.reason, time.Since(down.since).Truncate(time.Second), upstreamRetryCooloff)
+	}
+	return fmt.Sprintf("no %s slot configured. Check `quenchforge doctor` for status.", kind)
+}
+
+// isConnectionRefused reports whether err is a refused TCP connection —
+// nothing is listening on the upstream port.
+func isConnectionRefused(err error) bool {
+	return err != nil && errors.Is(err, syscall.ECONNREFUSED)
 }
 
 // SetCPUUpstream points the CPU instance of a dual-placed ("auto") kind at a
@@ -652,7 +772,16 @@ func (g *Gateway) advertisedRoutes() []string {
 //	      "p99_ms": 41.2,
 //	      "error_rate": 0.0,
 //	      "status": "ok",
-//	      "window_secs": 60
+//	      "window_secs": 60,
+//	      "configured": true,
+//	      "upstream": "http://127.0.0.1:11501"
+//	    },
+//	    "rerank": {
+//	      "kind": "rerank",
+//	      "samples": 0,
+//	      "status": "unconfigured",
+//	      "configured": false,
+//	      "detail": "model \"bge-reranker-v2-m3\" is configured but no upstream is registered …"
 //	    },
 //	    ...
 //	  },
@@ -660,21 +789,20 @@ func (g *Gateway) advertisedRoutes() []string {
 //	}
 func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	snaps := g.latency.Snapshot()
-	slots := make(map[string]LatencySnapshot, len(snaps))
-	for k, v := range snaps {
-		slots[string(k)] = v
-	}
-	// Overall status is the worst per-slot status (so /health caller
-	// gets a one-glance answer to "is anything wrong").
+	slots := make(map[string]SlotHealth, len(snaps)+len(knownSlotKinds))
 	overall := StatusOK
-	for _, v := range snaps {
-		if v.Status == StatusCritical {
-			overall = StatusCritical
-			break
-		}
-		if v.Status == StatusDegraded && overall == StatusOK {
-			overall = StatusDegraded
-		}
+	for _, kind := range knownSlotKinds {
+		h := g.slotHealth(kind, snaps[kind])
+		slots[string(kind)] = h
+		overall = worstStatus(overall, h.Status)
+		delete(snaps, kind)
+	}
+	// Anything left is a dual-placed CPU twin ("embed-cpu") — an instance
+	// rather than a kind. It has samples, so it exists; the kind's own entry
+	// above carries the readiness.
+	for kind, snap := range snaps {
+		slots[string(kind)] = SlotHealth{LatencySnapshot: snap, Configured: true}
+		overall = worstStatus(overall, snap.Status)
 	}
 	resp := map[string]any{
 		"status":               string(overall),
@@ -696,7 +824,111 @@ func (g *Gateway) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (g *Gateway) handleTags(w http.ResponseWriter, _ *http.Request) {
+// SlotHealth is one entry in /health's slots map: the rolling latency
+// snapshot (same JSON keys as before, inlined) plus the readiness facts.
+type SlotHealth struct {
+	LatencySnapshot
+	// Configured reports whether a usable upstream is registered for the
+	// kind right now. False means every request to its route returns 503.
+	Configured bool   `json:"configured"`
+	Upstream   string `json:"upstream,omitempty"`
+	Detail     string `json:"detail,omitempty"`
+}
+
+// slotHealth merges one kind's latency snapshot with its readiness. snap
+// may be the zero value (no traffic in the window).
+func (g *Gateway) slotHealth(kind SlotKind, snap LatencySnapshot) SlotHealth {
+	if snap.Kind == "" {
+		snap = LatencySnapshot{
+			Kind:       kind,
+			Status:     StatusOK,
+			WindowSecs: int(latencyWindow / time.Second),
+		}
+	}
+	g.mu.RLock()
+	entry, registered := g.upstreams[kind]
+	down, parked := g.downUpstreams[kind]
+	g.mu.RUnlock()
+
+	h := SlotHealth{LatencySnapshot: snap}
+	switch {
+	case registered && entry.proxy != nil:
+		h.Configured = true
+		h.Upstream = entry.url.String()
+	case parked:
+		h.Status = StatusUnreachable
+		h.Detail = fmt.Sprintf("upstream %s stopped accepting connections %s ago (%s); retrying after %s",
+			down.raw, time.Since(down.since).Truncate(time.Second), down.reason, upstreamRetryCooloff)
+	case g.configuredModel(kind) != "":
+		h.Status = StatusUnconfigured
+		h.Detail = fmt.Sprintf("model %q is configured but no upstream is registered — "+
+			"the slot is not running and every %s request returns 503",
+			g.configuredModel(kind), kind)
+	default:
+		h.Status = StatusDisabled
+		h.Detail = fmt.Sprintf("no model configured for %s; the route is mounted and returns 503", kind)
+	}
+	return h
+}
+
+// configuredModel is the model the operator asked this kind to serve.
+// Empty means the kind was never requested, which is the difference between
+// "disabled" and "unconfigured" in /health.
+func (g *Gateway) configuredModel(kind SlotKind) string {
+	switch kind {
+	case KindChat:
+		return g.cfg.DefaultModel
+	case KindEmbed:
+		return g.cfg.EmbedModel
+	case KindCodeEmbed:
+		return g.cfg.CodeEmbedModel
+	case KindRerank:
+		return g.cfg.RerankModel
+	case KindWhisper:
+		return g.cfg.WhisperModel
+	case KindImageGen:
+		return g.cfg.SDModel
+	case KindTTS:
+		return g.cfg.BarkModel
+	}
+	return ""
+}
+
+// worstStatus folds a per-slot status into the overall one. The overall
+// vocabulary stays {ok, degraded, critical}: "unconfigured" and
+// "unreachable" are faults and degrade it, "disabled" is an operator choice
+// and does not (otherwise a chat-only deployment reads "degraded" forever
+// and consumers learn to ignore the field).
+func worstStatus(overall, s SlotStatus) SlotStatus {
+	if statusRank(s) <= statusRank(overall) {
+		return overall
+	}
+	if statusRank(s) >= statusRank(StatusCritical) {
+		return StatusCritical
+	}
+	return StatusDegraded
+}
+
+func statusRank(s SlotStatus) int {
+	switch s {
+	case StatusCritical:
+		return 2
+	case StatusDegraded, StatusUnconfigured, StatusUnreachable:
+		return 1
+	default: // ok, disabled
+		return 0
+	}
+}
+
+// handleTags lists the GGUFs in the model directory in Ollama's tags shape.
+//
+// Ollama's contract is that a name here can be loaded on demand; quenchforge
+// serves whatever its slots already have loaded and does not swap models per
+// request. Each entry therefore carries `loaded`: true when a registered
+// slot is serving that model, false when the file is merely cached. A
+// request for a name with loaded=false is refused by /api/chat rather than
+// silently answered by the loaded model.
+func (g *Gateway) handleTags(w http.ResponseWriter, r *http.Request) {
 	models, err := EnumerateModels(g.cfg.ModelsDir)
 	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
@@ -735,12 +967,9 @@ func (g *Gateway) handleTags(w http.ResponseWriter, _ *http.Request) {
 // observability-only and never sheds.
 func (g *Gateway) proxyHandler(kind SlotKind, rewriteTo string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		g.mu.RLock()
-		entry, ok := g.upstreams[kind]
-		g.mu.RUnlock()
-		if !ok || entry.proxy == nil {
-			writeJSONError(w, http.StatusServiceUnavailable,
-				fmt.Sprintf("no %s slot configured. Check `quenchforge doctor` for status.", kind))
+		entry, ok := g.lookupUpstream(kind)
+		if !ok {
+			writeJSONError(w, http.StatusServiceUnavailable, g.unavailableReason(kind))
 			return
 		}
 		if g.shouldBackoff(kind) {
