@@ -156,7 +156,11 @@ func KernelParamsForDevice(profile hardware.Profile, vramGB int, kind gateway.Sl
 func gpuKernelParams(profile hardware.Profile, vramGB int, kind gateway.SlotKind, cfg config.Config) SlotTuning {
 	switch kind {
 	case gateway.KindChat:
-		return chatParams(profile, vramGB)
+		// Only reached when chat resolves to the GPU. On AMD-discrete that
+		// takes an explicit QUENCHFORGE_PLACE_CHAT=gpu — the default policy
+		// routes chat to the CPU (~7x faster for autoregressive decode), and
+		// KernelParams short-circuits to cpuTuning above before it gets here.
+		return chatGPUParams(profile, vramGB)
 	case gateway.KindEmbed, gateway.KindCodeEmbed:
 		return embedParams(profile, vramGB, cfg)
 	case gateway.KindRerank:
@@ -222,20 +226,28 @@ func cpuTuning(kind gateway.SlotKind, cfg config.Config) SlotTuning {
 	return t
 }
 
-// chatParams returns the chat-slot tuning. AMD-discrete profiles get
-// the existing three safety flags AND AutoRespawn — sustained chat
-// inference (cerid LongMemEval extraction, agentic tool-use loops)
-// produces family-B `GGML_ASSERT(buf_src)` crashes the same as embed
-// under sustained load. v0.6.0 missed wiring AutoRespawn here on the
-// theory that chat is naturally bursty; cerid eval workloads broke
-// that assumption (chat.log entry at 2026-05-16T23:14 — task 143
-// hit GGML_ASSERT at `set_tensor` after ~30 successful chat calls).
-func chatParams(profile hardware.Profile, vramGB int) SlotTuning {
+// chatGPUParams returns the tuning for a chat slot that runs on the GPU.
+//
+// This is NOT the AMD-discrete default. Since v0.9.0 the placement policy
+// routes chat on AMD-discrete to the CPU and KernelParams returns cpuTuning
+// before reaching here; the only ways in are QUENCHFORGE_PLACE_CHAT=gpu and
+// the dual-launch GPU instance of an "auto" kind. Non-AMD profiles fall
+// through to upstream defaults.
+//
+// AutoRespawn is set because sustained chat inference (cerid LongMemEval
+// extraction, agentic tool-use loops) produces family-B
+// `GGML_ASSERT(buf_src)` crashes the same as embed under sustained load.
+// v0.6.0 missed wiring it here on the theory that chat is naturally bursty;
+// cerid eval workloads broke that assumption (chat.log entry at
+// 2026-05-16T23:14 — task 143 hit GGML_ASSERT at `set_tensor` after ~30
+// successful chat calls). CPU-placed chat gets its own AutoRespawn from
+// cpuTuning.
+func chatGPUParams(profile hardware.Profile, vramGB int) SlotTuning {
 	if !profileIsAMDDiscrete(profile) {
 		return SlotTuning{}
 	}
 	ctxCap, _ := amdSizing(vramGB)
-	// AMD-discrete chat slot runs on GPU as of v0.8.0. The MTLDispatchTypeConcurrent
+	// The MTLDispatchTypeConcurrent
 	// race that produced cross-call non-determinism is disabled via
 	// MetalConcurrencyDisable -> GGML_METAL_CONCURRENCY_DISABLE=1 (and intrinsically
 	// by patch 0005 on any binary built from this tree). The family-B IOMMU

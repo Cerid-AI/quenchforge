@@ -627,16 +627,28 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 	if notice := unknownGPUNotice(hwInfo); notice != "" {
 		fmt.Fprint(stderr, notice)
 	}
+	// Device-placement policy. Built from the hardware profile plus operator
+	// overrides, and resolved before the banner and the VRAM pre-flight
+	// because both have to state which kinds actually land on the GPU. The
+	// gateway gets the same policy via SetPlacement, so placement, tuning and
+	// the budget never disagree.
+	pol := tuning.PolicyFor(hwInfo.Profile, cfg)
+
 	if hwInfo.IsAMDDiscrete() {
-		// Keep this banner in sync with tuning.go::chatParams — it used to
-		// announce the three retired chat safety flags (R3, 2026-07-08)
-		// long after tuning stopped applying them, which misled incident
-		// analysis into believing the flags were still active.
+		// Keep this banner in sync with the placement policy and
+		// tuning.go — it used to announce the three retired chat safety flags
+		// (R3, 2026-07-08) long after tuning stopped applying them, which
+		// misled incident analysis into believing the flags were still active.
 		fmt.Fprintf(stdout,
 			"quenchforge: detected %s profile — AMD-discrete tuning active "+
 				"(patched Metal kernels; VRAM-tier-adaptive embed sizing; "+
 				"auto-respawn on embed/rerank/chat slots)\n",
 			hwInfo.Profile)
+		fmt.Fprintf(stdout,
+			"quenchforge: slot placement — chat=%s embed=%s code-embed=%s rerank=%s "+
+				"(override with QUENCHFORGE_PLACE_<SLOT>=gpu|cpu|auto)\n",
+			pol.Mode(placement.KindChat), pol.Mode(placement.KindEmbed),
+			pol.Mode(placement.KindCodeEmbed), pol.Mode(placement.KindRerank))
 	}
 
 	// The effective chat model is resolved here rather than at the spawn
@@ -651,13 +663,6 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 	// report it as an error naming the lane and the fix, and skip the spawn
 	// so no upstream is registered for a lane that will never answer.
 	unavailable := preflightSlotModels(cfg, chatModel, !*noSlot, stderr)
-
-	// Device-placement policy. Built from the hardware profile plus operator
-	// overrides, and resolved here because the VRAM pre-flight below needs to
-	// know which kinds actually land on the GPU. The gateway gets the same
-	// policy via SetPlacement, so placement, tuning and the budget never
-	// disagree.
-	pol := tuning.PolicyFor(hwInfo.Profile, cfg)
 
 	// VRAM pre-flight (v0.4.0). Refuse to spawn slots whose combined
 	// model weights would over-subscribe VRAM. Operator-friendly error
