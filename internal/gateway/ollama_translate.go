@@ -34,6 +34,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -180,18 +181,14 @@ type openAIEmbedResponse struct {
 func (g *Gateway) handleOllamaChat(generateMode bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// The primary chat slot's availability is checked FIRST, before the
-		// body is even read — matches the pre-dispatch behavior where an
-		// unconfigured chat slot 503s regardless of what else is wrong with
-		// the request (malformed JSON, an oversized body, …). Only once we
-		// know a request actually resolves to the background slot (which
-		// requires parsing the body's `model` field) do we check that
-		// slot's own availability separately, below.
-		g.mu.RLock()
-		chatEntry, chatOK := g.upstreams[KindChat]
-		g.mu.RUnlock()
-		if !chatOK || chatEntry.proxy == nil {
-			writeJSONError(w, http.StatusServiceUnavailable,
-				"no chat slot configured. Check `quenchforge doctor` for status.")
+		// body is even read — an unconfigured chat slot 503s regardless of
+		// what else is wrong with the request (malformed JSON, an oversized
+		// body, …). Only once we know a request resolves to the background
+		// slot (which requires parsing the body's `model` field) do we check
+		// that slot's own availability, below.
+		chatEntry, chatOK := g.lookupUpstream(KindChat)
+		if !chatOK {
+			writeJSONError(w, http.StatusServiceUnavailable, g.unavailableReason(KindChat))
 			return
 		}
 
@@ -253,15 +250,23 @@ func (g *Gateway) handleOllamaChat(generateMode bool) http.HandlerFunc {
 		kind := g.resolveChatKind(model)
 		entry := chatEntry
 		if kind == KindBackground {
-			g.mu.RLock()
-			bgEntry, ok := g.upstreams[KindBackground]
-			g.mu.RUnlock()
-			if !ok || bgEntry.proxy == nil {
-				writeJSONError(w, http.StatusServiceUnavailable,
-					fmt.Sprintf("no %s slot configured. Check `quenchforge doctor` for status.", kind))
+			bgEntry, ok := g.lookupUpstream(KindBackground)
+			if !ok {
+				writeJSONError(w, http.StatusServiceUnavailable, g.unavailableReason(KindBackground))
 				return
 			}
 			entry = bgEntry
+		}
+
+		// Same pre-emptive shedding contract as the proxy routes: when
+		// auto-backoff is on and the resolved slot's error rate is critical,
+		// answer with structured backpressure instead of piling onto a slot
+		// that is crashing.
+		if g.shouldBackoff(kind) {
+			w.Header().Set("Retry-After", "2")
+			writeJSONError(w, http.StatusServiceUnavailable,
+				fmt.Sprintf("%s slot is shedding load (critical error rate) — back off (Retry-After: 2s)", kind))
+			return
 		}
 
 		if len(messages) == 0 {
@@ -326,10 +331,16 @@ func (g *Gateway) handleOllamaChat(generateMode bool) http.HandlerFunc {
 		}
 
 		// Gated on the resolved kind so a background-slot request is
-		// admitted/prioritised independently of the primary chat slot.
+		// admitted/prioritised independently of the primary chat slot. Every
+		// upstream call is recorded in that kind's latency tracker: /health
+		// surfaces the slot's status from it and auto-backoff sheds on its
+		// error rate.
 		g.gated(kind, func(w http.ResponseWriter, r *http.Request) {
+			started := time.Now()
 			resp, err := translateHTTPClient.Do(upReq)
 			if err != nil {
+				g.latency.Record(kind, time.Since(started), true)
+				g.markUpstreamUnreachable(kind, err)
 				writeJSONError(w, http.StatusBadGateway,
 					fmt.Sprintf("chat upstream %s unreachable: %v",
 						entry.url.Host, err))
@@ -341,17 +352,20 @@ func (g *Gateway) handleOllamaChat(generateMode bool) http.HandlerFunc {
 			// through. llama-server returns OpenAI-style { "error": { "message", "type" } };
 			// translate that into Ollama-style { "error": "..." }.
 			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				g.latency.Record(kind, time.Since(started), resp.StatusCode >= 500)
 				body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 				writeJSONError(w, resp.StatusCode,
 					extractOpenAIErrorMessage(body))
 				return
 			}
 
+			var failed bool
 			if streamFlag {
-				streamOllamaChat(w, resp.Body, model)
+				failed = streamOllamaChat(w, resp.Body, model)
 			} else {
-				respondOllamaChat(w, resp.Body, model)
+				failed = respondOllamaChat(w, resp.Body, model)
 			}
+			g.latency.Record(kind, time.Since(started), failed)
 		})(w, r)
 	}
 }
@@ -455,6 +469,7 @@ func (g *Gateway) handleOllamaEmbeddings() http.HandlerFunc {
 							"Check `quenchforge doctor` for slot status.", entry.url.Host, syncUpstreamTimeout))
 					return
 				}
+				g.markUpstreamUnreachable(kind, err)
 				writeJSONError(w, http.StatusBadGateway,
 					fmt.Sprintf("embed upstream %s unreachable: %v",
 						entry.url.Host, err))
@@ -508,13 +523,15 @@ func (g *Gateway) handleOllamaEmbeddings() http.HandlerFunc {
 // ---------------------------------------------------------------------------
 
 // respondOllamaChat reads one OpenAI chat JSON object and writes one
-// Ollama chat JSON object. Used when the caller set stream=false.
-func respondOllamaChat(w http.ResponseWriter, body io.Reader, requestedModel string) {
+// Ollama chat JSON object. Used when the caller set stream=false. Reports
+// whether the exchange failed, so the caller records the latency sample
+// with the right error flag.
+func respondOllamaChat(w http.ResponseWriter, body io.Reader, requestedModel string) (failed bool) {
 	var resp openAIChatResponse
 	if err := json.NewDecoder(body).Decode(&resp); err != nil {
 		writeJSONError(w, http.StatusBadGateway,
 			fmt.Sprintf("decode upstream chat response: %v", err))
-		return
+		return true
 	}
 	model := resp.Model
 	if model == "" {
@@ -541,10 +558,13 @@ func respondOllamaChat(w http.ResponseWriter, body io.Reader, requestedModel str
 		"eval_count":        resp.Usage.CompletionTokens,
 	}
 	writeJSON(w, http.StatusOK, out)
+	return false
 }
 
 // streamOllamaChat reads the upstream SSE stream and writes one
-// Ollama NDJSON line per chunk, ending with a `done: true` line.
+// Ollama NDJSON line per chunk, ending with a `done: true` line. It reports
+// whether the stream was severed, so the caller records the latency sample
+// as an error.
 //
 // Spec:
 //   - Each OpenAI SSE event is "data: {json}\n\n" or "data: [DONE]\n\n"
@@ -552,7 +572,16 @@ func respondOllamaChat(w http.ResponseWriter, body io.Reader, requestedModel str
 //   - Empty content deltas (e.g. role-only "delta": {"role":"assistant"})
 //     emit a line with content="" so caller's token accumulator stays
 //     happy — matches Ollama's behavior.
-func streamOllamaChat(w http.ResponseWriter, body io.Reader, requestedModel string) {
+//
+// Truncation is the case this function has to be honest about. A stream can
+// end three ways that are NOT a completion: a read error, a connection that
+// closed mid-generation (llama-server SIGABRT — the family-B Metal crash
+// this repo exists to mitigate), or a scanner buffer overflow. All three
+// leave the loop without a terminal signal from the upstream. Reporting
+// done_reason "stop" for those is a wire-level lie: "stop" is what a
+// finished answer looks like, so the client cannot tell a complete reply
+// from a severed one. We emit done_reason "error" plus an `error` detail.
+func streamOllamaChat(w http.ResponseWriter, body io.Reader, requestedModel string) (truncated bool) {
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no") // disable proxy buffering
@@ -567,7 +596,8 @@ func streamOllamaChat(w http.ResponseWriter, body io.Reader, requestedModel stri
 	var (
 		lastModel    = requestedModel
 		finishReason = ""
-		emitted      bool
+		chunks       int
+		sawDone      bool
 	)
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -579,6 +609,7 @@ func streamOllamaChat(w http.ResponseWriter, body io.Reader, requestedModel stri
 			continue
 		}
 		if payload == "[DONE]" {
+			sawDone = true
 			break
 		}
 		var chunk openAIChatStreamChunk
@@ -614,10 +645,19 @@ func streamOllamaChat(w http.ResponseWriter, body io.Reader, requestedModel stri
 		if flusher != nil {
 			flusher.Flush()
 		}
-		emitted = true
+		chunks++
 	}
 
-	if finishReason == "" {
+	var detail string
+	switch {
+	case scanner.Err() != nil:
+		detail = fmt.Sprintf("upstream stream failed after %d chunks: %v", chunks, scanner.Err())
+	case !sawDone && finishReason == "":
+		detail = "upstream closed the stream before signalling completion — the answer is truncated"
+	case chunks == 0:
+		detail = "upstream produced no output"
+	}
+	if detail == "" && finishReason == "" {
 		finishReason = "stop"
 	}
 	final := map[string]interface{}{
@@ -627,11 +667,16 @@ func streamOllamaChat(w http.ResponseWriter, body io.Reader, requestedModel stri
 		"done":        true,
 		"done_reason": finishReason,
 	}
+	if detail != "" {
+		final["done_reason"] = "error"
+		final["error"] = detail
+		log.Printf("quenchforge: chat stream not completed: %s", detail)
+	}
 	_ = writeNDJSONLine(w, final)
 	if flusher != nil {
 		flusher.Flush()
 	}
-	_ = emitted // reserved for future "no-output" warning logs
+	return detail != ""
 }
 
 // ---------------------------------------------------------------------------

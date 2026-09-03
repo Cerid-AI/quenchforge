@@ -69,6 +69,23 @@ const (
 	// crash. Consumers should back off; when QUENCHFORGE_AUTO_BACKOFF=true
 	// the gateway returns 503+Retry-After.
 	StatusCritical SlotStatus = "critical"
+
+	// StatusUnconfigured means the operator asked for this kind (its model
+	// is set in the config) but no upstream is registered — the slot never
+	// started, or died before it registered. The route is mounted and 503s
+	// every call, so this degrades the overall status.
+	StatusUnconfigured SlotStatus = "unconfigured"
+
+	// StatusUnreachable means an upstream was registered and then proved
+	// dead (connection refused). The gateway has deregistered it and will
+	// retry after a cool-off; the route 503s until then.
+	StatusUnreachable SlotStatus = "unreachable"
+
+	// StatusDisabled means the kind was never requested (no model configured
+	// for it). Its route is mounted and 503s, which is the documented
+	// behaviour, so it does NOT degrade the overall status — but consumers
+	// can still see the lane is unavailable and stop retrying it.
+	StatusDisabled SlotStatus = "disabled"
 )
 
 // latencySample is a single recorded upstream call outcome. Stored in
