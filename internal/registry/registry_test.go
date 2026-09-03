@@ -442,3 +442,87 @@ func TestCatalog_HasSensibleEntries(t *testing.T) {
 
 // Smoke that the time helpers don't crash on zero values.
 var _ = time.Time{}
+
+// noLFSServer serves a tree entry with no lfs block — a file below HF's LFS
+// threshold, a mirror, or a gated repo whose tree response differs.
+func noLFSServer(t *testing.T, payload []byte) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/models/testorg/test-gguf/tree/main", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode([]hfTreeEntry{
+			{Path: "test-model-Q4_K_M.gguf", Type: "file", Size: int64(len(payload))},
+		})
+	})
+	mux.HandleFunc("/testorg/test-gguf/resolve/main/test-model-Q4_K_M.gguf", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(payload)))
+		_, _ = w.Write(payload)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestPull_E2E_RefusesWithoutLFSMetadata(t *testing.T) {
+	payload := []byte("unverifiable fake GGUF")
+	srv := noLFSServer(t, payload)
+	tmpDir := t.TempDir()
+	client := New(tmpDir).WithBaseURL(srv.URL)
+	spec, err := ParseSpec("testorg/test-gguf:Q4_K_M")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	finalPath, err := client.Pull(context.Background(), spec, nil)
+	if err == nil {
+		t.Fatalf("Pull installed %s with no integrity check at all", finalPath)
+	}
+	if !strings.Contains(err.Error(), "SHA-256") {
+		t.Errorf("error should name the missing checksum: %v", err)
+	}
+	entries, _ := os.ReadDir(tmpDir)
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".gguf") {
+			t.Errorf("unverified file %q was installed anyway", e.Name())
+		}
+	}
+}
+
+func TestPull_E2E_AllowUnverifiedOptIn(t *testing.T) {
+	payload := []byte("unverifiable fake GGUF")
+	srv := noLFSServer(t, payload)
+	tmpDir := t.TempDir()
+	client := New(tmpDir).WithBaseURL(srv.URL).AllowUnverified(true)
+	spec, err := ParseSpec("testorg/test-gguf:Q4_K_M")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	finalPath, err := client.Pull(context.Background(), spec, nil)
+	if err != nil {
+		t.Fatalf("explicit opt-in should still pull: %v", err)
+	}
+	got, err := os.ReadFile(finalPath)
+	if err != nil || string(got) != string(payload) {
+		t.Fatalf("ReadFile %s = %q, %v", finalPath, got, err)
+	}
+}
+
+func TestPull_E2E_RefusesUnverifiablePreexistingFile(t *testing.T) {
+	// The idempotency path returned "already installed" for a size match with
+	// no SHA — so a tampered file of the right size passed as verified.
+	payload := []byte("unverifiable fake GGUF")
+	srv := noLFSServer(t, payload)
+	tmpDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(tmpDir, "test-gguf-Q4_K_M.gguf"), payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	client := New(tmpDir).WithBaseURL(srv.URL)
+	spec, err := ParseSpec("testorg/test-gguf:Q4_K_M")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Pull(context.Background(), spec, nil); err == nil {
+		t.Fatalf("a size-only match is not verification")
+	}
+}
