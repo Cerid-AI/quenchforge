@@ -159,6 +159,9 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) error {
 		fmt.Fprintf(stdout, "    device[%d]: %q vram=%dGB lowpower=%v apple=%v\n",
 			i, d.Name, d.VRAMGB, d.LowPower, d.AppleSilicon)
 	}
+	if notice := unknownGPUNotice(info); notice != "" {
+		fmt.Fprint(stdout, notice)
+	}
 	fmt.Fprintln(stdout)
 
 	// Config
@@ -620,6 +623,9 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 				"  Slot tuning defaults to apple-silicon profile; chat may be\n"+
 				"  unstable on AMD discrete. Run `quenchforge doctor` to diagnose.\n",
 			hwErr)
+	}
+	if notice := unknownGPUNotice(hwInfo); notice != "" {
+		fmt.Fprint(stderr, notice)
 	}
 	if hwInfo.IsAMDDiscrete() {
 		// Keep this banner in sync with tuning.go::chatParams — it used to
@@ -1444,6 +1450,23 @@ func slotLine(modelsDir, model string, port int) string {
 			model, port, modelsDir)
 	}
 	return fmt.Sprintf("model=%s port=%d", model, port)
+}
+
+// unknownGPUNotice is the operator-facing note for a Metal device that
+// matched no tuning bucket. Empty for every recognised profile.
+//
+// The tuning tables are per-card measurements; applying Vega II's numbers to
+// an unbenched card was a silent guess that could force chat onto the CPU and
+// serialise Metal on hardware that needs neither.
+func unknownGPUNotice(info hardware.Info) string {
+	if info.Profile != hardware.ProfileMetalUnknown {
+		return ""
+	}
+	return fmt.Sprintf(
+		"quenchforge: unrecognised Metal GPU %q (%d GB) — running with upstream defaults,\n"+
+			"  no profile tuning applied. Please file a hardware_profile report so this card\n"+
+			"  gets measured defaults: https://github.com/Cerid-AI/quenchforge/issues\n",
+		info.GPU, info.GPUVRAMGB)
 }
 
 // redactPath replaces the user's home dir with "~" when --redacted is set.
