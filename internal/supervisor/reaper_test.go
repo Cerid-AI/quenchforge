@@ -44,14 +44,14 @@ func TestReapOrphans_DoesNotKillAProcessItCannotVerify(t *testing.T) {
 	decoy := decoyProcess(t)
 	pidDir := t.TempDir()
 	// A pidfile from a crashed supervisor that recorded nothing but the PID:
-	// the PID may since have been recycled, so the reaper cannot prove the
-	// process is one of its children.
+	// the PID may since have been recycled, so the only evidence left is the
+	// executable the process is running, and it is not one of ours.
 	if err := os.WriteFile(filepath.Join(pidDir, "chat.pid"),
 		[]byte(strconv.Itoa(decoy.Process.Pid)+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
-	res := ReapOrphans(pidDir)
+	res := ReapOrphans(pidDir, []string{"/opt/quenchforge/libexec/llama-server"})
 	if len(res) != 1 {
 		t.Fatalf("ReapOrphans: %d results, want 1", len(res))
 	}
@@ -63,6 +63,44 @@ func TestReapOrphans_DoesNotKillAProcessItCannotVerify(t *testing.T) {
 	if !alive(decoy.Process.Pid) {
 		t.Fatalf("the reaper SIGKILLed pid %d, an unrelated process whose command line "+
 			"merely contains \"quenchforge\"", decoy.Process.Pid)
+	}
+}
+
+// TestReapOrphans_ReapsALegacyPIDFileWhoseExecutableIsOurs covers the first
+// restart after upgrading from a build that wrote bare-integer pidfiles:
+// every orphan it stranded is described by such a pidfile, and refusing to
+// signal them leaves a stale llama-server holding its slot port and its VRAM.
+func TestReapOrphans_ReapsALegacyPIDFileWhoseExecutableIsOurs(t *testing.T) {
+	decoy := decoyProcess(t)
+	pid := decoy.Process.Pid
+	_, execPath, err := processIdentity(pid)
+	if err != nil {
+		t.Fatalf("processIdentity(%d): %v", pid, err)
+	}
+	pidDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(pidDir, "chat.pid"),
+		[]byte(strconv.Itoa(pid)+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	res := ReapOrphans(pidDir, []string{execPath})
+	if len(res) != 1 {
+		t.Fatalf("ReapOrphans: %d results, want 1", len(res))
+	}
+	if res[0].Action != "killed" {
+		t.Fatalf("reaper action = %q (%s), want killed — pid %d runs %s, one of the "+
+			"executables this build spawns, and its pidfile is the bare integer every "+
+			"shipped build wrote", res[0].Action, res[0].Note, pid, execPath)
+	}
+	done := make(chan struct{})
+	go func() {
+		_ = decoy.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Errorf("pid %d survived the reaper", pid)
 	}
 }
 
@@ -84,7 +122,7 @@ func TestReapOrphans_SkipsRecycledPID(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res := ReapOrphans(pidDir)
+	res := ReapOrphans(pidDir, []string{execPath})
 	if len(res) != 1 || res[0].Action != "skip" {
 		t.Errorf("ReapOrphans = %+v, want a single skip", res)
 	}
@@ -110,7 +148,7 @@ func TestReapOrphans_KillsAMatchingChild(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	res := ReapOrphans(pidDir)
+	res := ReapOrphans(pidDir, nil)
 	if len(res) != 1 || res[0].Action != "killed" {
 		t.Fatalf("ReapOrphans = %+v, want a single kill", res)
 	}

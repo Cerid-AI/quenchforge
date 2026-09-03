@@ -727,7 +727,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 
 	// Orphan reaper — clean up any survivors from a previous crash before we
 	// allocate new ports.
-	reaped := supervisor.ReapOrphans(cfg.PIDDir)
+	reaped := supervisor.ReapOrphans(cfg.PIDDir, slotExecutables(cfg))
 	for _, r := range reaped {
 		fmt.Fprintf(stderr, "quenchforge: reap %s pid=%d action=%s %s\n",
 			r.File, r.PID, r.Action, r.Note)
@@ -818,7 +818,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 			slots[kind] = s
 			fmt.Fprintf(stdout, "quenchforge: %s slot pid=%d model=%s port=%d\n",
 				name, s.PID(), model, gpuPort)
-			registerWhenReady(ctx, name, gpuPort, upstreamSetter(g, kind), stderr)
+			registerWhenReady(ctx, name, gpuPort, model, upstreamSetter(g, kind), stderr)
 			return
 		}
 		// Auto: dual-placed. GPU instance is the primary upstream.
@@ -832,7 +832,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 			slots[kind] = s
 			fmt.Fprintf(stdout, "quenchforge: %s slot (gpu) pid=%d model=%s port=%d\n",
 				name, s.PID(), model, gpuPort)
-			registerWhenReady(ctx, name, gpuPort, upstreamSetter(g, kind), stderr)
+			registerWhenReady(ctx, name, gpuPort, model, upstreamSetter(g, kind), stderr)
 		}
 		// CPU instance handles single-request latency traffic.
 		cpuName := name + "-cpu"
@@ -847,7 +847,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 			slots[gateway.SlotKind(cpuName)] = s
 			fmt.Fprintf(stdout, "quenchforge: %s slot (cpu) pid=%d model=%s port=%d\n",
 				cpuName, s.PID(), model, cpuPort)
-			registerWhenReady(ctx, cpuName, cpuPort, cpuUpstreamSetter(g, kind), stderr)
+			registerWhenReady(ctx, cpuName, cpuPort, model, cpuUpstreamSetter(g, kind), stderr)
 		}
 	}
 
@@ -870,7 +870,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 			slots[gateway.KindChat] = s
 			fmt.Fprintf(stdout, "quenchforge: chat slot pid=%d model=%s port=%d\n",
 				s.PID(), modelName, cfg.ChatPort)
-			registerWhenReady(ctx, "chat", cfg.ChatPort,
+			registerWhenReady(ctx, "chat", cfg.ChatPort, modelName,
 				upstreamSetter(g, gateway.KindChat), stderr)
 		}
 	}
@@ -915,7 +915,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 				slots[gateway.KindRerank] = s
 				fmt.Fprintf(stdout, "quenchforge: rerank slot pid=%d model=%s port=%d\n",
 					s.PID(), cfg.RerankModel, cfg.RerankPort)
-				registerWhenReady(ctx, "rerank", cfg.RerankPort,
+				registerWhenReady(ctx, "rerank", cfg.RerankPort, cfg.RerankModel,
 					upstreamSetter(g, gateway.KindRerank), stderr)
 			}
 		}
@@ -949,7 +949,9 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 					fmt.Fprintf(stdout,
 						"quenchforge: image-gen slot pid=%d model=%s port=%d\n",
 						slot.PID(), cfg.SDModel, cfg.SDPort)
-					registerWhenReady(ctx, "image-gen", cfg.SDPort,
+					// sd-server serves no /v1/models, so TCP accept is all
+					// the readiness evidence there is.
+					registerWhenReady(ctx, "image-gen", cfg.SDPort, "",
 						upstreamSetter(g, gateway.KindImageGen), stderr)
 				}
 			}
@@ -985,7 +987,8 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 					fmt.Fprintf(stdout,
 						"quenchforge: TTS slot pid=%d model=%s port=%d\n",
 						slot.PID(), cfg.BarkModel, cfg.BarkPort)
-					registerWhenReady(ctx, "tts", cfg.BarkPort,
+					// The bark server serves no /v1/models.
+					registerWhenReady(ctx, "tts", cfg.BarkPort, "",
 						upstreamSetter(g, gateway.KindTTS), stderr)
 				}
 			}
@@ -1028,7 +1031,8 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 					fmt.Fprintf(stdout,
 						"quenchforge: whisper slot pid=%d model=%s port=%d gpu=%v\n",
 						slot.PID(), cfg.WhisperModel, cfg.WhisperPort, cfg.WhisperGPU)
-					registerWhenReady(ctx, "whisper", cfg.WhisperPort,
+					// whisper-server serves no /v1/models.
+					registerWhenReady(ctx, "whisper", cfg.WhisperPort, "",
 						upstreamSetter(g, gateway.KindWhisper), stderr)
 				}
 			}
@@ -1333,6 +1337,25 @@ func cmdMigrate(args []string, stdout, stderr io.Writer) error {
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
+
+// slotExecutables lists the binaries this build spawns slot children from,
+// skipping the ones that are not installed. The orphan reaper needs them to
+// judge a pidfile written before pidfiles carried a process identity: that is
+// the only evidence such a pidfile leaves behind. See ReapOrphans.
+func slotExecutables(cfg config.Config) []string {
+	var out []string
+	for _, resolve := range []func() (string, error){
+		func() (string, error) { return resolveLlamaBin(cfg.LlamaBin) },
+		resolveWhisperBin,
+		resolveSDBin,
+		resolveBarkBin,
+	} {
+		if p, err := resolve(); err == nil {
+			out = append(out, p)
+		}
+	}
+	return out
+}
 
 // resolveSDBin finds sd-server (stable-diffusion.cpp HTTP example).
 func resolveSDBin() (string, error) {

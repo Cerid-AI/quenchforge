@@ -263,7 +263,7 @@ func TestReadPIDFileBadContent(t *testing.T) {
 
 func TestReapOrphansHandlesMissingDir(t *testing.T) {
 	// Reaping a non-existent dir should return an empty list, not panic.
-	res := ReapOrphans("/nonexistent/quenchforge/pids")
+	res := ReapOrphans("/nonexistent/quenchforge/pids", nil)
 	if len(res) != 0 {
 		t.Errorf("ReapOrphans on missing dir returned %d results, want 0", len(res))
 	}
@@ -275,7 +275,7 @@ func TestReapOrphansHandlesStaleNonMatchingPID(t *testing.T) {
 	if err := writePIDRecord(filepath.Join(pidDir, "stale.pid"), pidRecord{PID: 1}); err != nil {
 		t.Fatal(err)
 	}
-	res := ReapOrphans(pidDir)
+	res := ReapOrphans(pidDir, nil)
 	if len(res) != 1 {
 		t.Fatalf("ReapOrphans: %d results, want 1", len(res))
 	}
@@ -293,7 +293,7 @@ func TestReapOrphansHandlesUnreadablePID(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(pidDir, "bad.pid"), []byte("garbage"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	res := ReapOrphans(pidDir)
+	res := ReapOrphans(pidDir, nil)
 	if len(res) != 1 || res[0].Action != "skip" {
 		t.Errorf("ReapOrphans bad pidfile: %+v", res)
 	}
