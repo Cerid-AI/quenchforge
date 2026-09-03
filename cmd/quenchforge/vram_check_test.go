@@ -12,6 +12,7 @@ import (
 
 	"github.com/cerid-ai/quenchforge/internal/config"
 	"github.com/cerid-ai/quenchforge/internal/hardware"
+	"github.com/cerid-ai/quenchforge/internal/tuning"
 )
 
 // makeFakeGGUF creates a sparse file of the given size in modelsDir.
@@ -43,7 +44,7 @@ func TestVRAMCheck_NoMetal_NoOp(t *testing.T) {
 	info := hardware.Info{Profile: hardware.ProfileCPU, HasMetal: false, GPUVRAMGB: 0}
 
 	var buf bytes.Buffer
-	if err := checkVRAMBudget(cfg, info, &buf); err != nil {
+	if err := checkVRAMBudget(cfg, info, tuning.PolicyFor(info.Profile, cfg), &buf); err != nil {
 		t.Errorf("non-Metal host should be a no-op, got: %v", err)
 	}
 }
@@ -57,7 +58,7 @@ func TestVRAMCheck_VRAMSizeUnknown_WarnAndContinue(t *testing.T) {
 	info := hardware.Info{Profile: hardware.ProfileIGPU, HasMetal: true, GPUVRAMGB: 0}
 
 	var buf bytes.Buffer
-	if err := checkVRAMBudget(cfg, info, &buf); err != nil {
+	if err := checkVRAMBudget(cfg, info, tuning.PolicyFor(info.Profile, cfg), &buf); err != nil {
 		t.Errorf("unknown VRAM should warn-and-continue, got: %v", err)
 	}
 	if !strings.Contains(buf.String(), "VRAM size unknown") {
@@ -72,7 +73,7 @@ func TestVRAMCheck_NoSlotsConfigured_NoOp(t *testing.T) {
 	info := hardware.Info{Profile: hardware.ProfileVegaPro, HasMetal: true, GPUVRAMGB: 32, GPU: "AMD Vega II"}
 
 	var buf bytes.Buffer
-	if err := checkVRAMBudget(cfg, info, &buf); err != nil {
+	if err := checkVRAMBudget(cfg, info, tuning.PolicyFor(info.Profile, cfg), &buf); err != nil {
 		t.Errorf("no slots configured should be a no-op, got: %v", err)
 	}
 }
@@ -92,7 +93,7 @@ func TestVRAMCheck_FitsComfortably(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := checkVRAMBudget(cfg, info, &buf); err != nil {
+	if err := checkVRAMBudget(cfg, info, tuning.PolicyFor(info.Profile, cfg), &buf); err != nil {
 		t.Errorf("4GB + 200MB should fit in 32GB, got: %v", err)
 	}
 	if !strings.Contains(buf.String(), "VRAM check OK") {
@@ -108,6 +109,7 @@ func TestVRAMCheck_Oversubscribed_HelpfulError(t *testing.T) {
 		ModelsDir:    tmp,
 		DefaultModel: "huge-chat",
 		EmbedModel:   "huge-embed",
+		PlaceChat:    "gpu", // both slots on the GPU, so both count
 	}
 	// 16 GB GPU — 28+8 + overhead won't fit
 	info := hardware.Info{
@@ -116,7 +118,7 @@ func TestVRAMCheck_Oversubscribed_HelpfulError(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	err := checkVRAMBudget(cfg, info, &buf)
+	err := checkVRAMBudget(cfg, info, tuning.PolicyFor(info.Profile, cfg), &buf)
 	if err == nil {
 		t.Fatalf("expected oversubscription error")
 	}
@@ -152,7 +154,7 @@ func TestVRAMCheck_MissingModel_Skipped(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	if err := checkVRAMBudget(cfg, info, &buf); err != nil {
+	if err := checkVRAMBudget(cfg, info, tuning.PolicyFor(info.Profile, cfg), &buf); err != nil {
 		t.Errorf("missing-model should be skipped, not errored: %v", err)
 	}
 }
@@ -183,5 +185,76 @@ func TestHumanBytes(t *testing.T) {
 		if got != c.want {
 			t.Errorf("humanBytes(%d) = %q, want %q", c.n, got, c.want)
 		}
+	}
+}
+
+func TestVRAMCheck_SkipsCPUPlacedSlots(t *testing.T) {
+	// AMD-discrete defaults route chat and rerank to the CPU (placement.go),
+	// so their weights never land in VRAM. Counting them against the GPU
+	// budget refuses a configuration that would run fine.
+	tmp := t.TempDir()
+	makeFakeGGUF(t, tmp, "chat-model", 12<<30)
+	makeFakeGGUF(t, tmp, "rerank-model", 2<<30)
+	makeFakeGGUF(t, tmp, "embed-model", 1<<30)
+	cfg := config.Config{
+		ModelsDir:    tmp,
+		DefaultModel: "chat-model",
+		RerankModel:  "rerank-model",
+		EmbedModel:   "embed-model",
+	}
+	info := hardware.Info{
+		Profile: hardware.ProfileVegaPro, HasMetal: true,
+		GPUVRAMGB: 8, GPU: "AMD Radeon Pro 580X",
+	}
+
+	var buf bytes.Buffer
+	if err := checkVRAMBudget(cfg, info, tuning.PolicyFor(info.Profile, cfg), &buf); err != nil {
+		t.Errorf("chat and rerank are CPU-placed on AMD-discrete; only the 1 GB embed "+
+			"slot competes for the 8 GB card. Got:\n%v", err)
+	}
+}
+
+func TestVRAMCheck_CountsCodeEmbedSlot(t *testing.T) {
+	tmp := t.TempDir()
+	makeFakeGGUF(t, tmp, "code-embed-model", 20<<30)
+	cfg := config.Config{
+		ModelsDir:      tmp,
+		CodeEmbedModel: "code-embed-model",
+	}
+	info := hardware.Info{
+		Profile: hardware.ProfileVegaPro, HasMetal: true,
+		GPUVRAMGB: 8, GPU: "AMD Radeon Pro 580X",
+	}
+
+	var buf bytes.Buffer
+	err := checkVRAMBudget(cfg, info, tuning.PolicyFor(info.Profile, cfg), &buf)
+	if err == nil {
+		t.Fatalf("a 20 GB GPU-placed code-embed model does not fit an 8 GB card, "+
+			"but the budget reported OK: %q", buf.String())
+	}
+	if !strings.Contains(err.Error(), "code-embed") {
+		t.Errorf("error must name the code-embed slot:\n%v", err)
+	}
+}
+
+func TestVRAMCheck_MissingModelIsReported(t *testing.T) {
+	tmp := t.TempDir()
+	cfg := config.Config{ModelsDir: tmp, EmbedModel: "absent-embed-model"}
+	info := hardware.Info{
+		Profile: hardware.ProfileVegaPro, HasMetal: true,
+		GPUVRAMGB: 32, GPU: "AMD Vega II",
+	}
+
+	var buf bytes.Buffer
+	if err := checkVRAMBudget(cfg, info, tuning.PolicyFor(info.Profile, cfg), &buf); err != nil {
+		t.Fatalf("a missing model is not a budget failure: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "absent-embed-model") {
+		t.Errorf("dropping a slot from the budget without saying so lets the "+
+			"pre-flight print an OK it cannot back. Got:\n%s", out)
+	}
+	if strings.Contains(out, "VRAM check OK") {
+		t.Errorf("the budget is incomplete; it must not claim OK. Got:\n%s", out)
 	}
 }

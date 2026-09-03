@@ -106,6 +106,12 @@ func main() {
 		fmt.Fprintln(os.Stderr, "       Quenchforge needs a discrete AMD GPU or Apple Silicon.")
 		exitCode = 3
 		return
+	case hardware.ProfileMetalUnknown:
+		// Detection worked; the card simply matched no tuning bucket. Supported,
+		// but it runs on upstream defaults until someone benches it.
+		fmt.Fprintln(os.Stderr, "[WARN] Unrecognized Metal GPU:", info.GPU)
+		fmt.Fprintln(os.Stderr, "       Quenchforge runs with upstream defaults (no profile tuning).")
+		fmt.Fprintln(os.Stderr, "       Please file a hardware_profile report so this card gets measured defaults.")
 	default:
 		// Unknown but classify_profile says we have metal — proceed but warn.
 		fmt.Fprintln(os.Stderr, "[WARN] Unrecognized profile:", info.Profile)

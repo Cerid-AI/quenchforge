@@ -45,6 +45,7 @@ Spec forms:
 Flags:
     --list                             # print the catalog of well-tested aliases
     --no-progress                      # suppress the progress bar
+    --allow-unverified                 # install even when HuggingFace publishes no SHA-256
     --models-dir <path>                # override the install dest (default: $QUENCHFORGE_MODELS_DIR or ~/.quenchforge/models)
 
 Authentication for private HF repos: set HF_TOKEN before invocation.
@@ -55,6 +56,8 @@ func cmdPull(args []string, stdout, stderr io.Writer) error {
 	fs.SetOutput(stderr)
 	listCatalog := fs.Bool("list", false, "print the catalog of well-tested aliases and exit")
 	noProgress := fs.Bool("no-progress", false, "suppress the progress bar")
+	allowUnverified := fs.Bool("allow-unverified", false,
+		"install even when HuggingFace publishes no SHA-256 for the file")
 	modelsDirFlag := fs.String("models-dir", "", "override the install destination")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -84,7 +87,7 @@ func cmdPull(args []string, stdout, stderr io.Writer) error {
 		modelsDir = *modelsDirFlag
 	}
 
-	client := registry.New(modelsDir)
+	client := registry.New(modelsDir).AllowUnverified(*allowUnverified)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()

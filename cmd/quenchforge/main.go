@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,16 +31,60 @@ import (
 	"github.com/cerid-ai/quenchforge/internal/tuning"
 )
 
+// devVersion is what an unstamped build starts from. It is deliberately not
+// a version number: the previous default was a literal five minor versions
+// behind HEAD that every source build reported through `version`, doctor's
+// header and the gateway's `/`, so a doctor paste could not identify the code
+// the operator was running.
+const devVersion = "dev"
+
 // Version is injected at build time via:
 //
 //	go build -ldflags "-X main.Version=$(git describe --tags --always)"
 //
-// goreleaser handles this in CI. Local dev builds carry the zero value.
+// goreleaser handles this in CI. An unstamped build resolves its identity
+// from the VCS data the toolchain embeds — see buildIdentity.
 var (
-	Version   = "0.5.0-dev"
+	Version   = devVersion
 	Commit    = "unknown"
 	BuildDate = "unknown"
 )
+
+// buildIdentity resolves the version and commit every surface reports.
+// ldflag-stamped values win. An unstamped build falls back to the VCS
+// revision Go records in the build info, and says so.
+func buildIdentity(version, commit string, bi *debug.BuildInfo, ok bool) (string, string) {
+	if version != devVersion {
+		return version, commit
+	}
+	if !ok || bi == nil {
+		return devVersion + " (unversioned build)", commit
+	}
+	var revision, modified string
+	for _, s := range bi.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			revision = s.Value
+		case "vcs.modified":
+			modified = s.Value
+		}
+	}
+	if revision == "" {
+		return devVersion + " (unversioned build)", commit
+	}
+	short := revision
+	if len(short) > 7 {
+		short = short[:7]
+	}
+	version = devVersion + "+g" + short
+	if modified == "true" {
+		version += ".dirty"
+	}
+	if commit == "unknown" {
+		commit = revision
+	}
+	return version, commit
+}
 
 const rootUsage = `quenchforge — local inference for Mac + AMD discrete GPU
 
@@ -67,6 +112,8 @@ Report a bug:  https://github.com/cerid-ai/quenchforge/issues/new/choose
 `
 
 func main() {
+	bi, biOK := debug.ReadBuildInfo()
+	Version, Commit = buildIdentity(Version, Commit, bi, biOK)
 	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintln(os.Stderr, "quenchforge:", err)
 		os.Exit(1)
@@ -159,6 +206,9 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) error {
 		fmt.Fprintf(stdout, "    device[%d]: %q vram=%dGB lowpower=%v apple=%v\n",
 			i, d.Name, d.VRAMGB, d.LowPower, d.AppleSilicon)
 	}
+	if notice := unknownGPUNotice(info); notice != "" {
+		fmt.Fprint(stdout, notice)
+	}
 	fmt.Fprintln(stdout)
 
 	// Config
@@ -184,14 +234,14 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) error {
 	// whether the slot starts unconditionally (chat) or only when its
 	// model env var is set.
 	fmt.Fprintln(stdout, "slots:")
-	fmt.Fprintf(stdout, "  chat:         model=%s port=%d\n", cfg.DefaultModel, cfg.ChatPort)
-	fmt.Fprintf(stdout, "  embed:        %s\n", slotLine(cfg.EmbedModel, cfg.EmbedPort))
+	fmt.Fprintf(stdout, "  chat:         %s\n", slotLine(cfg.ModelsDir, cfg.DefaultModel, cfg.ChatPort))
+	fmt.Fprintf(stdout, "  embed:        %s\n", slotLine(cfg.ModelsDir, cfg.EmbedModel, cfg.EmbedPort))
 	fmt.Fprintf(stdout, "  code-embed:   %s   (routed by request model == cfg.CodeEmbedModel)\n",
-		slotLine(cfg.CodeEmbedModel, cfg.CodeEmbedPort))
-	fmt.Fprintf(stdout, "  rerank:       %s\n", slotLine(cfg.RerankModel, cfg.RerankPort))
-	fmt.Fprintf(stdout, "  whisper:      %s\n", slotLine(cfg.WhisperModel, cfg.WhisperPort))
-	fmt.Fprintf(stdout, "  imagegen (sd):%s\n", slotLine(cfg.SDModel, cfg.SDPort))
-	fmt.Fprintf(stdout, "  tts (bark):   %s\n", slotLine(cfg.BarkModel, cfg.BarkPort))
+		slotLine(cfg.ModelsDir, cfg.CodeEmbedModel, cfg.CodeEmbedPort))
+	fmt.Fprintf(stdout, "  rerank:       %s\n", slotLine(cfg.ModelsDir, cfg.RerankModel, cfg.RerankPort))
+	fmt.Fprintf(stdout, "  whisper:      %s\n", slotLine(cfg.ModelsDir, cfg.WhisperModel, cfg.WhisperPort))
+	fmt.Fprintf(stdout, "  imagegen (sd):%s\n", slotLine(cfg.ModelsDir, cfg.SDModel, cfg.SDPort))
+	fmt.Fprintf(stdout, "  tts (bark):   %s\n", slotLine(cfg.ModelsDir, cfg.BarkModel, cfg.BarkPort))
 	fmt.Fprintln(stdout)
 
 	// llama-server binary check
@@ -621,25 +671,57 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 				"  unstable on AMD discrete. Run `quenchforge doctor` to diagnose.\n",
 			hwErr)
 	}
+	if notice := unknownGPUNotice(hwInfo); notice != "" {
+		fmt.Fprint(stderr, notice)
+	}
+	// Device-placement policy. Built from the hardware profile plus operator
+	// overrides, and resolved before the banner and the VRAM pre-flight
+	// because both have to state which kinds actually land on the GPU. The
+	// gateway gets the same policy via SetPlacement, so placement, tuning and
+	// the budget never disagree.
+	pol := tuning.PolicyFor(hwInfo.Profile, cfg)
+
 	if hwInfo.IsAMDDiscrete() {
-		// Keep this banner in sync with tuning.go::chatParams — it used to
-		// announce the three retired chat safety flags (R3, 2026-07-08)
-		// long after tuning stopped applying them, which misled incident
-		// analysis into believing the flags were still active.
+		// Keep this banner in sync with the placement policy and
+		// tuning.go — it used to announce the three retired chat safety flags
+		// (R3, 2026-07-08) long after tuning stopped applying them, which
+		// misled incident analysis into believing the flags were still active.
 		fmt.Fprintf(stdout,
 			"quenchforge: detected %s profile — AMD-discrete tuning active "+
 				"(patched Metal kernels; VRAM-tier-adaptive embed sizing; "+
 				"auto-respawn on embed/rerank/chat slots)\n",
 			hwInfo.Profile)
+		fmt.Fprintf(stdout,
+			"quenchforge: slot placement — chat=%s embed=%s code-embed=%s rerank=%s "+
+				"(override with QUENCHFORGE_PLACE_<SLOT>=gpu|cpu|auto)\n",
+			pol.Mode(placement.KindChat), pol.Mode(placement.KindEmbed),
+			pol.Mode(placement.KindCodeEmbed), pol.Mode(placement.KindRerank))
 	}
+
+	// The effective chat model is resolved here rather than at the spawn
+	// site so the configured-slot pre-flight below sees the same value the
+	// chat slot will load.
+	chatModel := *model
+	if chatModel == "" {
+		chatModel = cfg.DefaultModel
+	}
+
+	// Configured-slot pre-flight. A slot whose model is absent cannot serve;
+	// report it as an error naming the lane and the fix, and skip the spawn
+	// so no upstream is registered for a lane that will never answer.
+	unavailable := preflightSlotModels(cfg, chatModel, !*noSlot, stderr)
 
 	// VRAM pre-flight (v0.4.0). Refuse to spawn slots whose combined
 	// model weights would over-subscribe VRAM. Operator-friendly error
 	// is better than three Metal-load failures in a row.
 	if !*noSlot && !vramCheckDisabled() {
-		if err := checkVRAMBudget(cfg, hwInfo, stdout); err != nil {
+		if err := checkVRAMBudget(cfg, hwInfo, pol, stdout); err != nil {
 			fmt.Fprintf(stderr, "quenchforge: %v\n", err)
-			return fmt.Errorf("VRAM pre-flight failed")
+			// Clean exit, like the pre-bind port check: no restart can make an
+			// over-subscribed configuration fit, and a non-zero exit against
+			// KeepAlive{SuccessfulExit:false} + ThrottleInterval 10 would
+			// respawn-loop this message every ten seconds forever.
+			return nil
 		}
 	}
 
@@ -659,9 +741,6 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 	g.SetVersion(Version)
 	// Install the device-placement policy so the gateway can route "auto"
 	// embedding kinds per request and skip GPU admission for CPU-placed kinds.
-	// Built from the same hardware profile + operator overrides the tuning
-	// module uses, so placement and slot tuning never disagree.
-	pol := tuning.PolicyFor(hwInfo.Profile, cfg)
 	g.SetPlacement(pol, cfg.AutoBatchThreshold)
 	if cfg.GovernorEnabled {
 		g.SetScheduler(startGovernor(ctx, pressure.NewSensor(), cfg, stdout))
@@ -739,7 +818,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 			slots[kind] = s
 			fmt.Fprintf(stdout, "quenchforge: %s slot pid=%d model=%s port=%d\n",
 				name, s.PID(), model, gpuPort)
-			_ = g.SetUpstream(kind, fmt.Sprintf("http://127.0.0.1:%d", gpuPort))
+			registerWhenReady(ctx, name, gpuPort, upstreamSetter(g, kind), stderr)
 			return
 		}
 		// Auto: dual-placed. GPU instance is the primary upstream.
@@ -753,7 +832,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 			slots[kind] = s
 			fmt.Fprintf(stdout, "quenchforge: %s slot (gpu) pid=%d model=%s port=%d\n",
 				name, s.PID(), model, gpuPort)
-			_ = g.SetUpstream(kind, fmt.Sprintf("http://127.0.0.1:%d", gpuPort))
+			registerWhenReady(ctx, name, gpuPort, upstreamSetter(g, kind), stderr)
 		}
 		// CPU instance handles single-request latency traffic.
 		cpuName := name + "-cpu"
@@ -768,16 +847,13 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 			slots[gateway.SlotKind(cpuName)] = s
 			fmt.Fprintf(stdout, "quenchforge: %s slot (cpu) pid=%d model=%s port=%d\n",
 				cpuName, s.PID(), model, cpuPort)
-			_ = g.SetCPUUpstream(kind, fmt.Sprintf("http://127.0.0.1:%d", cpuPort))
+			registerWhenReady(ctx, cpuName, cpuPort, cpuUpstreamSetter(g, kind), stderr)
 		}
 	}
 
-	if !*noSlot {
-		// Chat slot — always-on unless suppressed.
-		modelName := *model
-		if modelName == "" {
-			modelName = cfg.DefaultModel
-		}
+	if !*noSlot && unavailable[gateway.KindChat] == nil {
+		// Chat slot — always-on unless suppressed or its model is absent.
+		modelName := chatModel
 		s, err := startSlot(ctx, cfg, hwInfo, slotSpec{
 			Kind:      gateway.KindChat,
 			Name:      "chat",
@@ -794,8 +870,8 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 			slots[gateway.KindChat] = s
 			fmt.Fprintf(stdout, "quenchforge: chat slot pid=%d model=%s port=%d\n",
 				s.PID(), modelName, cfg.ChatPort)
-			_ = g.SetUpstream(gateway.KindChat,
-				fmt.Sprintf("http://127.0.0.1:%d", cfg.ChatPort))
+			registerWhenReady(ctx, "chat", cfg.ChatPort,
+				upstreamSetter(g, gateway.KindChat), stderr)
 		}
 	}
 	{ // embed/rerank/whisper evaluate independently of --no-slot
@@ -805,7 +881,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 		// --pooling cls is the standard for most BERT-style embedders (added
 		// by startEmbedFamily). Under "auto" placement this brings up a
 		// GPU+CPU pair; otherwise a single policy-placed instance.
-		if cfg.EmbedModel != "" {
+		if cfg.EmbedModel != "" && unavailable[gateway.KindEmbed] == nil {
 			startEmbedFamily(gateway.KindEmbed, "embed", cfg.EmbedModel,
 				cfg.EmbedPort, cfg.EmbedCPUPort)
 		}
@@ -816,14 +892,14 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 		// `model` field equals cfg.CodeEmbedModel. Lets one quenchforge
 		// process serve a general-text embedder (for KB / RAG) alongside
 		// a code-tuned embedder (for semantic-code-search MCPs).
-		if cfg.CodeEmbedModel != "" {
+		if cfg.CodeEmbedModel != "" && unavailable[gateway.KindCodeEmbed] == nil {
 			startEmbedFamily(gateway.KindCodeEmbed, "code-embed", cfg.CodeEmbedModel,
 				cfg.CodeEmbedPort, cfg.CodeEmbedCPUPort)
 		}
 
 		// Rerank slot — opt-in via QUENCHFORGE_RERANK_MODEL. Same
 		// llama-server binary as chat/embed, just --reranking mode.
-		if cfg.RerankModel != "" {
+		if cfg.RerankModel != "" && unavailable[gateway.KindRerank] == nil {
 			s, err := startSlot(ctx, cfg, hwInfo, slotSpec{
 				Kind:      gateway.KindRerank,
 				Name:      "rerank",
@@ -839,8 +915,8 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 				slots[gateway.KindRerank] = s
 				fmt.Fprintf(stdout, "quenchforge: rerank slot pid=%d model=%s port=%d\n",
 					s.PID(), cfg.RerankModel, cfg.RerankPort)
-				_ = g.SetUpstream(gateway.KindRerank,
-					fmt.Sprintf("http://127.0.0.1:%d", cfg.RerankPort))
+				registerWhenReady(ctx, "rerank", cfg.RerankPort,
+					upstreamSetter(g, gateway.KindRerank), stderr)
 			}
 		}
 
@@ -873,8 +949,8 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 					fmt.Fprintf(stdout,
 						"quenchforge: image-gen slot pid=%d model=%s port=%d\n",
 						slot.PID(), cfg.SDModel, cfg.SDPort)
-					_ = g.SetUpstream(gateway.KindImageGen,
-						fmt.Sprintf("http://127.0.0.1:%d", cfg.SDPort))
+					registerWhenReady(ctx, "image-gen", cfg.SDPort,
+						upstreamSetter(g, gateway.KindImageGen), stderr)
 				}
 			}
 		}
@@ -909,8 +985,8 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 					fmt.Fprintf(stdout,
 						"quenchforge: TTS slot pid=%d model=%s port=%d\n",
 						slot.PID(), cfg.BarkModel, cfg.BarkPort)
-					_ = g.SetUpstream(gateway.KindTTS,
-						fmt.Sprintf("http://127.0.0.1:%d", cfg.BarkPort))
+					registerWhenReady(ctx, "tts", cfg.BarkPort,
+						upstreamSetter(g, gateway.KindTTS), stderr)
 				}
 			}
 		}
@@ -952,8 +1028,8 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 					fmt.Fprintf(stdout,
 						"quenchforge: whisper slot pid=%d model=%s port=%d gpu=%v\n",
 						slot.PID(), cfg.WhisperModel, cfg.WhisperPort, cfg.WhisperGPU)
-					_ = g.SetUpstream(gateway.KindWhisper,
-						fmt.Sprintf("http://127.0.0.1:%d", cfg.WhisperPort))
+					registerWhenReady(ctx, "whisper", cfg.WhisperPort,
+						upstreamSetter(g, gateway.KindWhisper), stderr)
 				}
 			}
 		}
@@ -1412,11 +1488,37 @@ var lookPath = func(name string) (string, error) {
 // slotLine renders one slot's doctor row. When the slot's model is unset
 // the line says "(opt-in: set $QUENCHFORGE_*_MODEL to enable)" so an
 // operator can copy a known port and know exactly which env var to flip.
-func slotLine(model string, port int) string {
+//
+// A configured model is cross-checked against the models dir doctor
+// enumerates a few lines below, and marked MISSING when it is not there.
+// Without the cross-check doctor confirmed a broken config as correct —
+// the exact diagnostic the 503 body tells operators to run.
+func slotLine(modelsDir, model string, port int) string {
 	if model == "" {
 		return fmt.Sprintf("(opt-in; port=%d)", port)
 	}
+	if _, err := resolveSlotModel(modelsDir, model); err != nil {
+		return fmt.Sprintf("model=%s port=%d  MISSING — not found under %s (slot will not start)",
+			model, port, modelsDir)
+	}
 	return fmt.Sprintf("model=%s port=%d", model, port)
+}
+
+// unknownGPUNotice is the operator-facing note for a Metal device that
+// matched no tuning bucket. Empty for every recognised profile.
+//
+// The tuning tables are per-card measurements; applying Vega II's numbers to
+// an unbenched card was a silent guess that could force chat onto the CPU and
+// serialise Metal on hardware that needs neither.
+func unknownGPUNotice(info hardware.Info) string {
+	if info.Profile != hardware.ProfileMetalUnknown {
+		return ""
+	}
+	return fmt.Sprintf(
+		"quenchforge: unrecognised Metal GPU %q (%d GB) — running with upstream defaults,\n"+
+			"  no profile tuning applied. Please file a hardware_profile report so this card\n"+
+			"  gets measured defaults: https://github.com/Cerid-AI/quenchforge/issues\n",
+		info.GPU, info.GPUVRAMGB)
 }
 
 // redactPath replaces the user's home dir with "~" when --redacted is set.

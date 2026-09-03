@@ -173,7 +173,17 @@ func (s *Slot) Start(ctx context.Context) error {
 	s.logFile = logFile
 	s.started = time.Now()
 	s.pidPath = filepath.Join(s.PIDDir, s.Name+".pid")
-	if err := writePIDFile(s.pidPath, cmd.Process.Pid); err != nil {
+	// Record the child's identity alongside its PID. Without it the reaper
+	// cannot tell our child from whatever inherits the PID after a crash, and
+	// it refuses to signal what it cannot identify.
+	rec := pidRecord{PID: cmd.Process.Pid}
+	if start, execPath, idErr := processIdentity(rec.PID); idErr == nil {
+		rec.Start, rec.Exec = start, execPath
+	} else {
+		fmt.Fprintf(os.Stderr, "quenchforge: warn: identify %s child pid %d: %v "+
+			"(orphan reaping disabled for this slot)\n", s.Name, rec.PID, idErr)
+	}
+	if err := writePIDRecord(s.pidPath, rec); err != nil {
 		// PID-file write failure is non-fatal — orphan reaper can't clean
 		// up this one if we crash, but the slot itself still works.
 		// Surfacing via a returned error would refuse to start over a
@@ -402,17 +412,20 @@ func (s *Slot) cleanupLocked() {
 // Orphan reaper
 // ---------------------------------------------------------------------------
 
-// ReapOrphans walks pidDir, reads each pidfile, and SIGKILLs the recorded PID
-// if it's still running and has our `quenchforge` ancestor signature. Always
-// removes the pidfile.
+// ReapOrphans walks pidDir, reads each pidfile, and SIGKILLs the recorded
+// process group when — and only when — the running process is provably the
+// child we spawned. Always removes the pidfile.
 //
 // Called at startup so a previous supervisor crash doesn't leave dangling
 // llama-server children chewing GPU memory.
 //
-// We're deliberately permissive about who we kill: if a PID in our pidfile
-// has been reused by an unrelated process, we still skip it because we
-// double-check the command line includes "llama-server" or "whisper-server"
-// before sending the signal.
+// Proof is the (start time, executable path) pair recorded at spawn time. It
+// used to be a substring test over the command line, which matched any
+// process whose argv mentioned "quenchforge" — an operator shell, an editor,
+// a second instance — and the signal goes to the whole process group. macOS
+// recycles PIDs freely and pidfiles survive a crash, so that was a live risk,
+// not a theoretical one. A pidfile without a recorded identity (written by an
+// older build) is never acted on.
 func ReapOrphans(pidDir string) []ReapResult {
 	results := make([]ReapResult, 0)
 	entries, err := os.ReadDir(pidDir)
@@ -424,7 +437,7 @@ func ReapOrphans(pidDir string) []ReapResult {
 			continue
 		}
 		full := filepath.Join(pidDir, e.Name())
-		pid, err := readPIDFile(full)
+		rec, err := readPIDRecord(full)
 		if err != nil {
 			results = append(results, ReapResult{
 				File:   e.Name(),
@@ -435,12 +448,12 @@ func ReapOrphans(pidDir string) []ReapResult {
 			continue
 		}
 
-		res := ReapResult{File: e.Name(), PID: pid}
-		if !pidLooksLikeOurChild(pid) {
+		res := ReapResult{File: e.Name(), PID: rec.PID}
+		if ours, why := pidIsOurChild(rec); !ours {
 			res.Action = "skip"
-			res.Note = "pid not running or not a quenchforge child"
+			res.Note = why
 		} else {
-			if err := signalGroup(pid, syscall.SIGKILL); err == nil {
+			if err := signalGroup(rec.PID, syscall.SIGKILL); err == nil {
 				res.Action = "killed"
 			} else {
 				res.Action = "skip"
@@ -461,40 +474,90 @@ type ReapResult struct {
 	Note   string
 }
 
-// pidLooksLikeOurChild returns true when /proc-style introspection (or ps
-// shell-out on darwin) reports the PID's command line includes a name we
-// recognize. Used by the reaper to avoid blasting unrelated processes.
-func pidLooksLikeOurChild(pid int) bool {
-	if pid <= 1 {
-		return false
+// pidIsOurChild reports whether the process now holding rec.PID is the same
+// process the supervisor recorded, and why not when it isn't. The identity is
+// the (start time, executable path) pair captured at spawn: a recycled PID
+// fails the start-time comparison, and an unrelated process that happens to
+// start at the same second fails the executable comparison.
+//
+// Anything unproven is a skip. The signal this gates is a process-group
+// SIGKILL; a false positive takes out whatever else shares that group.
+func pidIsOurChild(rec pidRecord) (bool, string) {
+	if rec.PID <= 1 {
+		return false, "invalid pid"
 	}
-	cmdline, err := commandLineForPID(pid)
-	if err != nil || cmdline == "" {
-		return false
+	if rec.Start == "" || rec.Exec == "" {
+		return false, "pidfile carries no process identity (older build); refusing to signal"
 	}
-	lower := strings.ToLower(cmdline)
-	return strings.Contains(lower, "llama-server") ||
-		strings.Contains(lower, "whisper-server") ||
-		strings.Contains(lower, "quenchforge")
+	start, execPath, err := processIdentity(rec.PID)
+	if err != nil {
+		return false, "pid not running"
+	}
+	if start != rec.Start {
+		return false, fmt.Sprintf("pid reused: started %q, pidfile recorded %q", start, rec.Start)
+	}
+	if execPath != rec.Exec {
+		return false, fmt.Sprintf("pid reused: running %q, pidfile recorded %q", execPath, rec.Exec)
+	}
+	return true, ""
 }
 
 // ---------------------------------------------------------------------------
 // pidfile helpers
 // ---------------------------------------------------------------------------
 
-func writePIDFile(path string, pid int) error {
-	return os.WriteFile(path, []byte(strconv.Itoa(pid)+"\n"), 0o644)
+// pidRecord is what a pidfile carries: the child's PID plus the identity the
+// reaper needs to prove the PID has not been recycled since.
+type pidRecord struct {
+	PID   int
+	Start string // opaque process start-time token from ps
+	Exec  string // executable path as ps reports it
 }
 
-func readPIDFile(path string) (int, error) {
+// writePIDRecord writes the pidfile as `key=value` lines. The first line is
+// `pid=N` so a human `cat` still answers the obvious question first.
+func writePIDRecord(path string, rec pidRecord) error {
+	body := fmt.Sprintf("pid=%d\nstart=%s\nexec=%s\n", rec.PID, rec.Start, rec.Exec)
+	return os.WriteFile(path, []byte(body), 0o644)
+}
+
+// readPIDRecord parses a pidfile. A bare-number file (written by a build
+// before identity recording) yields a record with an empty identity, which
+// pidIsOurChild refuses to act on.
+func readPIDRecord(path string) (pidRecord, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return 0, err
+		return pidRecord{}, err
 	}
-	s := strings.TrimSpace(string(data))
-	n, err := strconv.Atoi(s)
-	if err != nil {
-		return 0, fmt.Errorf("pidfile %q: %w", path, err)
+	body := strings.TrimSpace(string(data))
+	if !strings.Contains(body, "=") {
+		n, err := strconv.Atoi(body)
+		if err != nil {
+			return pidRecord{}, fmt.Errorf("pidfile %q: %w", path, err)
+		}
+		return pidRecord{PID: n}, nil
 	}
-	return n, nil
+	var rec pidRecord
+	for _, line := range strings.Split(body, "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "pid":
+			n, err := strconv.Atoi(value)
+			if err != nil {
+				return pidRecord{}, fmt.Errorf("pidfile %q: %w", path, err)
+			}
+			rec.PID = n
+		case "start":
+			rec.Start = value
+		case "exec":
+			rec.Exec = value
+		}
+	}
+	if rec.PID == 0 {
+		return pidRecord{}, fmt.Errorf("pidfile %q: no pid", path)
+	}
+	return rec, nil
 }

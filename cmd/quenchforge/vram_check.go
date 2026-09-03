@@ -27,6 +27,7 @@ import (
 
 	"github.com/cerid-ai/quenchforge/internal/config"
 	"github.com/cerid-ai/quenchforge/internal/hardware"
+	"github.com/cerid-ai/quenchforge/internal/placement"
 )
 
 // vramBudget is one slot's contribution to the VRAM total. Captured so
@@ -53,15 +54,21 @@ const (
 	vramSafetyMultiplier = 1.15
 )
 
-// checkVRAMBudget pre-validates that the configured slots will fit in
+// checkVRAMBudget pre-validates that the GPU-placed slots will fit in
 // VRAM. Returns nil if either the check passes OR the host has no
 // Metal GPU (CPU-only paths aren't VRAM-constrained).
 //
-// The check considers chat, embed, rerank, whisper-on-GPU, image-gen,
-// and TTS slots — every workload that would land model weights on the
-// GPU. It does NOT verify llama-server's actual VRAM usage at runtime;
-// for that we'd need an iperf-style probe which Metal doesn't expose.
-func checkVRAMBudget(cfg config.Config, hwInfo hardware.Info, w io.Writer) error {
+// The check considers the four GGUF slots — chat, embed, code-embed and
+// rerank — and only those the placement policy actually puts on the GPU. On
+// AMD-discrete the default policy routes chat and rerank to the CPU, so their
+// weights never enter the VRAM budget; counting them refused configurations
+// that run fine on small cards. whisper / sd / bark load through different
+// binaries with different memory shapes and keep their own launch-failure
+// path.
+//
+// It does NOT verify llama-server's actual VRAM usage at runtime; for that
+// we'd need an iperf-style probe which Metal doesn't expose.
+func checkVRAMBudget(cfg config.Config, hwInfo hardware.Info, pol placement.Policy, w io.Writer) error {
 	if !hwInfo.HasMetal {
 		// CPU-only path. No VRAM constraint.
 		return nil
@@ -77,19 +84,35 @@ func checkVRAMBudget(cfg config.Config, hwInfo hardware.Info, w io.Writer) error
 	var budgets []vramBudget
 	var totalBytes int64
 
+	// incomplete records that the budget is missing a slot, so a partial
+	// sum never gets printed as an unqualified "VRAM check OK".
+	incomplete := false
+
 	addSlot := func(slotName, modelName string) {
 		if modelName == "" {
 			return
 		}
+		if pol.Mode(slotName) == placement.ModeCPU {
+			// CPU-placed: the weights never land in VRAM. "auto" kinds still
+			// count — they launch a GPU instance alongside the CPU one.
+			fmt.Fprintf(w, "quenchforge: VRAM check: %s slot is CPU-placed; excluded from the GPU budget\n", slotName)
+			return
+		}
 		path, err := resolveModelPath(cfg.ModelsDir, modelName)
 		if err != nil {
-			// Model isn't actually present — leave the error to the
-			// per-slot startSlot path which has the right context.
-			// Don't include unknown-size models in the budget.
+			// The model is absent. Say so: silently dropping it from the sum
+			// is how the pre-flight came to print "VRAM check OK" for a
+			// configuration that cannot start.
+			incomplete = true
+			fmt.Fprintf(w, "quenchforge: VRAM check: %s slot model %q not found under %s — excluded from the budget\n",
+				slotName, modelName, cfg.ModelsDir)
 			return
 		}
 		info, err := os.Stat(path)
 		if err != nil {
+			incomplete = true
+			fmt.Fprintf(w, "quenchforge: VRAM check: %s slot model %q is unreadable (%v) — excluded from the budget\n",
+				slotName, modelName, err)
 			return
 		}
 		b := vramBudget{
@@ -102,15 +125,19 @@ func checkVRAMBudget(cfg config.Config, hwInfo hardware.Info, w io.Writer) error
 		totalBytes += b.bytes
 	}
 
-	addSlot("chat", cfg.DefaultModel)
-	addSlot("embed", cfg.EmbedModel)
-	addSlot("rerank", cfg.RerankModel)
+	// Slot names are the placement kind keys (placement.KindChat etc.) so the
+	// policy lookup in addSlot stays honest.
+	addSlot(placement.KindChat, cfg.DefaultModel)
+	addSlot(placement.KindEmbed, cfg.EmbedModel)
+	addSlot(placement.KindCodeEmbed, cfg.CodeEmbedModel)
+	addSlot(placement.KindRerank, cfg.RerankModel)
 	// whisper/sd/bark are different binaries with different memory
 	// shapes — skip from the simple GGUF-based budget. They have their
 	// own per-binary launch failure path if they don't fit.
 
 	if len(budgets) == 0 {
-		// No slots configured (--no-slot, or all opt-in vars empty).
+		// Nothing lands on the GPU: --no-slot, all opt-in vars empty, every
+		// configured kind CPU-placed, or every model absent.
 		return nil
 	}
 
@@ -122,10 +149,12 @@ func checkVRAMBudget(cfg config.Config, hwInfo hardware.Info, w io.Writer) error
 	vramBytes := int64(hwInfo.GPUVRAMGB) * (1 << 30)
 
 	if adjustedBytes <= vramBytes {
-		// Fits — log a friendly summary so operators can see the
-		// budget breakdown.
-		fmt.Fprintf(w, "quenchforge: VRAM check OK — %s configured, %s available on %s\n",
-			humanBytes(adjustedBytes), humanBytes(vramBytes), hwInfo.GPU)
+		verdict := "VRAM check OK"
+		if incomplete {
+			verdict = "VRAM check INCOMPLETE (see the excluded slots above)"
+		}
+		fmt.Fprintf(w, "quenchforge: %s — %s configured, %s available on %s\n",
+			verdict, humanBytes(adjustedBytes), humanBytes(vramBytes), hwInfo.GPU)
 		return nil
 	}
 
@@ -142,7 +171,7 @@ func checkVRAMBudget(cfg config.Config, hwInfo hardware.Info, w io.Writer) error
 			b.slotName, humanBytes(b.bytes), filepath.Base(b.modelPath))
 	}
 	fmt.Fprintln(&sb)
-	fmt.Fprintln(&sb, "  to fix, either:")
+	fmt.Fprintln(&sb, "  quenchforge is exiting without starting any slot. To fix, either:")
 	fmt.Fprintln(&sb, "    - unset one slot's model env var (e.g. `unset QUENCHFORGE_RERANK_MODEL`)")
 	fmt.Fprintln(&sb, "    - swap to a smaller model (`quenchforge pull --list` shows sizes)")
 	fmt.Fprintln(&sb, "    - reduce --ctx-size (lower KV cache footprint)")

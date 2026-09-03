@@ -657,3 +657,32 @@ func TestKernelParams_UnknownKindsAreEmpty(t *testing.T) {
 		})
 	}
 }
+
+// An unrecognised Metal GPU gets upstream defaults, not the AMD-discrete
+// tuning derived from a Vega II. The AMD Metal-correctness gating lives in
+// the patch series (device-property driven); the profile tuning is sizing,
+// and sizing a card we have never benched is a guess.
+func TestKernelParams_UnknownMetalProfileGetsNoAMDTuning(t *testing.T) {
+	cfg := config.Config{MaxContext: 8192, MetalNCB: 2}
+	for _, kind := range []gateway.SlotKind{gateway.KindChat, gateway.KindEmbed, gateway.KindRerank} {
+		tn := KernelParams(hardware.ProfileMetalUnknown, 32, kind, cfg)
+		if tn.MetalConcurrencyDisable {
+			t.Errorf("%s: MetalConcurrencyDisable set for an unbenched GPU", kind)
+		}
+		if tn.ContextSize != 0 {
+			t.Errorf("%s: context capped to %d from a VRAM tier we never measured", kind, tn.ContextSize)
+		}
+		if containsFlag(tn.ExtraArgs, "--gpu-layers") {
+			t.Errorf("%s: unexpected placement override %v", kind, tn.ExtraArgs)
+		}
+	}
+}
+
+func containsFlag(args []string, flag string) bool {
+	for _, a := range args {
+		if a == flag {
+			return true
+		}
+	}
+	return false
+}

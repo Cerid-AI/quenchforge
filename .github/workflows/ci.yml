@@ -13,6 +13,9 @@ on:
       - 'docs/**'
       - '**/*.md'
       - 'LICENSE'
+  # The hardware gate also runs for the merge queue, so a PR that went stale
+  # behind another merge is re-verified against the code that actually lands.
+  merge_group:
 
 # Cancel superseded runs on the same branch (saves CI minutes when several
 # pushes land back-to-back). Canonical form per global GH Actions cost policy.
@@ -57,6 +60,9 @@ jobs:
 
       - name: go vet
         run: go vet ./...
+
+      - name: release artifacts are all notarized
+        run: bash scripts/check-release-artifacts.sh
 
       # NB: no `go mod tidy` drift gate yet. The MVP is stdlib-only so
       # there's nothing for tidy to manage; we'll add the gate when Olla
@@ -147,10 +153,18 @@ jobs:
   # /v1/chat/completions through the gateway, asserts the output isn't
   # garbage tokens. See docs/SELF_HOSTED_RUNNER.md.
   #
-  # `continue-on-error: true` because the runner is a single machine;
-  # if it's offline (maintenance, OS update, hardware fault) the rest
-  # of CI shouldn't block. The rebase-upstream workflow has its own
-  # hard gate against this same test path.
+  # This is the gate CLAUDE.md absolute rule 5 describes, so it fails the
+  # run. It used to carry `continue-on-error: true`, which made the only
+  # test that distinguishes correct Metal output from the garbage-token
+  # signature the project exists to prevent purely advisory.
+  #
+  # When the runner is offline the job fails and the PR waits — that is the
+  # intended trade for a hardware gate on a single machine. The escape
+  # hatch is the maintainer re-running or temporarily dropping the required
+  # check in branch protection, not a workflow that cannot fail.
+  #
+  # rebase-upstream.yml has no test step of its own: it opens a PR labelled
+  # `needs-hw-verify`, and that PR is gated by this job like any other.
   # ------------------------------------------------------------------
   amd-gpu-integration:
     needs: [lint]
@@ -162,19 +176,42 @@ jobs:
       (github.actor != 'dependabot[bot]' ||
         contains(github.event.pull_request.labels.*.name, 'dependabot-full-ci'))
     runs-on: [self-hosted, amd-gpu]
-    continue-on-error: true
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: build patched llama-server (if missing)
+      # The runner is a persistent launchd service and actions/checkout does
+      # not clean submodule working trees, so the binary from the first-ever
+      # run survives every later run. Keying the rebuild on "does a binary
+      # exist" meant a changed patch series was never re-applied and the gate
+      # tested the previous build. Key it on the inputs instead: the patch
+      # series plus the scripts that apply and build it.
+      - name: build patched llama-server (when the patch series changes)
         run: |
-          if [ ! -x llama.cpp/build-x86_64/bin/llama-server ] && [ ! -x llama.cpp/build-arm64/bin/llama-server ]; then
-            bash scripts/apply-patches.sh
-            bash scripts/build-llama.sh
+          set -euo pipefail
+          stamp=llama.cpp/.quenchforge-build-stamp
+          want="$(cat $(find patches -name '*.patch' -not -path '*/drafts/*' | sort)                       scripts/apply-patches.sh scripts/build-llama.sh |
+                  shasum -a 256 | awk '{print $1}')"
+          have="$(cat "$stamp" 2>/dev/null || echo none)"
+          bin=""
+          for candidate in llama.cpp/build-x86_64/bin/llama-server llama.cpp/build-arm64/bin/llama-server; do
+            [ -x "$candidate" ] && bin="$candidate"
+          done
+          if [ -n "$bin" ] && [ "$want" = "$have" ]; then
+            echo "llama-server is current for patch series $want ($bin)"
+            exit 0
           fi
+          echo "rebuilding llama-server: patch series $want (stamp: $have)"
+          rm -f "$stamp"
+          bash scripts/apply-patches.sh --reset
+          bash scripts/apply-patches.sh
+          bash scripts/build-llama.sh
+          echo "$want" > "$stamp"
 
+      # No TEST_MODEL_PATH fallback here: the harness fails when no model is
+      # present rather than skipping, so a wiped model cache cannot turn the
+      # correctness assertion into a green run that proves nothing.
       - name: integration test (amd_gpu tag)
-        run: go test -tags=amd_gpu -timeout 5m -count=1 ./tests/integration/...
+        run: go test -tags=amd_gpu -timeout 10m -count=1 ./tests/integration/...
