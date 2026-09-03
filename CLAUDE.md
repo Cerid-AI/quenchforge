@@ -28,11 +28,19 @@ become a generic inference framework.
    Apple Silicon and Intel Mac are the only targets. If a PR adds non-Darwin
    code, the answer is no.
 3. **Minimise the patch surface.** The patch series is exactly the
-   load-bearing change(s) in `patches/<submodule>/`. As of 2026-07-08 that is:
+   load-bearing change(s) in `patches/<submodule>/`. As of 2026-07-08 that is
+   eight patches across four submodules:
    - `llama.cpp`: `0001-metal-correctness-on-non-apple-silicon` +
      `0002-metal-staging-buffer-pool` + `0003-metal-amd-bert-fallback-kernels`
      + `0004-metal-amd-bert-matmul-fallback` (0003/0004 un-parked and
      correctness-validated on Vega II 2026-07-08 — roadmap R1)
+     + `0005-metal-serial-dispatch-non-uma` (concurrent Metal dispatch flips
+     BERT embedding determinism from cos_sim 1.000000 to ~0.117 on non-UMA
+     devices; 0005 defaults `use_concurrency` to false when
+     `has_unified_memory == false`, with `GGML_METAL_CONCURRENCY_FORCE=1` to
+     opt back in. Rationale in `patches/README.md` § patch 0005; upstream
+     target is the [`ggml-org/llama.cpp#19563`](https://github.com/ggml-org/llama.cpp/issues/19563)
+     thread the `0001` patches already track)
    - `whisper.cpp`, `sd.cpp`, `bark.cpp`: `0001-metal-correctness-on-non-apple-silicon` each
    `GGML_METAL_N_CB` is set via env, not a code patch. Adding any new patch
    requires a written rationale in `patches/README.md`, a public upstream
