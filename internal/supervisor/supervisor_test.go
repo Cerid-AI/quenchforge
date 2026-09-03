@@ -238,15 +238,15 @@ func TestStopOnUnstartedSlotIsNoOp(t *testing.T) {
 func TestPIDFileRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.pid")
-	if err := writePIDFile(path, 12345); err != nil {
-		t.Fatalf("writePIDFile: %v", err)
+	if err := writePIDRecord(path, pidRecord{PID: 12345, Start: "start-token", Exec: "/bin/true"}); err != nil {
+		t.Fatalf("writePIDRecord: %v", err)
 	}
-	pid, err := readPIDFile(path)
+	rec, err := readPIDRecord(path)
 	if err != nil {
-		t.Fatalf("readPIDFile: %v", err)
+		t.Fatalf("readPIDRecord: %v", err)
 	}
-	if pid != 12345 {
-		t.Errorf("readPIDFile: got %d, want 12345", pid)
+	if rec.PID != 12345 {
+		t.Errorf("readPIDRecord: got %d, want 12345", rec.PID)
 	}
 }
 
@@ -256,8 +256,8 @@ func TestReadPIDFileBadContent(t *testing.T) {
 	if err := os.WriteFile(path, []byte("not a number"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readPIDFile(path); err == nil {
-		t.Error("readPIDFile: want error on non-numeric content")
+	if _, err := readPIDRecord(path); err == nil {
+		t.Error("readPIDRecord: want error on non-numeric content")
 	}
 }
 
@@ -272,7 +272,7 @@ func TestReapOrphansHandlesMissingDir(t *testing.T) {
 func TestReapOrphansHandlesStaleNonMatchingPID(t *testing.T) {
 	pidDir := t.TempDir()
 	// Use PID 1 (init) — not a quenchforge child, must be skipped.
-	if err := writePIDFile(filepath.Join(pidDir, "stale.pid"), 1); err != nil {
+	if err := writePIDRecord(filepath.Join(pidDir, "stale.pid"), pidRecord{PID: 1}); err != nil {
 		t.Fatal(err)
 	}
 	res := ReapOrphans(pidDir)
