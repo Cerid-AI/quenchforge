@@ -667,6 +667,19 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 			hwInfo.Profile)
 	}
 
+	// The effective chat model is resolved here rather than at the spawn
+	// site so the configured-slot pre-flight below sees the same value the
+	// chat slot will load.
+	chatModel := *model
+	if chatModel == "" {
+		chatModel = cfg.DefaultModel
+	}
+
+	// Configured-slot pre-flight. A slot whose model is absent cannot serve;
+	// report it as an error naming the lane and the fix, and skip the spawn
+	// so no upstream is registered for a lane that will never answer.
+	unavailable := preflightSlotModels(cfg, chatModel, !*noSlot, stderr)
+
 	// VRAM pre-flight (v0.4.0). Refuse to spawn slots whose combined
 	// model weights would over-subscribe VRAM. Operator-friendly error
 	// is better than three Metal-load failures in a row.
@@ -809,12 +822,9 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 		}
 	}
 
-	if !*noSlot {
-		// Chat slot — always-on unless suppressed.
-		modelName := *model
-		if modelName == "" {
-			modelName = cfg.DefaultModel
-		}
+	if !*noSlot && unavailable[gateway.KindChat] == nil {
+		// Chat slot — always-on unless suppressed or its model is absent.
+		modelName := chatModel
 		s, err := startSlot(ctx, cfg, hwInfo, slotSpec{
 			Kind:      gateway.KindChat,
 			Name:      "chat",
@@ -870,7 +880,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 		// --pooling cls is the standard for most BERT-style embedders (added
 		// by startEmbedFamily). Under "auto" placement this brings up a
 		// GPU+CPU pair; otherwise a single policy-placed instance.
-		if cfg.EmbedModel != "" {
+		if cfg.EmbedModel != "" && unavailable[gateway.KindEmbed] == nil {
 			startEmbedFamily(gateway.KindEmbed, "embed", cfg.EmbedModel,
 				cfg.EmbedPort, cfg.EmbedCPUPort)
 		}
@@ -881,14 +891,14 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 		// `model` field equals cfg.CodeEmbedModel. Lets one quenchforge
 		// process serve a general-text embedder (for KB / RAG) alongside
 		// a code-tuned embedder (for semantic-code-search MCPs).
-		if cfg.CodeEmbedModel != "" {
+		if cfg.CodeEmbedModel != "" && unavailable[gateway.KindCodeEmbed] == nil {
 			startEmbedFamily(gateway.KindCodeEmbed, "code-embed", cfg.CodeEmbedModel,
 				cfg.CodeEmbedPort, cfg.CodeEmbedCPUPort)
 		}
 
 		// Rerank slot — opt-in via QUENCHFORGE_RERANK_MODEL. Same
 		// llama-server binary as chat/embed, just --reranking mode.
-		if cfg.RerankModel != "" {
+		if cfg.RerankModel != "" && unavailable[gateway.KindRerank] == nil {
 			s, err := startSlot(ctx, cfg, hwInfo, slotSpec{
 				Kind:      gateway.KindRerank,
 				Name:      "rerank",
