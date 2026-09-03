@@ -155,6 +155,12 @@ curl http://127.0.0.1:11434/   # verify
 
 Release binaries are signed with a Developer ID and Apple-notarized.
 
+### Upgrading
+
+`brew upgrade quenchforge` and restart the LaunchAgent. Version-specific
+notes — including what the v0.11.0 restart does to slots left running by an
+older build — are in [docs/UPGRADE.md](docs/UPGRADE.md).
+
 ### Coexistence with Ollama.app
 
 Quenchforge listens on `127.0.0.1:11434` — the same port as Ollama. If

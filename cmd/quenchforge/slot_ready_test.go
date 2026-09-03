@@ -8,6 +8,11 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -87,7 +92,7 @@ func TestRegisterWhenReady_HoldsRegistrationUntilTheSlotAcceptsConnections(t *te
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var out syncBuffer
-	registerWhenReady(ctx, "rerank", port, set, &out)
+	registerWhenReady(ctx, "rerank", port, "", set, &out)
 
 	time.Sleep(120 * time.Millisecond)
 	if n := seen(); n != 0 {
@@ -134,7 +139,7 @@ func TestRegisterWhenReady_ReportsSetterErrors(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var out syncBuffer
-	registerWhenReady(ctx, "embed", port, func(string) error {
+	registerWhenReady(ctx, "embed", port, "", func(string) error {
 		return fmt.Errorf("bad upstream")
 	}, &out)
 
@@ -147,5 +152,109 @@ func TestRegisterWhenReady_ReportsSetterErrors(t *testing.T) {
 	}
 	if got := out.String(); got == "" {
 		t.Errorf("a rejected upstream registration must be reported, not discarded")
+	}
+}
+
+// modelServer stands in for whatever is listening on a slot port: a
+// llama-server that answers /v1/models with the model it loaded. Returns the
+// port it listens on.
+func modelServer(t *testing.T, servedModel string) int {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/models" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"object":"list","data":[{"id":%q,"object":"model"}]}`, servedModel)
+	}))
+	t.Cleanup(srv.Close)
+	u, err := url.Parse(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return port
+}
+
+// TestRegisterWhenReady_DoesNotAdoptAProcessServingAnotherModel is the
+// upgrade hazard: an orphaned llama-server from the previous run still holds
+// the slot port, so the slot we just spawned never bound it. TCP accept alone
+// says "ready", and registering that upstream points the lane's live traffic
+// at a stale process serving the previous model while /health reports ok.
+func TestRegisterWhenReady_DoesNotAdoptAProcessServingAnotherModel(t *testing.T) {
+	prev := slotReadyPoll
+	slotReadyPoll = 20 * time.Millisecond
+	defer func() { slotReadyPoll = prev }()
+	t.Setenv("QUENCHFORGE_SLOT_READY_TIMEOUT_SEC", "1")
+
+	port := modelServer(t, "/models/llama3.1-8b-instruct-q4_k_m.gguf")
+
+	var mu sync.Mutex
+	var registered []string
+	set := func(u string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		registered = append(registered, u)
+		return nil
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var out syncBuffer
+	registerWhenReady(ctx, "chat", port, "qwen2.5-7b-instruct-q4_k_m.gguf", set, &out)
+
+	time.Sleep(1500 * time.Millisecond)
+	mu.Lock()
+	got := append([]string(nil), registered...)
+	mu.Unlock()
+	if len(got) != 0 {
+		t.Fatalf("registered %v as the chat upstream — that port is held by a process "+
+			"serving llama3.1-8b, not the model this slot was started with", got)
+	}
+	if !strings.Contains(out.String(), "llama3.1-8b-instruct-q4_k_m") {
+		t.Errorf("the refusal must name the model the port actually serves; log was %q", out.String())
+	}
+}
+
+// TestRegisterWhenReady_RegistersOnceTheSlotReportsItsModel is the vacuity
+// guard: the readiness check must still register a slot that is serving the
+// model it was started with, under every spelling of that model's name.
+func TestRegisterWhenReady_RegistersOnceTheSlotReportsItsModel(t *testing.T) {
+	prev := slotReadyPoll
+	slotReadyPoll = 20 * time.Millisecond
+	defer func() { slotReadyPoll = prev }()
+
+	port := modelServer(t, "/Users/op/.quenchforge/models/qwen2.5-7b-instruct-q4_k_m.gguf")
+
+	var mu sync.Mutex
+	var registered []string
+	set := func(u string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		registered = append(registered, u)
+		return nil
+	}
+	seen := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(registered)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var out syncBuffer
+	registerWhenReady(ctx, "chat", port, "qwen2.5:7b", set, &out)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && seen() == 0 {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if seen() != 1 {
+		t.Fatalf("want one registration for a slot serving the model it was started with, got %d (log: %s)",
+			seen(), out.String())
 	}
 }
