@@ -934,6 +934,7 @@ func (g *Gateway) handleTags(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	loaded := g.loadedModels(r.Context())
 	// Ollama returns: {"models": [{"name", "modified_at", "size", "digest", ...}]}
 	out := make([]map[string]any, 0, len(models))
 	for _, m := range models {
@@ -943,9 +944,142 @@ func (g *Gateway) handleTags(w http.ResponseWriter, r *http.Request) {
 			"modified_at": m.ModifiedAt.Format(time.RFC3339),
 			"size":        m.SizeBytes,
 			"digest":      m.Digest,
+			"loaded":      anyModelMatches(loaded, m.Name),
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"models": out})
+}
+
+// slotModelProbeTimeout bounds one /v1/models probe, and
+// slotModelProbeRetry is how long a failed probe is cached before we ask
+// again — a slot that was still loading its model when we first asked must
+// not stay "unknown" for the life of the process.
+const (
+	slotModelProbeTimeout = 2 * time.Second
+	slotModelProbeRetry   = 30 * time.Second
+)
+
+// servedModel returns the model name a slot reports as loaded, probed from
+// the upstream's OpenAI /v1/models and cached until the kind is
+// re-registered. Returns "" when the slot cannot be asked (still loading, or
+// an upstream that does not implement the route); callers must read that as
+// "no opinion", never as a mismatch.
+func (g *Gateway) servedModel(ctx context.Context, kind SlotKind, entry upstreamEntry) string {
+	g.mu.RLock()
+	cached, ok := g.slotModels[kind]
+	g.mu.RUnlock()
+	if ok && (cached.model != "" || time.Since(cached.at) < slotModelProbeRetry) {
+		return cached.model
+	}
+	model := probeUpstreamModel(ctx, entry.url)
+	g.mu.Lock()
+	// Only cache against the registration we probed: SetUpstream drops the
+	// cache on re-registration, and a probe racing one must not resurrect a
+	// name from the previous process.
+	if cur, still := g.upstreams[kind]; still && cur.url != nil && entry.url != nil &&
+		cur.url.String() == entry.url.String() {
+		g.slotModels[kind] = probedModel{model: model, at: time.Now()}
+	}
+	g.mu.Unlock()
+	return model
+}
+
+// loadedModels is the set of models the registered slots are serving.
+func (g *Gateway) loadedModels(ctx context.Context) []string {
+	var out []string
+	for _, kind := range knownSlotKinds {
+		entry, ok := g.lookupUpstream(kind)
+		if !ok {
+			continue
+		}
+		if m := g.servedModel(ctx, kind, entry); m != "" {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// probeUpstreamModel asks a llama-server-style upstream which model it has
+// loaded. Best-effort: any failure returns "".
+func probeUpstreamModel(ctx context.Context, u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(ctx, slotModelProbeTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		strings.TrimRight(u.String(), "/")+"/v1/models", nil)
+	if err != nil {
+		return ""
+	}
+	resp, err := translateHTTPClient.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	var body struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&body); err != nil {
+		return ""
+	}
+	if len(body.Data) == 0 {
+		return ""
+	}
+	return body.Data[0].ID
+}
+
+// modelsMatch reports whether a requested model name refers to the model a
+// slot has loaded. One model reaches the gateway under three spellings —
+// Ollama-style "qwen2.5:7b-instruct-q4_k_m", the GGUF filename
+// "qwen2.5-7b-instruct-q4_k_m.gguf", and shorthand "qwen2.5:7b" — so the
+// comparison normalises separators and accepts a shorthand that is a
+// component-boundary prefix of the loaded name. It does not accept an
+// unrelated name; catching that is the point.
+func modelsMatch(requested, served string) bool {
+	rq, sv := normalizeModelName(requested), normalizeModelName(served)
+	if rq == "" || sv == "" {
+		return true // nothing to compare against — no opinion
+	}
+	if rq == sv {
+		return true
+	}
+	return isModelPrefix(rq, sv) || isModelPrefix(sv, rq)
+}
+
+// anyModelMatches reports whether name is one of the served models.
+func anyModelMatches(served []string, name string) bool {
+	for _, s := range served {
+		if s != "" && modelsMatch(name, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// isModelPrefix reports whether short is a component-boundary prefix of
+// long ("qwen2.5-7b" of "qwen2.5-7b-instruct-q4-k-m", but not "qwen2.5-7"
+// of it).
+func isModelPrefix(short, long string) bool {
+	return len(short) < len(long) && strings.HasPrefix(long, short) && long[len(short)] == '-'
+}
+
+// normalizeModelName folds the spellings of one model onto a single key:
+// lowercased, no directory prefix, no ".gguf" suffix, and ':' / '_' / ' '
+// collapsed to '-'.
+func normalizeModelName(name string) string {
+	n := strings.ToLower(strings.TrimSpace(name))
+	n = strings.TrimSuffix(n, ".gguf")
+	if i := strings.LastIndex(n, "/"); i >= 0 {
+		n = n[i+1:]
+	}
+	n = strings.NewReplacer(":", "-", "_", "-", " ", "-").Replace(n)
+	return strings.Trim(n, "-")
 }
 
 // proxyHandler returns an http.HandlerFunc that reverse-proxies to the
@@ -1085,28 +1219,38 @@ func (s *statusRecorder) Flush() {
 // resolveEmbedKind picks the embed slot kind for an inbound request by
 // matching the request's `model` field against Config.CodeEmbedModel.
 //
-//   - Empty CodeEmbedModel  → always KindEmbed (legacy single-slot behavior).
+//   - Empty CodeEmbedModel  → KindEmbed (legacy single-slot behavior).
 //   - model == CodeEmbedModel and a KindCodeEmbed upstream is registered →
 //     KindCodeEmbed.
+//   - model == CodeEmbedModel and no code-embed upstream → KindEmbed, demoted.
 //   - Anything else → KindEmbed.
 //
-// The fallback to KindEmbed is deliberate: if an operator typo'd the code
-// model name or the code-embed slot failed to register, callers still get
-// a working general-text response instead of a 503 they can't diagnose.
-func (g *Gateway) resolveEmbedKind(model string) SlotKind {
+// demoted is true for the third case: the caller asked for the code model
+// by name and quenchforge cannot serve it. It used to fall through to the
+// general-text embedder — but vectors from a different model live in a
+// different space, so the caller does not get "a working response", it gets
+// silently unusable numbers that poison whatever index it writes them to.
+// Callers must refuse the request instead.
+func (g *Gateway) resolveEmbedKind(model string) (kind SlotKind, demoted bool) {
 	if g.cfg.CodeEmbedModel == "" || model == "" {
-		return KindEmbed
+		return KindEmbed, false
 	}
 	if model != g.cfg.CodeEmbedModel {
-		return KindEmbed
+		return KindEmbed, false
 	}
-	g.mu.RLock()
-	_, ok := g.upstreams[KindCodeEmbed]
-	g.mu.RUnlock()
-	if !ok {
-		return KindEmbed
+	if _, ok := g.lookupUpstream(KindCodeEmbed); !ok {
+		return KindEmbed, true
 	}
-	return KindCodeEmbed
+	return KindCodeEmbed, false
+}
+
+// codeEmbedUnavailable is the 503 body for a code-embed request the gateway
+// refuses to answer from the general-text slot.
+func (g *Gateway) codeEmbedUnavailable(model string) string {
+	return fmt.Sprintf("no %s slot configured for model %q — refusing to answer from the %s slot, "+
+		"whose vectors are from a different model in a different embedding space. "+
+		"Set QUENCHFORGE_CODE_EMBED_MODEL and check `quenchforge doctor` for slot status.",
+		KindCodeEmbed, model, KindEmbed)
 }
 
 // handleOpenAIEmbeddings is the OpenAI-native /v1/embeddings entry point.
@@ -1130,12 +1274,15 @@ func (g *Gateway) handleOpenAIEmbeddings() http.HandlerFunc {
 			Input interface{} `json:"input"`
 		}
 		_ = json.Unmarshal(raw, &probe) // tolerate empty/invalid bodies; let upstream reject
-		kind := g.resolveEmbedKind(probe.Model)
+		kind, demoted := g.resolveEmbedKind(probe.Model)
+		if demoted {
+			writeJSONError(w, http.StatusServiceUnavailable, g.codeEmbedUnavailable(probe.Model))
+			return
+		}
 		batchN := countEmbedInputs(probe.Input, "")
 		entry, onGPU, track, ok := g.routeEmbed(kind, batchN)
 		if !ok {
-			writeJSONError(w, http.StatusServiceUnavailable,
-				fmt.Sprintf("no %s slot configured. Check `quenchforge doctor` for status.", kind))
+			writeJSONError(w, http.StatusServiceUnavailable, g.unavailableReason(kind))
 			return
 		}
 		// Re-attach the consumed body so the reverse-proxy can forward it.

@@ -248,6 +248,21 @@ func (g *Gateway) handleOllamaChat(generateMode bool) http.HandlerFunc {
 			return
 		}
 
+		// The chat slot serves exactly one model and llama-server ignores
+		// the `model` field, so forwarding a mismatched pin verbatim means
+		// answering with a DIFFERENT model than the caller asked for, under
+		// the caller's own label. Refuse instead, naming what is loaded.
+		if model != "" {
+			if served := g.servedModel(r.Context(), KindChat, entry); served != "" &&
+				!modelsMatch(model, served) {
+				writeJSONError(w, http.StatusBadRequest, fmt.Sprintf(
+					"model %q is not loaded: the chat slot is serving %q. "+
+						"Request that model, or start quenchforge with the model you want.",
+					model, served))
+				return
+			}
+		}
+
 		// Translate options.* → OpenAI top-level fields. Anything we don't
 		// recognize is dropped — llama-server rejects unknown fields, and
 		// the alternative (forwarding raw) breaks more than it fixes.
@@ -363,12 +378,15 @@ func (g *Gateway) handleOllamaEmbeddings() http.HandlerFunc {
 			return
 		}
 
-		kind := g.resolveEmbedKind(req.Model)
+		kind, demoted := g.resolveEmbedKind(req.Model)
+		if demoted {
+			writeJSONError(w, http.StatusServiceUnavailable, g.codeEmbedUnavailable(req.Model))
+			return
+		}
 		batchN := countEmbedInputs(req.Input, req.Prompt)
 		entry, onGPU, track, ok := g.routeEmbed(kind, batchN)
 		if !ok {
-			writeJSONError(w, http.StatusServiceUnavailable,
-				fmt.Sprintf("no %s slot configured. Check `quenchforge doctor` for status.", kind))
+			writeJSONError(w, http.StatusServiceUnavailable, g.unavailableReason(kind))
 			return
 		}
 

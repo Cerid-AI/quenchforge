@@ -280,6 +280,15 @@ func TestChatProxiesToUpstreamWhenSet(t *testing.T) {
 func TestSlotKindRouting(t *testing.T) {
 	var chatHits, embedHits int
 	chatUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/models" {
+			// Capability probe (which model is loaded), not a routed
+			// inference call — don't count it.
+			writeJSON(w, http.StatusOK, map[string]any{
+				"object": "list",
+				"data":   []map[string]any{{"id": "x", "object": "model"}},
+			})
+			return
+		}
 		chatHits++
 		// Return a minimal OpenAI-shape body so the translator can
 		// fold it back into Ollama wire when needed.
