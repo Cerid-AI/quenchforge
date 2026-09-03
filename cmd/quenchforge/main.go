@@ -216,16 +216,16 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) error {
 		sdModel, sdPort = mergeLiveSlot(live["imagegen"], sdModel, sdPort)
 		barkModel, barkPort = mergeLiveSlot(live["tts"], barkModel, barkPort)
 	}
-	fmt.Fprintf(stdout, "  chat:         model=%s port=%d\n", chatModel, chatPort)
-	fmt.Fprintf(stdout, "  embed:        %s\n", slotLine(embedModel, embedPort))
+	fmt.Fprintf(stdout, "  chat:         %s\n", slotLine(cfg.ModelsDir, chatModel, chatPort))
+	fmt.Fprintf(stdout, "  embed:        %s\n", slotLine(cfg.ModelsDir, embedModel, embedPort))
 	fmt.Fprintf(stdout, "  code-embed:   %s   (routed by request model == cfg.CodeEmbedModel)\n",
-		slotLine(codeEmbedModel, codeEmbedPort))
+		slotLine(cfg.ModelsDir, codeEmbedModel, codeEmbedPort))
 	fmt.Fprintf(stdout, "  background:   %s   (routed by request model == cfg.BackgroundModel)\n",
-		slotLine(backgroundModel, backgroundPort))
-	fmt.Fprintf(stdout, "  rerank:       %s\n", slotLine(rerankModel, rerankPort))
-	fmt.Fprintf(stdout, "  whisper:      %s\n", slotLine(whisperModel, whisperPort))
-	fmt.Fprintf(stdout, "  imagegen (sd):%s\n", slotLine(sdModel, sdPort))
-	fmt.Fprintf(stdout, "  tts (bark):   %s\n", slotLine(barkModel, barkPort))
+		slotLine(cfg.ModelsDir, backgroundModel, backgroundPort))
+	fmt.Fprintf(stdout, "  rerank:       %s\n", slotLine(cfg.ModelsDir, rerankModel, rerankPort))
+	fmt.Fprintf(stdout, "  whisper:      %s\n", slotLine(cfg.ModelsDir, whisperModel, whisperPort))
+	fmt.Fprintf(stdout, "  imagegen (sd):%s\n", slotLine(cfg.ModelsDir, sdModel, sdPort))
+	fmt.Fprintf(stdout, "  tts (bark):   %s\n", slotLine(cfg.ModelsDir, barkModel, barkPort))
 	fmt.Fprintln(stdout)
 
 	// llama-server binary check
@@ -1489,9 +1489,18 @@ var lookPath = func(name string) (string, error) {
 // slotLine renders one slot's doctor row. When the slot's model is unset
 // the line says "(opt-in: set $QUENCHFORGE_*_MODEL to enable)" so an
 // operator can copy a known port and know exactly which env var to flip.
-func slotLine(model string, port int) string {
+//
+// A configured model is cross-checked against the models dir doctor
+// enumerates a few lines below, and marked MISSING when it is not there.
+// Without the cross-check doctor confirmed a broken config as correct —
+// the exact diagnostic the 503 body tells operators to run.
+func slotLine(modelsDir, model string, port int) string {
 	if model == "" {
 		return fmt.Sprintf("(opt-in; port=%d)", port)
+	}
+	if _, err := resolveSlotModel(modelsDir, model); err != nil {
+		return fmt.Sprintf("model=%s port=%d  MISSING — not found under %s (slot will not start)",
+			model, port, modelsDir)
 	}
 	return fmt.Sprintf("model=%s port=%d", model, port)
 }
