@@ -56,8 +56,12 @@ func llamaBin(t *testing.T) string {
 //  1. $TEST_MODEL_PATH if non-empty.
 //  2. The Ollama llama3.2:3b blob (the model the patch was validated
 //     against). Resolved by reading the manifest.
-//  3. Skip the test with a helpful message — we don't want CI to fail
-//     just because the contributor hasn't downloaded a model yet.
+//
+// No model is a FAILURE, not a skip. These tests are the merge gate for the
+// patch series and they only run when someone asks for the amd_gpu /
+// apple_silicon tag; a skip there reports green while proving nothing, and on
+// the self-hosted runner a wiped model cache would silently retire the only
+// check that catches garbage-token output.
 func testModel(t *testing.T) string {
 	t.Helper()
 	if p := os.Getenv("TEST_MODEL_PATH"); p != "" {
@@ -68,7 +72,7 @@ func testModel(t *testing.T) string {
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		t.Skipf("cannot determine home dir: %v", err)
+		t.Fatalf("cannot determine home dir and TEST_MODEL_PATH is unset: %v", err)
 	}
 	// Ollama llama3.2:3b blob hash — stable across the Ollama registry.
 	blob := filepath.Join(home, ".ollama", "models", "blobs",
@@ -76,7 +80,9 @@ func testModel(t *testing.T) string {
 	if _, err := os.Stat(blob); err == nil {
 		return blob
 	}
-	t.Skipf("no test model available — set TEST_MODEL_PATH or `ollama pull llama3.2:3b`")
+	t.Fatalf("no test model available — set TEST_MODEL_PATH or `ollama pull llama3.2:3b`. "+
+		"This test is the patch-series merge gate; it fails rather than skips so an "+
+		"absent model cannot read as a pass. Looked for %s", blob)
 	return ""
 }
 
