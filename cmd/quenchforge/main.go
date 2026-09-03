@@ -13,6 +13,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,16 +31,60 @@ import (
 	"github.com/cerid-ai/quenchforge/internal/tuning"
 )
 
+// devVersion is what an unstamped build starts from. It is deliberately not
+// a version number: the previous default was a literal five minor versions
+// behind HEAD that every source build reported through `version`, doctor's
+// header and the gateway's `/`, so a doctor paste could not identify the code
+// the operator was running.
+const devVersion = "dev"
+
 // Version is injected at build time via:
 //
 //	go build -ldflags "-X main.Version=$(git describe --tags --always)"
 //
-// goreleaser handles this in CI. Local dev builds carry the zero value.
+// goreleaser handles this in CI. An unstamped build resolves its identity
+// from the VCS data the toolchain embeds — see buildIdentity.
 var (
-	Version   = "0.5.0-dev"
+	Version   = devVersion
 	Commit    = "unknown"
 	BuildDate = "unknown"
 )
+
+// buildIdentity resolves the version and commit every surface reports.
+// ldflag-stamped values win. An unstamped build falls back to the VCS
+// revision Go records in the build info, and says so.
+func buildIdentity(version, commit string, bi *debug.BuildInfo, ok bool) (string, string) {
+	if version != devVersion {
+		return version, commit
+	}
+	if !ok || bi == nil {
+		return devVersion + " (unversioned build)", commit
+	}
+	var revision, modified string
+	for _, s := range bi.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			revision = s.Value
+		case "vcs.modified":
+			modified = s.Value
+		}
+	}
+	if revision == "" {
+		return devVersion + " (unversioned build)", commit
+	}
+	short := revision
+	if len(short) > 7 {
+		short = short[:7]
+	}
+	version = devVersion + "+g" + short
+	if modified == "true" {
+		version += ".dirty"
+	}
+	if commit == "unknown" {
+		commit = revision
+	}
+	return version, commit
+}
 
 const rootUsage = `quenchforge — local inference for Mac + AMD discrete GPU
 
@@ -67,6 +112,8 @@ Report a bug:  https://github.com/cerid-ai/quenchforge/issues/new/choose
 `
 
 func main() {
+	bi, biOK := debug.ReadBuildInfo()
+	Version, Commit = buildIdentity(Version, Commit, bi, biOK)
 	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintln(os.Stderr, "quenchforge:", err)
 		os.Exit(1)
