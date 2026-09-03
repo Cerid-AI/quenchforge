@@ -16,7 +16,9 @@
 //   - system_profiler is bundled in every macOS install since 10.0.
 //
 // Trade-off: ~200-500ms extra at first launch vs. a direct Metal API call.
-// Acceptable for a once-per-boot probe; cached for subsequent reads.
+// Acceptable for a once-per-boot probe. There is no cache: every Detect()
+// call shells out again, so callers that need the snapshot repeatedly should
+// hold on to it.
 package hardware
 
 import (
@@ -108,10 +110,14 @@ func classifyProfile(i Info) Profile {
 		strings.Contains(gpu, "intel uhd"):
 		return ProfileIGPU
 	case i.HasMetal:
-		// Discrete AMD on Intel Mac that didn't match any specific bucket —
-		// fall through to vega-pro tuning as the closest defaults. Operators
-		// hitting this should file a hardware_profile.yml issue.
-		return ProfileVegaPro
+		// A Metal device that matched no bucket. It used to fall through to
+		// vega-pro, which hands AMD-discrete tuning — chat forced to CPU via
+		// --gpu-layers 0, GGML_METAL_CONCURRENCY_DISABLE=1, VRAM-tier ubatch
+		// caps — to a card nobody has benched, including any Apple Silicon Mac
+		// whose vendor keys drift out of the heuristic above. Classify it
+		// honestly instead; operators hitting this should file a
+		// hardware_profile.yml issue.
+		return ProfileMetalUnknown
 	}
 	return ProfileCPU
 }

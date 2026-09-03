@@ -113,12 +113,17 @@ type SlotTuning struct {
 // base llama-server args built by buildSlotArgs. Empty / zero fields
 // signal "use the upstream default".
 //
-// Apple Silicon and unknown profiles get zero tuning across all slot
-// kinds: their Metal stack is unified-memory and never enters the
+// Apple Silicon, metal-unknown and unknown profiles get zero tuning across
+// all slot kinds. On Apple Silicon that is because the Metal stack is
+// unified-memory and never enters the
 // `newBufferWithBytesNoCopy` staging-buffer path (see
 // `~/Develop/quenchforge/llama.cpp/ggml/src/ggml-metal/ggml-metal-device.m:1665-1717`
 // — the `buf->is_shared` fast path uses plain `memcpy`). Adding flags
-// on those profiles would regress throughput without any safety win.
+// on those profiles would regress throughput without any safety win. On an
+// unrecognised Metal device it is because every tuning value in this file is
+// a measurement of a specific card, and no measurement exists for that one —
+// Metal correctness on AMD is carried by the patch series, which gates on
+// device properties rather than on this profile.
 func KernelParams(profile hardware.Profile, vramGB int, kind gateway.SlotKind, cfg config.Config) SlotTuning {
 	// Device placement comes first: the GPU safety tuning below is only
 	// meaningful when the slot actually runs on the GPU. On a host where the

@@ -85,3 +85,17 @@ func TestStartGovernor_QuietWhenProbesWork(t *testing.T) {
 		t.Errorf("healthy probes must not warn. Got:\n%s", out.String())
 	}
 }
+
+func TestUnknownGPUNotice(t *testing.T) {
+	got := unknownGPUNotice(hardware.Info{
+		Profile: hardware.ProfileMetalUnknown, GPU: "AMD Radeon Pro W7900X", GPUVRAMGB: 48,
+	})
+	for _, want := range []string{"AMD Radeon Pro W7900X", "upstream defaults", "hardware_profile"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("notice missing %q: %q", want, got)
+		}
+	}
+	if n := unknownGPUNotice(hardware.Info{Profile: hardware.ProfileVegaPro, GPU: "Vega II"}); n != "" {
+		t.Errorf("recognised profile must not warn: %q", n)
+	}
+}

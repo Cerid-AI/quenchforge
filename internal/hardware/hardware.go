@@ -49,6 +49,14 @@ const (
 	// ProfileUnknown is returned only when detection itself failed (CGo error,
 	// missing IOKit framework, etc.). Callers should refuse to start.
 	ProfileUnknown Profile = "unknown"
+
+	// ProfileMetalUnknown covers a Metal-capable device that matched no named
+	// bucket — a newer AMD card, or an Apple Silicon Mac whose vendor keys
+	// drifted. Detection worked, so the host is supported; what is unknown is
+	// the tuning, and the tuning tables are per-card measurements. These hosts
+	// get upstream defaults rather than another card's numbers, and the
+	// supervisor asks the operator to file a hardware profile report.
+	ProfileMetalUnknown Profile = "metal-unknown"
 )
 
 // String implements fmt.Stringer.
@@ -79,7 +87,10 @@ type Info struct {
 	// Devices.
 	GPU string
 
-	// GPUVRAMGB is total VRAM in GB across all detected discrete devices.
+	// GPUVRAMGB is the VRAM in GB of the device named in GPU — the
+	// highest-VRAM non-low-power device, not a total across devices. Metal
+	// cannot address two cards as one pool, so the single-device figure is
+	// the one the VRAM budget and the tuning tiers must use.
 	// On Apple Silicon this is unified memory.
 	GPUVRAMGB int
 
