@@ -424,9 +424,13 @@ func (s *Slot) cleanupLocked() {
 // process whose argv mentioned "quenchforge" — an operator shell, an editor,
 // a second instance — and the signal goes to the whole process group. macOS
 // recycles PIDs freely and pidfiles survive a crash, so that was a live risk,
-// not a theoretical one. A pidfile without a recorded identity (written by an
-// older build) is never acted on.
-func ReapOrphans(pidDir string) []ReapResult {
+// not a theoretical one.
+//
+// ourExec is the set of executable paths this build spawns children from
+// (llama-server, whisper-server, sd-server, bark server). It is the only
+// evidence available for a pidfile written before identity recording existed;
+// see legacyGrace on pidIsOurChild.
+func ReapOrphans(pidDir string, ourExec []string) []ReapResult {
 	results := make([]ReapResult, 0)
 	entries, err := os.ReadDir(pidDir)
 	if err != nil {
@@ -449,9 +453,10 @@ func ReapOrphans(pidDir string) []ReapResult {
 		}
 
 		res := ReapResult{File: e.Name(), PID: rec.PID}
-		if ours, why := pidIsOurChild(rec); !ours {
+		ours, why := pidIsOurChild(rec, ourExec)
+		res.Note = why
+		if !ours {
 			res.Action = "skip"
-			res.Note = why
 		} else {
 			if err := signalGroup(rec.PID, syscall.SIGKILL); err == nil {
 				res.Action = "killed"
@@ -482,16 +487,34 @@ type ReapResult struct {
 //
 // Anything unproven is a skip. The signal this gates is a process-group
 // SIGKILL; a false positive takes out whatever else shares that group.
-func pidIsOurChild(rec pidRecord) (bool, string) {
+//
+// LEGACY PIDFILE GRACE — REMOVE IN v0.12.0, one release after the one that
+// starts writing identity-bearing pidfiles (see docs/UPGRADE.md).
+// Every build up to v0.10.1 wrote the pidfile as a bare integer, so at the
+// first restart after the upgrade every genuine orphan is described by a
+// pidfile with no recorded identity. Refusing those outright strands a
+// llama-server on its slot port with its VRAM still allocated, and the slot
+// that should replace it cannot bind. For those pidfiles only, the running
+// process's executable path is checked against the executables this build
+// spawns: strictly narrower than the substring matcher that reaped them
+// before the upgrade, and it expires on its own — the next pidfile this
+// build writes carries a full identity.
+func pidIsOurChild(rec pidRecord, ourExec []string) (bool, string) {
 	if rec.PID <= 1 {
 		return false, "invalid pid"
-	}
-	if rec.Start == "" || rec.Exec == "" {
-		return false, "pidfile carries no process identity (older build); refusing to signal"
 	}
 	start, execPath, err := processIdentity(rec.PID)
 	if err != nil {
 		return false, "pid not running"
+	}
+	if rec.Start == "" || rec.Exec == "" {
+		if execMatchesOurs(execPath, ourExec) {
+			return true, fmt.Sprintf(
+				"legacy pidfile (no recorded identity); pid runs %q, which this build spawns", execPath)
+		}
+		return false, fmt.Sprintf(
+			"legacy pidfile (no recorded identity) and pid runs %q, not one of our executables; refusing to signal",
+			execPath)
 	}
 	if start != rec.Start {
 		return false, fmt.Sprintf("pid reused: started %q, pidfile recorded %q", start, rec.Start)
@@ -500,6 +523,22 @@ func pidIsOurChild(rec pidRecord) (bool, string) {
 		return false, fmt.Sprintf("pid reused: running %q, pidfile recorded %q", execPath, rec.Exec)
 	}
 	return true, ""
+}
+
+// execMatchesOurs reports whether execPath is one of the executables this
+// build spawns children from. Exact path comparison, not basename: a
+// llama-server from some other installation is not ours to kill.
+func execMatchesOurs(execPath string, ourExec []string) bool {
+	if execPath == "" {
+		return false
+	}
+	want := filepath.Clean(execPath)
+	for _, c := range ourExec {
+		if c != "" && filepath.Clean(c) == want {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------------------------------------------------------------------------
