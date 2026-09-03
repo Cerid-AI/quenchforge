@@ -57,14 +57,14 @@ func TestWaitPortReady_ListeningPort(t *testing.T) {
 	defer ln.Close()
 	port := ln.Addr().(*net.TCPAddr).Port
 
-	if !waitPortReady(context.Background(), port, 2*time.Second) {
+	if !waitPortReady(context.Background(), port, 2*time.Second, 20*time.Millisecond) {
 		t.Errorf("port %d has a listener; waitPortReady said otherwise", port)
 	}
 }
 
 func TestWaitPortReady_DeadPort(t *testing.T) {
 	port := freeTestPort(t)
-	if waitPortReady(context.Background(), port, 300*time.Millisecond) {
+	if waitPortReady(context.Background(), port, 300*time.Millisecond, 20*time.Millisecond) {
 		t.Errorf("nothing listens on port %d; waitPortReady said it was ready", port)
 	}
 }
