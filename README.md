@@ -21,13 +21,16 @@ Quenchforge carries a small patch series — one kernel-correctness patch per su
 | **Image generation** | `stable-diffusion.cpp` | ⚠️ experimental — sd-server slot + `/v1/images/generations` wired, but AMD-Mac correctness unverified |
 | **Text-to-speech** | `bark.cpp` | ⚠️ experimental — bark slot + `/v1/audio/speech` → `/tts` wired, but AMD-Mac correctness unverified |
 
-> **Status:** v0.8.2 (2026-06-02), signed + notarized. Production-stable for **chat + embeddings + code-embeddings + reranking — all GPU-resident** — on Mac Pro 2019 + Radeon Pro Vega II (32 GB HBM2), and VRAM-tier-adaptive across the rest of the Intel-Mac AMD range. Whisper transcription ships CPU-mode (correct, fast). Image-gen + TTS slots are wired but **AMD-Mac correctness is unverified** — treat as experimental until a hardware-profile report confirms. Signed + notarized release binaries (Developer ID Application: Justin Michaels, team `4A5VDRMRB8`, hardened-runtime, Apple-notarized) are on the [releases page](https://github.com/Cerid-AI/quenchforge/releases); `brew install cerid-ai/tap/quenchforge` works.
+> **Status:** v0.10.1 (2026-07-12), signed + notarized. Production-stable for **chat + embeddings + code-embeddings + reranking** on Mac Pro 2019 + Radeon Pro Vega II (32 GB HBM2), and VRAM-tier-adaptive across the rest of the Intel-Mac AMD range. On AMD-discrete the **placement policy routes each slot to the device that measured faster**: embeddings and code-embeddings on the GPU, chat and reranking on the CPU (autoregressive decode and single-pair reranking are faster there than the AMD Metal path). Override per slot with `QUENCHFORGE_PLACE_CHAT` / `_EMBED` / `_CODE_EMBED` / `_RERANK` = `gpu` \| `cpu` \| `auto`. Whisper transcription ships CPU-mode (correct, fast). Image-gen + TTS slots are wired but **AMD-Mac correctness is unverified** — treat as experimental until a hardware-profile report confirms. Signed + notarized release binaries (Developer ID Application: Justin Michaels, team `4A5VDRMRB8`, hardened-runtime, Apple-notarized) are on the [releases page](https://github.com/Cerid-AI/quenchforge/releases); `brew install cerid-ai/tap/quenchforge` works.
 >
 > **Recent highlights** (full history in [CHANGELOG.md](CHANGELOG.md)):
+> - **v0.10.1** — supervisor lifecycle hardening after the 2026-07-11 incident: every slot is `Wait()`ed whatever its restart policy, CPU-placed slots get auto-respawn, and a crash-storm cool-off replaces "give up permanently".
+> - **v0.10.0** — the `_fb` fallback kernels went live (patches 0003/0004), patch 0005 makes serial Metal dispatch the default on non-UMA devices, and slot placement became a measured policy rather than a blanket GPU assumption.
+> - **v0.9.0** — GPU resource-control framework: per-slot device placement plus a pressure governor that reserves GPU headroom for the display compositor while a screen is being driven.
 > - **v0.8.2** — one-line `curl … | sh` installer: resolves the latest release, verifies its SHA-256 against `checksums.txt`, installs the binaries, and writes the LaunchAgent + prestart port guard.
 > - **v0.8.1** — prestart port guard: the install-generated LaunchAgent reclaims `:11434` from an Ollama squatter on every start/login, so the two coexist with no manual eviction.
 > - **v0.8.0** — AMD-discrete **GPU mode shipped for all four slots** (chat, embed, code-embed, rerank) via two ggml Metal patches (kernel correctness + a staging-buffer pool for sustained load), plus **VRAM-tier-adaptive sizing** so cards from 4 GB MacBook Pro dGPUs to 32 GB Vega II run out-of-the-box.
-> - **v0.5.0** — dedicated **code-embed slot** (route code-tuned embedders independently of general-text), model registry (`pull` / `list` / `rm` with HuggingFace + SHA-256 verification), and VRAM pre-flight that refuses to oversubscribe.
+> - **v0.5.0** — dedicated **code-embed slot** (route code-tuned embedders independently of general-text), model registry (`pull` / `list` / `rm` with HuggingFace + SHA-256 verification — a pull whose file HF publishes no checksum for is refused unless you pass `--allow-unverified`), and VRAM pre-flight that refuses to oversubscribe.
 
 ## Hardware compatibility matrix
 
@@ -75,7 +78,7 @@ That's why the whisper slot defaults to `--no-gpu` on Intel Mac + AMD. Flip `QUE
 | `quenchforge-preflight` | One-line `curl ... | sh` gating binary that emits `KEY=VALUE` for install scripts. Refuses to install on unsupported macOS / hardware |
 | `scripts/build-llama.sh` | Builds patched `llama-server` (Metal, dual-arch, universal lipo) |
 | `scripts/build-whisper.sh` | Builds patched `whisper-server` (same patch shape, different submodule) |
-| `patches/{llama,whisper,sd,bark}.cpp/` | The actual diffs against each submodule (llama.cpp carries two; the rest one each). `scripts/apply-patches.sh` is idempotent + `--check` + `--reset` |
+| `patches/{llama,whisper,sd,bark}.cpp/` | The actual diffs against each submodule — eight in total: llama.cpp carries five (`0001`–`0005`), the other three one each. `scripts/apply-patches.sh` is idempotent + `--check` + `--reset` |
 
 ## Quickstart
 
@@ -93,7 +96,9 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cerid.quenchforge.pl
 curl http://127.0.0.1:11434/
 ```
 
-Knobs: `QUENCHFORGE_VERSION=v0.8.2` to pin a release, `QUENCHFORGE_NO_SERVICE=1` to install the binaries without the LaunchAgent.
+Pull first: the LaunchAgent configures the chat slot with exactly what `quenchforge pull llama3.2:3b` installs, and a slot whose model is not on disk is not started (serve reports it and `quenchforge doctor` marks it `MISSING`). Embed and rerank are opt-in — pull the model, then set `QUENCHFORGE_EMBED_MODEL` / `QUENCHFORGE_RERANK_MODEL` in the LaunchAgent to its on-disk name.
+
+Knobs: `QUENCHFORGE_VERSION=v0.10.1` to pin a release, `QUENCHFORGE_NO_SERVICE=1` to install the binaries without the LaunchAgent.
 
 ### Building from source
 
@@ -226,7 +231,7 @@ All settings have sensible defaults. Selected env vars:
 | `QUENCHFORGE_EMBED_METAL_N_CB` | `0` (inherit `METAL_N_CB`) | Per-slot `GGML_METAL_N_CB` for embed and code-embed. Set to `1` on AMD discrete to serialise Metal command-buffer submission. |
 | `QUENCHFORGE_RERANK_BATCH_SIZE` | `0` (llama.cpp's 512-token default) | Rerank slot `--batch-size` and `--ubatch-size`. Raise this when the reranker takes (query, doc) pairs longer than 510 tokens (e.g. `bge-reranker-v2-m3` with ≥ 1k-token chunks). |
 | `QUENCHFORGE_RERANK_METAL_N_CB` | `0` (inherit `METAL_N_CB`) | Per-slot `GGML_METAL_N_CB` for the rerank slot. |
-| `QUENCHFORGE_AUTO_BACKOFF` | `false` | Opt-in: gateway returns `HTTP 503` + `Retry-After: 2` on `/v1/embeddings` etc. when the slot's rolling p99 latency is `critical` (5× p50 or error rate > 5%). Default off — observability via `/health` works without this flag. |
+| `QUENCHFORGE_AUTO_BACKOFF` | `false` | Opt-in: gateway returns `HTTP 503` + `Retry-After: 2` on `/v1/embeddings` etc. when the slot's rolling **error rate exceeds 5%**. Latency is deliberately not a trigger — the p99/p50 ratio is workload-shape sensitive (one 26 s GPU batch beside millisecond singles reads as critical with zero failures; the 2026-07-08 false-critical incident) and stays an observability field in `/health`. Default off. |
 | `QUENCHFORGE_ADVERTISE_MDNS` | `false` | Bonjour advertisement (`_quenchforge._tcp.local.`) |
 | `QUENCHFORGE_GOVERNOR` | on; off on Apple silicon | GPU-pressure governor: throttles GPU admission while a display is driven so inference can't starve the compositor. An explicit value overrides the per-profile default. |
 
