@@ -789,7 +789,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 			slots[kind] = s
 			fmt.Fprintf(stdout, "quenchforge: %s slot pid=%d model=%s port=%d\n",
 				name, s.PID(), model, gpuPort)
-			_ = g.SetUpstream(kind, fmt.Sprintf("http://127.0.0.1:%d", gpuPort))
+			registerWhenReady(ctx, name, gpuPort, upstreamSetter(g, kind), stderr)
 			return
 		}
 		// Auto: dual-placed. GPU instance is the primary upstream.
@@ -803,7 +803,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 			slots[kind] = s
 			fmt.Fprintf(stdout, "quenchforge: %s slot (gpu) pid=%d model=%s port=%d\n",
 				name, s.PID(), model, gpuPort)
-			_ = g.SetUpstream(kind, fmt.Sprintf("http://127.0.0.1:%d", gpuPort))
+			registerWhenReady(ctx, name, gpuPort, upstreamSetter(g, kind), stderr)
 		}
 		// CPU instance handles single-request latency traffic.
 		cpuName := name + "-cpu"
@@ -818,7 +818,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 			slots[gateway.SlotKind(cpuName)] = s
 			fmt.Fprintf(stdout, "quenchforge: %s slot (cpu) pid=%d model=%s port=%d\n",
 				cpuName, s.PID(), model, cpuPort)
-			_ = g.SetCPUUpstream(kind, fmt.Sprintf("http://127.0.0.1:%d", cpuPort))
+			registerWhenReady(ctx, cpuName, cpuPort, cpuUpstreamSetter(g, kind), stderr)
 		}
 	}
 
@@ -841,8 +841,8 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 			slots[gateway.KindChat] = s
 			fmt.Fprintf(stdout, "quenchforge: chat slot pid=%d model=%s port=%d\n",
 				s.PID(), modelName, cfg.ChatPort)
-			_ = g.SetUpstream(gateway.KindChat,
-				fmt.Sprintf("http://127.0.0.1:%d", cfg.ChatPort))
+			registerWhenReady(ctx, "chat", cfg.ChatPort,
+				upstreamSetter(g, gateway.KindChat), stderr)
 		}
 	}
 
@@ -914,8 +914,8 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 				slots[gateway.KindRerank] = s
 				fmt.Fprintf(stdout, "quenchforge: rerank slot pid=%d model=%s port=%d\n",
 					s.PID(), cfg.RerankModel, cfg.RerankPort)
-				_ = g.SetUpstream(gateway.KindRerank,
-					fmt.Sprintf("http://127.0.0.1:%d", cfg.RerankPort))
+				registerWhenReady(ctx, "rerank", cfg.RerankPort,
+					upstreamSetter(g, gateway.KindRerank), stderr)
 			}
 		}
 
@@ -948,8 +948,8 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 					fmt.Fprintf(stdout,
 						"quenchforge: image-gen slot pid=%d model=%s port=%d\n",
 						slot.PID(), cfg.SDModel, cfg.SDPort)
-					_ = g.SetUpstream(gateway.KindImageGen,
-						fmt.Sprintf("http://127.0.0.1:%d", cfg.SDPort))
+					registerWhenReady(ctx, "image-gen", cfg.SDPort,
+						upstreamSetter(g, gateway.KindImageGen), stderr)
 				}
 			}
 		}
@@ -984,8 +984,8 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 					fmt.Fprintf(stdout,
 						"quenchforge: TTS slot pid=%d model=%s port=%d\n",
 						slot.PID(), cfg.BarkModel, cfg.BarkPort)
-					_ = g.SetUpstream(gateway.KindTTS,
-						fmt.Sprintf("http://127.0.0.1:%d", cfg.BarkPort))
+					registerWhenReady(ctx, "tts", cfg.BarkPort,
+						upstreamSetter(g, gateway.KindTTS), stderr)
 				}
 			}
 		}
@@ -1027,8 +1027,8 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 					fmt.Fprintf(stdout,
 						"quenchforge: whisper slot pid=%d model=%s port=%d gpu=%v\n",
 						slot.PID(), cfg.WhisperModel, cfg.WhisperPort, cfg.WhisperGPU)
-					_ = g.SetUpstream(gateway.KindWhisper,
-						fmt.Sprintf("http://127.0.0.1:%d", cfg.WhisperPort))
+					registerWhenReady(ctx, "whisper", cfg.WhisperPort,
+						upstreamSetter(g, gateway.KindWhisper), stderr)
 				}
 			}
 		}
