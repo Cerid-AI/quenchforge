@@ -56,6 +56,12 @@
 
     <key>EnvironmentVariables</key>
     <dict>
+        <!--
+          /usr/sbin carries ioreg and sysctl, which the GPU governor probes
+          for display power and memory pressure. Without it those probes do
+          not run and the governor holds a conservative plan on unmeasured
+          data (it says so in the log).
+        -->
         <key>PATH</key>
         <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin</string>
 

@@ -61,3 +61,37 @@ func TestInstall_WritesPlistAndPrestartGuard(t *testing.T) {
 		}
 	}
 }
+
+// The GPU governor probes ioreg and sysctl, both of which live in /usr/sbin.
+// launchd hands the job the PATH from this plist and nothing else, so an
+// omitted /usr/sbin switches the compositor-starvation guard off on every
+// fresh install.
+func TestInstall_PlistPathIncludesUsrSbin(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("install is macOS-only")
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USER", "tester")
+
+	var out, errb bytes.Buffer
+	if err := cmdInstall(nil, &out, &errb); err != nil {
+		t.Fatalf("cmdInstall: %v (stderr=%s)", err, errb.String())
+	}
+	plist, err := os.ReadFile(filepath.Join(home, "Library", "LaunchAgents", plistFilename))
+	if err != nil {
+		t.Fatalf("read plist: %v", err)
+	}
+	line := ""
+	for _, l := range strings.Split(string(plist), "\n") {
+		if strings.Contains(l, "/usr/local/bin:") {
+			line = l
+		}
+	}
+	if line == "" {
+		t.Fatalf("plist has no PATH value:\n%s", plist)
+	}
+	if !strings.Contains(line, "/usr/sbin") {
+		t.Errorf("LaunchAgent PATH omits /usr/sbin, where ioreg and sysctl live: %s", line)
+	}
+}
