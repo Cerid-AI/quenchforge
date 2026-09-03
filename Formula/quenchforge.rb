@@ -15,7 +15,10 @@ class Quenchforge < Formula
   desc "ggml-on-AMD-Mac correctness — chat, embedding, reranker, Whisper transcription"
   homepage "https://github.com/Cerid-AI/quenchforge"
   license "Apache-2.0"
-  version "0.3.1-dev"
+  # Placeholder, never a real release: goreleaser substitutes the tag on every
+  # release. A stale version number here (it sat at 0.3.1-dev through v0.10.1)
+  # reads like a claim about what the tap ships, which this file never decides.
+  version "0.0.0-scaffold"
 
   # Hardware constraint — Quenchforge is macOS-only by design, and the
   # patches only matter on Intel Mac + AMD discrete or Apple Silicon. We
