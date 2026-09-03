@@ -24,7 +24,7 @@ func TestClassifyProfileBuckets(t *testing.T) {
 		{"AMD Radeon RX 6700M", true, ProfileRDNA2},
 		{"Intel Iris Plus Graphics", true, ProfileIGPU},
 		{"Intel UHD Graphics 630", true, ProfileIGPU},
-		{"some-unknown-gpu", true, ProfileVegaPro}, // fallback for discrete-AMD-with-metal
+		{"some-unknown-gpu", true, ProfileMetalUnknown}, // conservative: no AMD-discrete tuning on a guess
 		{"", false, ProfileCPU},
 	}
 	for _, tc := range cases {
@@ -44,5 +44,21 @@ func TestClassifyProfileAppleSilicon(t *testing.T) {
 	}
 	if got := classifyProfile(info); got != ProfileAppleSilicon {
 		t.Errorf("AppleSilicon classify = %q, want %q", got, ProfileAppleSilicon)
+	}
+}
+
+// An Apple Silicon Mac whose vendor key drifts (system_profiler schema change,
+// or a model string without "Apple M") falls through every named bucket. It
+// used to land on vega-pro, which forces chat to the CPU with --gpu-layers 0
+// and disables Metal concurrency — a large unexplained slowdown presented as
+// normal operation.
+func TestClassifyProfile_UnrecognisedMetalDeviceGetsConservativeDefaults(t *testing.T) {
+	info := Info{
+		GPU:      "Apple GPU",
+		HasMetal: true,
+		Devices:  []Device{{Name: "Apple GPU", VRAMGB: 32}},
+	}
+	if got := classifyProfile(info); got != ProfileMetalUnknown {
+		t.Errorf("classifyProfile(unrecognised Metal device) = %q, want %q", got, ProfileMetalUnknown)
 	}
 }
