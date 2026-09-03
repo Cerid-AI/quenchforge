@@ -9,7 +9,10 @@
 //
 //  1. The self-hosted runner on the maintainer's Mac Pro 2019, labelled
 //     `[amd-gpu]` — runs `go test -tags=amd_gpu ./tests/integration/...`
-//     as the merge gate for any change that touches the patch series.
+//     as the merge gate for any change that touches the patch series. The
+//     job rebuilds llama-server whenever the patch series hash changes and
+//     fails (never skips) when no test model is present, so a green run
+//     means the current patches produced correct output on real hardware.
 //
 //  2. Local validation by anyone with the target hardware. Run:
 //     bash scripts/apply-patches.sh
