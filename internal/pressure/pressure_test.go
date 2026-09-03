@@ -50,3 +50,15 @@ func TestSensorNeverPanics(t *testing.T) {
 		t.Errorf("MemPressure = %d, want >= 1", r.MemPressure)
 	}
 }
+
+func TestForPlan_FailedProbeIsConservative(t *testing.T) {
+	l := Limits{Max: 6, DisplayActive: 1, DisplayActiveDuty: 0.5}
+	// A failed probe cannot prove the host is headless. Treating it as
+	// headless opens the GPU to gapless full-throughput inference, which is
+	// the state that starves WindowServer into a kernel-watchdog panic.
+	p := l.For(Reading{DisplayActive: false, MemPressure: MemNormal, ProbeFailed: true})
+	if p.Concurrency != 1 || p.Duty != 0.5 {
+		t.Errorf("For(probe failed) = {conc=%d duty=%v}, want the display-active plan {conc=1 duty=0.5}",
+			p.Concurrency, p.Duty)
+	}
+}
