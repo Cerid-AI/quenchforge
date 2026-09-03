@@ -38,6 +38,11 @@ type Reading struct {
 	// MemPressure is the macOS memory-pressure level (1 normal / 2 warn /
 	// 4 critical). 1 when unknown.
 	MemPressure int
+	// ProbeFailed is true when a sensor probe could not run at all (a missing
+	// or unexecutable ioreg / sysctl). The reading's other fields are then
+	// defaults, not measurements, and Limits.For falls back to the
+	// display-active plan rather than trusting them.
+	ProbeFailed bool
 }
 
 // Limits configures the governor's target plan in each regime.
@@ -66,6 +71,7 @@ type Plan struct {
 
 // For maps a Reading to the plan the governor should apply:
 //
+//   - probe failed                   → the display-active plan (conservative)
 //   - headless / display asleep      → {Max, 1.0}   full throughput, no gaps
 //   - display active, memory normal  → {DisplayActive, DisplayActiveDuty}
 //   - display active, memory warn    → {1, DisplayActiveDuty}  serialize
@@ -88,6 +94,15 @@ func (l Limits) For(r Reading) Plan {
 		duty = 0.5
 	}
 
+	// An unmeasured host is not a headless host. Without this, a probe that
+	// cannot run reads as DisplayActive=false and opens the GPU to gapless
+	// full-throughput inference — the state this package exists to prevent.
+	if r.ProbeFailed {
+		if r.MemPressure >= MemCritical {
+			return Plan{Concurrency: 1, Duty: tighten(duty)}
+		}
+		return Plan{Concurrency: da, Duty: duty}
+	}
 	if !r.DisplayActive {
 		if r.MemPressure >= MemCritical {
 			return Plan{Concurrency: 1, Duty: 1.0}
@@ -115,9 +130,9 @@ func tighten(d float64) float64 {
 }
 
 // Sensor reads host pressure. Read never blocks beyond its internal probe
-// timeout and never returns an error — on any probe failure it returns the
-// safe default for the platform (headless + normal memory → full throughput;
-// see sense_darwin.go / sense_other.go).
+// timeout and never returns an error — a probe that could not run sets
+// Reading.ProbeFailed, which Limits.For treats as display-active (see
+// sense_darwin.go / sense_other.go).
 type Sensor interface {
 	Read() Reading
 }
