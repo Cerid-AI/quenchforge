@@ -63,7 +63,7 @@ func portAccepts(port int) bool {
 // waitPortReady polls until 127.0.0.1:port accepts a connection. Returns
 // false when ctx is cancelled or timeout elapses first; a non-positive
 // timeout means "until ctx is done".
-func waitPortReady(ctx context.Context, port int, timeout time.Duration) bool {
+func waitPortReady(ctx context.Context, port int, timeout time.Duration, poll time.Duration) bool {
 	var deadline time.Time
 	if timeout > 0 {
 		deadline = time.Now().Add(timeout)
@@ -78,7 +78,7 @@ func waitPortReady(ctx context.Context, port int, timeout time.Duration) bool {
 		select {
 		case <-ctx.Done():
 			return false
-		case <-time.After(slotReadyPoll):
+		case <-time.After(poll):
 		}
 	}
 }
@@ -100,8 +100,12 @@ func waitPortReady(ctx context.Context, port int, timeout time.Duration) bool {
 // and TCP accept is all the evidence available.
 func registerWhenReady(ctx context.Context, name string, port int, expectModel string, set func(string) error, w io.Writer) {
 	upstream := fmt.Sprintf("http://127.0.0.1:%d", port)
+	// Snapshot the poll interval here rather than in the goroutine: the probe
+	// outlives its caller by design, and a test that restores the package var
+	// would otherwise race the running probe.
+	poll := slotReadyPoll
 	go func() {
-		if !waitPortReady(ctx, port, slotReadyTimeout()) {
+		if !waitPortReady(ctx, port, slotReadyTimeout(), poll) {
 			if ctx.Err() != nil {
 				return
 			}
@@ -110,12 +114,12 @@ func registerWhenReady(ctx context.Context, name string, port int, expectModel s
 					"within %s — its lane returns 503 until it does.\n"+
 					"  Check the slot log for a model-load failure; the probe keeps running.\n",
 				name, port, slotReadyTimeout())
-			if !waitPortReady(ctx, port, 0) {
+			if !waitPortReady(ctx, port, 0, poll) {
 				return
 			}
 			fmt.Fprintf(w, "quenchforge: %s slot is accepting connections after all\n", name)
 		}
-		if !waitModelConfirmed(ctx, name, port, expectModel, w) {
+		if !waitModelConfirmed(ctx, name, port, expectModel, w, poll) {
 			return
 		}
 		if err := set(upstream); err != nil {
@@ -138,7 +142,7 @@ var slotProbeClient = &http.Client{Timeout: slotModelProbeTimeout}
 // model is less recoverable than serving nothing — a 503 lane is visible,
 // a lane answering from the previous model is not. Probing continues, so the
 // lane comes up on its own once the real slot wins the port.
-func waitModelConfirmed(ctx context.Context, name string, port int, expectModel string, w io.Writer) bool {
+func waitModelConfirmed(ctx context.Context, name string, port int, expectModel string, w io.Writer, poll time.Duration) bool {
 	if expectModel == "" {
 		return true
 	}
@@ -170,7 +174,7 @@ func waitModelConfirmed(ctx context.Context, name string, port int, expectModel 
 		select {
 		case <-ctx.Done():
 			return false
-		case <-time.After(slotReadyPoll):
+		case <-time.After(poll):
 		}
 	}
 }
