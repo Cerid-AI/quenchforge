@@ -6,17 +6,18 @@
   source-build case (or anyone who wants per-user supervision without
   a Homebrew install).
 
-  Install:
-    install -m 0644 packaging/macos/com.cerid.quenchforge.plist \
-        ~/Library/LaunchAgents/com.cerid.quenchforge.plist
+  Install (this template is embedded in the binary; `install` writes it
+  with your $USER substituted, so prefer it over copying by hand):
+    quenchforge install
 
   Edit ~/Library/LaunchAgents/com.cerid.quenchforge.plist to set the
-  default model env vars to GGUF filenames that exist under
-  ~/.quenchforge/models/ — see `quenchforge doctor` for the registry.
+  model env vars to GGUF filenames that exist under ~/.quenchforge/models/
+  — `quenchforge list` shows what is installed and `quenchforge doctor`
+  marks a configured slot whose model is missing.
 
-  Load:
-    launchctl unload ~/Library/LaunchAgents/com.cerid.quenchforge.plist 2>/dev/null || true
-    launchctl load -w ~/Library/LaunchAgents/com.cerid.quenchforge.plist
+  Load (the bootstrap flow `quenchforge install` prints):
+    launchctl bootout gui/$(id -u)/com.cerid.quenchforge 2>/dev/null || true
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cerid.quenchforge.plist
 
   Check:
     launchctl list | grep com.cerid.quenchforge
@@ -25,10 +26,12 @@
   Logs:
     tail -F ~/Library/Logs/quenchforge/quenchforge.out.log
 
-  KeepAlive=true means launchd auto-restarts the daemon if it dies
-  (Vega II prompt-cache crash, kill -9, OS upgrade, etc). When the
-  operator wants to stop it on purpose, `launchctl unload` removes
-  the job from supervision so KeepAlive doesn't fight them.
+  KeepAlive is <dict><key>SuccessfulExit</key><false/></dict>: launchd
+  restarts the daemon after a crash (Vega II prompt-cache crash, kill -9,
+  OS upgrade) but leaves a clean exit alone, because serve exits 0 with an
+  actionable message when it deliberately yields — a held port, or a set
+  of slots that cannot fit in VRAM. To stop it on purpose, boot the job
+  out of supervision with `launchctl bootout`.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -64,22 +67,32 @@
         <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin</string>
 
         <!--
-          Replace these three values with GGUF filenames that exist
-          under ~/.quenchforge/models/. Leave a value empty to skip
-          that slot (e.g. embed-only deployments).
+          Each value is a GGUF filename (without .gguf) under
+          ~/.quenchforge/models/. A slot whose model is not on disk is
+          NOT started and its lane returns 503 — serve says so at
+          startup and `quenchforge doctor` marks it MISSING — so only
+          name models you have pulled.
 
-          The chat-slot default is the smallest commonly-pre-loaded
-          quant; bump to qwen2.5:7b-instruct-q4_k_m or qwen2.5:14b for
-          a more capable model.
+          The chat default is what `quenchforge pull llama3.2:3b`
+          installs, which is the pull install.sh tells you to run. Swap
+          in a larger model (`quenchforge pull qwen2.5:7b` installs
+          qwen2.5-7b-instruct-q4_k_m) once it is downloaded.
         -->
         <key>QUENCHFORGE_DEFAULT_MODEL</key>
-        <string>qwen2.5:7b-instruct-q4_k_m</string>
+        <string>llama-3.2-3b-instruct-q4_k_m</string>
 
+        <!--
+          Embed and rerank are opt-in. Pull the model first, then put its
+          filename here:
+            quenchforge pull nomic-embed:v1.5
+            quenchforge pull bge-reranker:v2-m3
+          `quenchforge list` prints the on-disk name each one installed.
+        -->
         <key>QUENCHFORGE_EMBED_MODEL</key>
-        <string>nomic-embed-text-v1.5</string>
+        <string></string>
 
         <key>QUENCHFORGE_RERANK_MODEL</key>
-        <string>bge-reranker-v2-m3</string>
+        <string></string>
     </dict>
 
     <key>RunAtLoad</key>
