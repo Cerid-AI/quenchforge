@@ -18,6 +18,6 @@ func signalGroup(pid int, sig syscall.Signal) error {
 	return syscall.ENOSYS
 }
 
-func commandLineForPID(pid int) (string, error) {
-	return "", syscall.ENOSYS
+func processIdentity(pid int) (start, execPath string, err error) {
+	return "", "", syscall.ENOSYS
 }
