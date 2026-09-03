@@ -75,3 +75,52 @@ func TestPreflightSlotModels_ChatSuppressedWhenNoSlot(t *testing.T) {
 		t.Fatalf("--no-slot suppresses the chat slot; want no findings, got %v", unavailable)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// doctor — configured-slot vs model-registry cross-check.
+// ---------------------------------------------------------------------------
+
+func TestSlotLine_MarksAbsentModelMissing(t *testing.T) {
+	tmp := t.TempDir()
+	makeFakeGGUF(t, tmp, "present-model", 1<<20)
+
+	if got := slotLine(tmp, "present-model", 11502); strings.Contains(got, "MISSING") {
+		t.Errorf("model exists under %s; got %q", tmp, got)
+	}
+	got := slotLine(tmp, "absent-model", 11502)
+	if !strings.Contains(got, "MISSING") {
+		t.Errorf("model is absent from %s but doctor renders it as configured: %q", tmp, got)
+	}
+	if !strings.Contains(got, "absent-model") || !strings.Contains(got, "11502") {
+		t.Errorf("slot line lost the model name or port: %q", got)
+	}
+	if got := slotLine(tmp, "", 11502); strings.Contains(got, "MISSING") {
+		t.Errorf("an unconfigured slot is opt-in, not missing: %q", got)
+	}
+}
+
+func TestDoctor_MarksConfiguredSlotWithAbsentModelMissing(t *testing.T) {
+	skipIfNotDarwin(t)
+	tmp := t.TempDir()
+	t.Setenv("QUENCHFORGE_MODELS_DIR", tmp)
+	t.Setenv("QUENCHFORGE_RERANK_MODEL", "bge-reranker-v2-m3")
+
+	var stdout, stderr bytes.Buffer
+	if err := cmdDoctor(nil, &stdout, &stderr); err != nil {
+		t.Fatalf("cmdDoctor: %v", err)
+	}
+	out := stdout.String()
+	line := ""
+	for _, l := range strings.Split(out, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(l), "rerank:") {
+			line = l
+		}
+	}
+	if line == "" {
+		t.Fatalf("doctor output has no rerank slot line:\n%s", out)
+	}
+	if !strings.Contains(line, "MISSING") {
+		t.Errorf("rerank model is absent from the registry doctor prints below, "+
+			"but the slot line reports it as configured: %q", line)
+	}
+}
