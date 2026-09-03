@@ -156,9 +156,15 @@ notarize:
         # timeout is moot when wait: false, but goreleaser may still use
         # it for the initial submit upload. Keep at 30m for headroom.
         timeout: 30m
+      # Every artifact that ships. The universal ids were missing, which
+      # left the darwin_all tarball — the one install.sh downloads, under a
+      # header promising "signed + notarized" — carrying binaries that were
+      # never submitted. The per-arch ids feed the Homebrew bottle.
       ids:
         - quenchforge
         - quenchforge-preflight
+        - quenchforge-universal
+        - quenchforge-preflight-universal
 
 # ---------------------------------------------------------------------------
 # Homebrew tap — auto-update Formula/quenchforge.rb in cerid-ai/homebrew-tap

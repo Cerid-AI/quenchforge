@@ -58,6 +58,9 @@ jobs:
       - name: go vet
         run: go vet ./...
 
+      - name: release artifacts are all notarized
+        run: bash scripts/check-release-artifacts.sh
+
       # NB: no `go mod tidy` drift gate yet. The MVP is stdlib-only so
       # there's nothing for tidy to manage; we'll add the gate when Olla
       # is vendored in v0.2 (or earlier when we pull in a real dep).
