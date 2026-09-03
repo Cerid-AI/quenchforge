@@ -17,7 +17,9 @@
 //     fsync, rename to the final path on success. Partial downloads
 //     get cleaned up on failure or resumed via HTTP Range on retry.
 //   - ETag integrity: compare the SHA256 from HF's API to a local
-//     SHA256 of the downloaded bytes. Refuse to install on mismatch.
+//     SHA256 of the downloaded bytes. Refuse to install on mismatch — and
+//     refuse to install at all when HF published no SHA256, unless the
+//     operator passes --allow-unverified.
 //   - Progress reporting via an opt-in callback so the CLI can render
 //     a progress bar without this package depending on a TTY library.
 //   - Friendly aliases: a small embedded catalog of (alias, repo, file)
@@ -86,6 +88,10 @@ type Client struct {
 	baseURL    string
 	hfToken    string // HF_TOKEN for private/gated repos; empty = anonymous
 	modelsDir  string
+	// allowUnverified installs a GGUF for which HF published no SHA-256.
+	// Off by default: absent metadata is an unverifiable download, not a
+	// verified one.
+	allowUnverified bool
 }
 
 // New returns a Client. modelsDir is the destination for pulls; it's
@@ -103,6 +109,14 @@ func New(modelsDir string) *Client {
 // WithBaseURL overrides the HF API base — test injection only.
 func (c *Client) WithBaseURL(url string) *Client {
 	c.baseURL = strings.TrimRight(url, "/")
+	return c
+}
+
+// AllowUnverified opts in to installing a GGUF that HuggingFace publishes
+// without SHA-256 metadata. The pull is then unauthenticated bytes from the
+// network; the CLI surfaces it as `--allow-unverified`.
+func (c *Client) AllowUnverified(v bool) *Client {
+	c.allowUnverified = v
 	return c
 }
 
@@ -298,6 +312,17 @@ func (c *Client) Pull(ctx context.Context, spec Spec, progress ProgressFn) (stri
 		return "", err
 	}
 
+	// Fail closed. The package header and the README both promise SHA-256
+	// verification; when HF publishes no checksum there is nothing to verify
+	// against, and installing anyway turned "no metadata" into "verified".
+	if !c.allowUnverified && (entry.LFS == nil || entry.LFS.SHA256 == "") {
+		return "", fmt.Errorf(
+			"%s: HuggingFace published no SHA-256 for %q, so the download cannot be "+
+				"verified (file below the LFS threshold, a mirror, or a gated repo). "+
+				"Refusing to install. Re-run with --allow-unverified to accept "+
+				"unverified bytes.", spec.Repo, entry.Path)
+	}
+
 	localName := spec.LocalName
 	if localName == "" {
 		localName = strings.TrimSuffix(filepath.Base(entry.Path), ".gguf")
@@ -313,7 +338,9 @@ func (c *Client) Pull(ctx context.Context, spec Spec, progress ProgressFn) (stri
 		}
 		if info.Size() == expectedSize {
 			if entry.LFS == nil || entry.LFS.SHA256 == "" {
-				return finalPath, nil // size matches; no SHA to verify
+				// Only reachable under --allow-unverified: a size match is
+				// not verification, but the operator asked for it.
+				return finalPath, nil
 			}
 			actualSha, shaErr := fileSHA256(finalPath)
 			if shaErr == nil && actualSha == entry.LFS.SHA256 {
