@@ -517,12 +517,25 @@ func (g *Gateway) handleRoot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	g.mu.RLock()
+	// slotModel maps each kind to its configured model name, if any, so a
+	// configured slot's entry can name the model actually loaded there.
+	slotModel := map[SlotKind]string{
+		KindChat:       g.cfg.DefaultModel,
+		KindBackground: g.cfg.BackgroundModel,
+		KindEmbed:      g.cfg.EmbedModel,
+		KindCodeEmbed:  g.cfg.CodeEmbedModel,
+		KindRerank:     g.cfg.RerankModel,
+	}
 	slots := make(map[string]any, len(g.upstreams))
 	for k, v := range g.upstreams {
-		slots[string(k)] = map[string]any{
+		entry := map[string]any{
 			"configured": true,
 			"url":        v.url.String(),
 		}
+		if m := slotModel[k]; m != "" {
+			entry["model"] = strings.TrimSuffix(m, ".gguf")
+		}
+		slots[string(k)] = entry
 	}
 	// Always include known kinds in the report so consumers can see which
 	// ones aren't configured.
