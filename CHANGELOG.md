@@ -10,6 +10,11 @@ patch bumps fix bugs or polish without behaviour change.
 
 ## Unreleased
 
+- **`/api/tags` reports whether each cached model is loaded.** Every entry
+  now includes `loaded` (bool): true when the model's trimmed name matches
+  a configured slot whose upstream is registered, false for a cached
+  `.gguf` with no slot serving it. Uses the same slot/model normalisation
+  as `GET /`'s `slots.<kind>.model` so the two routes can't disagree.
 - **Root payload reports each configured slot's model.** `GET /`'s
   `slots.<kind>` entries now include `model` (the GGUF name, `.gguf`
   suffix trimmed) for every configured kind, so a caller can confirm

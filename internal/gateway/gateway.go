@@ -511,21 +511,26 @@ func (g *Gateway) ListenAddr() string {
 // Route handlers
 // ---------------------------------------------------------------------------
 
-func (g *Gateway) handleRoot(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
-		return
-	}
-	g.mu.RLock()
-	// slotModel maps each kind to its configured model name, if any, so a
-	// configured slot's entry can name the model actually loaded there.
-	slotModel := map[SlotKind]string{
+// slotModelNames maps each known slot kind to its configured model name (may
+// be empty). Shared by handleRoot and handleTags so both routes name a
+// slot's model — and decide whether a cached file is "loaded" — the same way.
+func (g *Gateway) slotModelNames() map[SlotKind]string {
+	return map[SlotKind]string{
 		KindChat:       g.cfg.DefaultModel,
 		KindBackground: g.cfg.BackgroundModel,
 		KindEmbed:      g.cfg.EmbedModel,
 		KindCodeEmbed:  g.cfg.CodeEmbedModel,
 		KindRerank:     g.cfg.RerankModel,
 	}
+}
+
+func (g *Gateway) handleRoot(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	g.mu.RLock()
+	slotModel := g.slotModelNames()
 	slots := make(map[string]any, len(g.upstreams))
 	for k, v := range g.upstreams {
 		entry := map[string]any{
@@ -639,6 +644,21 @@ func (g *Gateway) handleTags(w http.ResponseWriter, _ *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+
+	// A model is "loaded" when its trimmed name matches a configured slot
+	// whose upstream is actually registered — cached-but-unserved files
+	// report false. Same slotModel + .gguf-trim normalisation as handleRoot's
+	// slots.<kind>.model so the two routes cannot disagree.
+	g.mu.RLock()
+	slotModel := g.slotModelNames()
+	loaded := make(map[string]bool, len(g.upstreams))
+	for k := range g.upstreams {
+		if m := slotModel[k]; m != "" {
+			loaded[strings.TrimSuffix(m, ".gguf")] = true
+		}
+	}
+	g.mu.RUnlock()
+
 	// Ollama returns: {"models": [{"name", "modified_at", "size", "digest", ...}]}
 	out := make([]map[string]any, 0, len(models))
 	for _, m := range models {
@@ -648,6 +668,7 @@ func (g *Gateway) handleTags(w http.ResponseWriter, _ *http.Request) {
 			"modified_at": m.ModifiedAt.Format(time.RFC3339),
 			"size":        m.SizeBytes,
 			"digest":      m.Digest,
+			"loaded":      loaded[m.Name],
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"models": out})

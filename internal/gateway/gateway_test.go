@@ -174,6 +174,56 @@ func TestTagsEmptyWhenModelsDirMissing(t *testing.T) {
 	}
 }
 
+// TestTagsReportsLoadedForServedModel — a cached .gguf whose trimmed name
+// matches a configured slot with a registered upstream reports loaded=true;
+// a cached file with no matching slot reports loaded=false; every entry
+// carries the field.
+func TestTagsReportsLoadedForServedModel(t *testing.T) {
+	cfg := newTestConfig(t)
+	cfg.ListenAddr = pickListenAddr(t)
+	cfg.DefaultModel = "qwen2.5-7b.gguf"
+	if err := os.MkdirAll(cfg.ModelsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"qwen2.5-7b.gguf", "llama-3.2-3b-q4.gguf"} {
+		if err := os.WriteFile(filepath.Join(cfg.ModelsDir, name), []byte("not a real model"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	g := newRunningGateway(t, cfg)
+	chatUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer chatUpstream.Close()
+	if err := g.SetUpstream(KindChat, chatUpstream.URL); err != nil {
+		t.Fatalf("set chat: %v", err)
+	}
+
+	resp, err := http.Get("http://" + cfg.ListenAddr + "/api/tags")
+	if err != nil {
+		t.Fatalf("GET /api/tags: %v", err)
+	}
+	defer resp.Body.Close()
+	var got struct {
+		Models []map[string]any `json:"models"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("decode tags: %v", err)
+	}
+	if len(got.Models) != 2 {
+		t.Fatalf("models length = %d, want 2 (got %+v)", len(got.Models), got)
+	}
+	for _, m := range got.Models {
+		loaded, present := m["loaded"]
+		if !present {
+			t.Fatalf("model %v missing loaded field", m)
+		}
+		want := m["name"] == "qwen2.5-7b"
+		if loaded != want {
+			t.Errorf("model %v loaded = %v, want %v", m["name"], loaded, want)
+		}
+	}
+}
+
 func TestChatProxyReturns503WithoutUpstream(t *testing.T) {
 	cfg := newTestConfig(t)
 	cfg.ListenAddr = pickListenAddr(t)
