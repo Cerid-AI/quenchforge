@@ -685,6 +685,53 @@ func TestRootReportsKnownSlots(t *testing.T) {
 	}
 }
 
+// TestRootReportsSlotModels — a configured slot's entry names its model
+// (with any .gguf suffix trimmed); an unconfigured slot reports none.
+func TestRootReportsSlotModels(t *testing.T) {
+	cfg := newTestConfig(t)
+	cfg.ListenAddr = pickListenAddr(t)
+	cfg.DefaultModel = "qwen2.5-7b-instruct-q4_k_m.gguf"
+	cfg.BackgroundModel = "qwen2.5-3b-instruct-q4_k_m"
+	g := newRunningGateway(t, cfg)
+
+	chatUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer chatUpstream.Close()
+	backgroundUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer backgroundUpstream.Close()
+	if err := g.SetUpstream(KindChat, chatUpstream.URL); err != nil {
+		t.Fatalf("set chat: %v", err)
+	}
+	if err := g.SetUpstream(KindBackground, backgroundUpstream.URL); err != nil {
+		t.Fatalf("set background: %v", err)
+	}
+
+	resp, err := http.Get("http://" + cfg.ListenAddr + "/")
+	if err != nil {
+		t.Fatalf("GET /: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	var got struct {
+		Slots map[string]struct {
+			Configured bool   `json:"configured"`
+			Model      string `json:"model"`
+		} `json:"slots"`
+	}
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode /: %v body=%q", err, body)
+	}
+	if got.Slots["chat"].Model != "qwen2.5-7b-instruct-q4_k_m" {
+		t.Errorf("chat model = %q, want .gguf suffix trimmed", got.Slots["chat"].Model)
+	}
+	if got.Slots["background"].Model != cfg.BackgroundModel {
+		t.Errorf("background model = %q, want %q", got.Slots["background"].Model, cfg.BackgroundModel)
+	}
+	if got.Slots["embed"].Model != "" {
+		t.Errorf("embed model = %q, want empty (unconfigured)", got.Slots["embed"].Model)
+	}
+}
+
 func TestPortConflictDetection(t *testing.T) {
 	addr := pickListenAddr(t)
 	// Hold the port with a stand-in listener.

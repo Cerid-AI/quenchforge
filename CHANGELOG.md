@@ -10,6 +10,11 @@ patch bumps fix bugs or polish without behaviour change.
 
 ## Unreleased
 
+- **Root payload reports each configured slot's model.** `GET /`'s
+  `slots.<kind>` entries now include `model` (the GGUF name, `.gguf`
+  suffix trimmed) for every configured kind, so a caller can confirm
+  which model is actually loaded there instead of guessing from config.
+  Unconfigured kinds are unchanged.
 - **Background chat slot routed by model name.** Opt-in via
   `QUENCHFORGE_BACKGROUND_MODEL` (port `QUENCHFORGE_BACKGROUND_PORT`,
   default 11507): a second chat-class slot for a different GGUF (e.g. a
