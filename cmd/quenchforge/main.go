@@ -188,6 +188,8 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) error {
 	fmt.Fprintf(stdout, "  embed:        %s\n", slotLine(cfg.EmbedModel, cfg.EmbedPort))
 	fmt.Fprintf(stdout, "  code-embed:   %s   (routed by request model == cfg.CodeEmbedModel)\n",
 		slotLine(cfg.CodeEmbedModel, cfg.CodeEmbedPort))
+	fmt.Fprintf(stdout, "  background:   %s   (routed by request model == cfg.BackgroundModel)\n",
+		slotLine(cfg.BackgroundModel, cfg.BackgroundPort))
 	fmt.Fprintf(stdout, "  rerank:       %s\n", slotLine(cfg.RerankModel, cfg.RerankPort))
 	fmt.Fprintf(stdout, "  whisper:      %s\n", slotLine(cfg.WhisperModel, cfg.WhisperPort))
 	fmt.Fprintf(stdout, "  imagegen (sd):%s\n", slotLine(cfg.SDModel, cfg.SDPort))
@@ -798,6 +800,34 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 				fmt.Sprintf("http://127.0.0.1:%d", cfg.ChatPort))
 		}
 	}
+
+	// Background slot — opt-in via QUENCHFORGE_BACKGROUND_MODEL, a second
+	// chat-class slot loading a different GGUF (e.g. a small model for
+	// background enrichment tasks). Evaluates independently of --no-slot,
+	// same as embed/rerank below. The gateway dispatches /api/chat,
+	// /api/generate, and /v1/chat/completions requests here when the
+	// body's `model` field names cfg.BackgroundModel.
+	if cfg.BackgroundModel != "" {
+		s, err := startSlot(ctx, cfg, hwInfo, slotSpec{
+			Kind:      gateway.KindBackground,
+			Name:      "background",
+			Model:     cfg.BackgroundModel,
+			Port:      cfg.BackgroundPort,
+			ExtraArgs: nil,
+		}, maxLogBytes, logBackups, stderr)
+		if err != nil {
+			fmt.Fprintf(stderr,
+				"quenchforge: warning: background slot not started: %v\n"+
+					"  Chat requests naming %s will return 503.\n", err, cfg.BackgroundModel)
+		} else {
+			slots[gateway.KindBackground] = s
+			fmt.Fprintf(stdout, "quenchforge: background slot pid=%d model=%s port=%d\n",
+				s.PID(), cfg.BackgroundModel, cfg.BackgroundPort)
+			_ = g.SetUpstream(gateway.KindBackground,
+				fmt.Sprintf("http://127.0.0.1:%d", cfg.BackgroundPort))
+		}
+	}
+
 	{ // embed/rerank/whisper evaluate independently of --no-slot
 
 		// Embed slot — opt-in via QUENCHFORGE_EMBED_MODEL or --embed-model.

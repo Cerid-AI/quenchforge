@@ -118,6 +118,55 @@ func TestBuildSlotArgs_AMDChatGetsCorrectnessFlags(t *testing.T) {
 	}
 }
 
+// TestBuildSlotArgs_BackgroundGetsChatFlags mirrors
+// TestBuildSlotArgs_AMDChatGetsCorrectnessFlags: the background slot is
+// chat-class and shares chat's tuning (KernelParams maps KindBackground to
+// chatParams), so it must get the same GPU-route correctness flags and
+// must not re-grow the retired CPU-route-era flags.
+func TestBuildSlotArgs_BackgroundGetsChatFlags(t *testing.T) {
+	for _, profile := range []hardware.Profile{
+		hardware.ProfileVegaPro,
+		hardware.ProfileW6800X,
+		hardware.ProfileRDNA1,
+		hardware.ProfileRDNA2,
+	} {
+		t.Run(string(profile), func(t *testing.T) {
+			cfg := config.Config{MaxContext: 8192, PlaceBackground: "gpu"} // exercise GPU path (default is CPU)
+			info := hardware.Info{Profile: profile}
+			spec := slotSpec{
+				Kind: gateway.KindBackground,
+				Name: "background",
+				Port: 11507,
+			}
+			args := buildSlotArgs(cfg, info, spec, "/tmp/background.gguf")
+
+			if !containsArgPair(args, "--gpu-layers", "999") {
+				t.Errorf("background slot on %s missing --gpu-layers 999: %v", profile, args)
+			}
+			for _, retired := range []string{"--flash-attn", "--cache-ram", "--no-cache-prompt"} {
+				if containsArg(args, retired) {
+					t.Errorf("background slot on %s re-grew retired flag %s: %v",
+						profile, retired, args)
+				}
+			}
+		})
+	}
+}
+
+// TestBuildSlotArgs_BackgroundDefaultsToCPURoute mirrors chat's
+// AMD-discrete default placement: background follows chat's placement
+// default (CPU on AMD-discrete) when PlaceBackground is unset.
+func TestBuildSlotArgs_BackgroundDefaultsToCPURoute(t *testing.T) {
+	cfg := config.Config{MaxContext: 8192} // no PlaceBackground override
+	info := hardware.Info{Profile: hardware.ProfileVegaPro}
+	spec := slotSpec{Kind: gateway.KindBackground, Name: "background", Port: 11507}
+	args := buildSlotArgs(cfg, info, spec, "/tmp/background.gguf")
+
+	if !containsArgPair(args, "--gpu-layers", "0") {
+		t.Errorf("background slot on AMD-discrete should default to CPU route (--gpu-layers 0): %v", args)
+	}
+}
+
 func TestBuildSlotArgs_AMDEmbedRerankDontGetChatFlags(t *testing.T) {
 	// Embed and rerank slots don't autoregressively decode and don't
 	// touch the LCP-prompt-save path; the chat-slot safety flags

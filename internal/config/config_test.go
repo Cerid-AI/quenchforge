@@ -71,6 +71,7 @@ func TestValidateRejectsBadConfigs(t *testing.T) {
 			CodeEmbedPort:    11506,
 			EmbedCPUPort:     11511,
 			CodeEmbedCPUPort: 11516,
+			BackgroundPort:   11507,
 		}
 	}
 	cases := []struct {
@@ -91,11 +92,13 @@ func TestValidateRejectsBadConfigs(t *testing.T) {
 		{"code-embed port 0", func(c *Config) { c.CodeEmbedPort = 0 }, "CodeEmbedPort"},
 		{"embed-cpu port 0", func(c *Config) { c.EmbedCPUPort = 0 }, "EmbedCPUPort"},
 		{"code-embed-cpu port 0", func(c *Config) { c.CodeEmbedCPUPort = 0 }, "CodeEmbedCPUPort"},
+		{"background port 0", func(c *Config) { c.BackgroundPort = 0 }, "BackgroundPort"},
 		{"same embed embed-cpu port", func(c *Config) { c.EmbedCPUPort = c.EmbedPort }, "must differ"},
 		{"same chat embed port", func(c *Config) { c.EmbedPort = c.ChatPort }, "must differ"},
 		{"same chat rerank port", func(c *Config) { c.RerankPort = c.ChatPort }, "must differ"},
 		{"same embed whisper port", func(c *Config) { c.WhisperPort = c.EmbedPort }, "must differ"},
 		{"same embed code-embed port", func(c *Config) { c.CodeEmbedPort = c.EmbedPort }, "must differ"},
+		{"same chat background port", func(c *Config) { c.BackgroundPort = c.ChatPort }, "must differ"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

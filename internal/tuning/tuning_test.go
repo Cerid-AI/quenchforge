@@ -128,6 +128,42 @@ func TestKernelParams_ChatNonAMDIsEmpty(t *testing.T) {
 	}
 }
 
+// TestKernelParams_BackgroundAMDDefaultsToCPU mirrors
+// TestKernelParams_ChatAMDDefaultsToCPU: the background slot is
+// chat-class and shares chat's placement default and GPU-safety tuning.
+func TestKernelParams_BackgroundAMDDefaultsToCPU(t *testing.T) {
+	cfg := config.Config{MaxContext: 8192} // no PlaceBackground override
+	for _, p := range amdProfiles {
+		t.Run(string(p), func(t *testing.T) {
+			tn := KernelParams(p, vramHigh, gateway.KindBackground, cfg)
+			if !slices.Equal(tn.ExtraArgs, []string{"--gpu-layers", "0"}) {
+				t.Errorf("background AMD %s default ExtraArgs = %v, want [--gpu-layers 0] (CPU route)", p, tn.ExtraArgs)
+			}
+			if tn.MetalConcurrencyDisable {
+				t.Errorf("background AMD %s CPU route should NOT set MetalConcurrencyDisable", p)
+			}
+		})
+	}
+}
+
+// TestKernelParams_BackgroundNonAMDIsEmpty mirrors
+// TestKernelParams_ChatNonAMDIsEmpty.
+func TestKernelParams_BackgroundNonAMDIsEmpty(t *testing.T) {
+	cfg := config.Config{MaxContext: 8192}
+	for _, p := range allProfiles {
+		if profileIsAMDDiscrete(p) {
+			continue
+		}
+		t.Run(string(p), func(t *testing.T) {
+			tn := KernelParams(p, vramHigh, gateway.KindBackground, cfg)
+			if !slices.Equal(tn.ExtraArgs, nil) && len(tn.ExtraArgs) != 0 {
+				t.Errorf("background %s should emit no ExtraArgs, got %v",
+					p, tn.ExtraArgs)
+			}
+		})
+	}
+}
+
 func TestKernelParams_EmbedDefaultsByProfile(t *testing.T) {
 	// Non-AMD profiles use MaxContext for ubatch/batch on embed slots —
 	// long single inputs need the full natural model context as a single

@@ -38,6 +38,18 @@
 //	                            clients are unaffected.
 //	QUENCHFORGE_CODE_EMBED_PORT — supervised code-embed-slot port. Default
 //	                            11506 (11503-11505 reserved for whisper/sd/bark).
+//	QUENCHFORGE_BACKGROUND_MODEL — GGUF model for a second chat-class slot.
+//	                            Empty = no background slot; chat requests
+//	                            never route there. When set, the gateway
+//	                            dispatches /api/chat, /api/generate, and
+//	                            /v1/chat/completions requests whose `model`
+//	                            field names this model (GGUF basename,
+//	                            optionally with .gguf or an Ollama-style
+//	                            :tag suffix) to this slot instead of the
+//	                            primary chat slot — e.g. a small model for
+//	                            background enrichment tasks running
+//	                            alongside a larger interactive chat model.
+//	QUENCHFORGE_BACKGROUND_PORT — supervised background-slot port. Default 11507.
 //	QUENCHFORGE_RERANK_MODEL — GGUF reranker model (BGE-reranker etc.).
 //	                            Empty = no rerank slot; /v1/rerank 503s.
 //	QUENCHFORGE_RERANK_PORT  — supervised rerank-slot port. Default 11502.
@@ -159,6 +171,20 @@ type Config struct {
 	// Only used when PlaceCodeEmbed == "auto".
 	CodeEmbedCPUPort int
 
+	// BackgroundModel is the GGUF a second, chat-class slot loads. Empty
+	// means no background slot is started; chat requests never route
+	// there. When set, the gateway dispatches /api/chat, /api/generate,
+	// and /v1/chat/completions requests whose `model` field names this
+	// model to this slot instead of the primary chat slot — e.g. a small
+	// model for background enrichment tasks running alongside a larger
+	// interactive chat model. Placement defaults identically to chat
+	// (CPU on AMD-discrete, GPU otherwise).
+	BackgroundModel string
+
+	// BackgroundPort is where the supervised background slot binds.
+	// Default 11507.
+	BackgroundPort int
+
 	// RerankModel is the GGUF reranker model. Empty disables /v1/rerank.
 	RerankModel string
 
@@ -265,14 +291,17 @@ type Config struct {
 	// GovernorIntervalMS is how often the governor re-reads host pressure.
 	GovernorIntervalMS int
 
-	// Place{Chat,Embed,CodeEmbed,Rerank} override the per-kind device
-	// placement ("gpu" | "cpu" | "auto"). Empty = use the hardware-adaptive
-	// default from internal/placement (AMD-discrete: chat=cpu, others=gpu;
-	// non-AMD: all gpu). "auto" dual-places and routes per request by batch.
-	PlaceChat      string
-	PlaceEmbed     string
-	PlaceCodeEmbed string
-	PlaceRerank    string
+	// Place{Chat,Embed,CodeEmbed,Rerank,Background} override the per-kind
+	// device placement ("gpu" | "cpu" | "auto"). Empty = use the
+	// hardware-adaptive default from internal/placement (AMD-discrete:
+	// chat=cpu, others=gpu; non-AMD: all gpu). "auto" dual-places and
+	// routes per request by batch. Background follows chat's default
+	// on every hardware class.
+	PlaceChat       string
+	PlaceEmbed      string
+	PlaceCodeEmbed  string
+	PlaceRerank     string
+	PlaceBackground string
 
 	// AutoBatchThreshold is the input-count boundary the gateway uses to
 	// route "auto"-placed embedding requests: a request whose input count is
@@ -312,6 +341,8 @@ func Default() (Config, error) {
 		CodeEmbedModel:     "", // opt-in
 		CodeEmbedPort:      11506,
 		CodeEmbedCPUPort:   11516,
+		BackgroundModel:    "", // opt-in
+		BackgroundPort:     11507,
 		RerankModel:        "", // opt-in
 		RerankPort:         11502,
 		WhisperModel:       "", // opt-in
@@ -362,6 +393,8 @@ func Load() (Config, error) {
 	cfg.CodeEmbedModel = envOr("QUENCHFORGE_CODE_EMBED_MODEL", cfg.CodeEmbedModel)
 	cfg.CodeEmbedPort = envIntOr("QUENCHFORGE_CODE_EMBED_PORT", cfg.CodeEmbedPort)
 	cfg.CodeEmbedCPUPort = envIntOr("QUENCHFORGE_CODE_EMBED_CPU_PORT", cfg.CodeEmbedCPUPort)
+	cfg.BackgroundModel = envOr("QUENCHFORGE_BACKGROUND_MODEL", cfg.BackgroundModel)
+	cfg.BackgroundPort = envIntOr("QUENCHFORGE_BACKGROUND_PORT", cfg.BackgroundPort)
 	cfg.RerankModel = envOr("QUENCHFORGE_RERANK_MODEL", cfg.RerankModel)
 	cfg.RerankPort = envIntOr("QUENCHFORGE_RERANK_PORT", cfg.RerankPort)
 	cfg.WhisperModel = envOr("QUENCHFORGE_WHISPER_MODEL", cfg.WhisperModel)
@@ -388,6 +421,7 @@ func Load() (Config, error) {
 	cfg.PlaceEmbed = envOr("QUENCHFORGE_PLACE_EMBED", cfg.PlaceEmbed)
 	cfg.PlaceCodeEmbed = envOr("QUENCHFORGE_PLACE_CODE_EMBED", cfg.PlaceCodeEmbed)
 	cfg.PlaceRerank = envOr("QUENCHFORGE_PLACE_RERANK", cfg.PlaceRerank)
+	cfg.PlaceBackground = envOr("QUENCHFORGE_PLACE_BACKGROUND", cfg.PlaceBackground)
 	cfg.AutoBatchThreshold = envIntOr("QUENCHFORGE_AUTO_BATCH_THRESHOLD", cfg.AutoBatchThreshold)
 	cfg.TelemetryEnabled = envBoolOr("QUENCHFORGE_TELEMETRY", false)
 	cfg.AdvertiseMDNS = envBoolOr("QUENCHFORGE_ADVERTISE_MDNS", false)
@@ -439,6 +473,7 @@ func (c Config) Validate() error {
 		{"EmbedCPUPort", c.EmbedCPUPort},
 		{"CodeEmbedPort", c.CodeEmbedPort},
 		{"CodeEmbedCPUPort", c.CodeEmbedCPUPort},
+		{"BackgroundPort", c.BackgroundPort},
 		{"RerankPort", c.RerankPort},
 		{"WhisperPort", c.WhisperPort},
 		{"SDPort", c.SDPort},
@@ -455,6 +490,7 @@ func (c Config) Validate() error {
 		"EmbedCPUPort":     c.EmbedCPUPort,
 		"CodeEmbedPort":    c.CodeEmbedPort,
 		"CodeEmbedCPUPort": c.CodeEmbedCPUPort,
+		"BackgroundPort":   c.BackgroundPort,
 		"RerankPort":       c.RerankPort,
 		"WhisperPort":      c.WhisperPort,
 		"SDPort":           c.SDPort,

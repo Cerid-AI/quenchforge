@@ -17,8 +17,9 @@ func TestDevice(t *testing.T) {
 func TestAMDDefaults(t *testing.T) {
 	p := NewPolicy(true, nil)
 	// chat + rerank are latency / single-request bound — CPU beats the AMD
-	// Metal path on both. embed + code-embed are batched-throughput — GPU.
-	for _, k := range []string{KindChat, KindRerank} {
+	// Metal path on both. background is chat-class and follows chat's
+	// default. embed + code-embed are batched-throughput — GPU.
+	for _, k := range []string{KindChat, KindRerank, KindBackground} {
 		if p.Device(k) != CPU {
 			t.Errorf("AMD %s should default to CPU, got %v", k, p.Device(k))
 		}
@@ -32,7 +33,7 @@ func TestAMDDefaults(t *testing.T) {
 
 func TestNonAMDAllGPU(t *testing.T) {
 	p := NewPolicy(false, nil)
-	for _, k := range []string{KindChat, KindEmbed, KindCodeEmbed, KindRerank} {
+	for _, k := range []string{KindChat, KindEmbed, KindCodeEmbed, KindRerank, KindBackground} {
 		if p.Device(k) != GPU {
 			t.Errorf("non-AMD %s should be GPU, got %v", k, p.Device(k))
 		}
@@ -40,7 +41,7 @@ func TestNonAMDAllGPU(t *testing.T) {
 }
 
 func TestOverrides(t *testing.T) {
-	p := NewPolicy(true, map[string]string{"embed": "cpu", "chat": "GPU", "rerank": "garbage", "code-embed": ""})
+	p := NewPolicy(true, map[string]string{"embed": "cpu", "chat": "GPU", "rerank": "garbage", "code-embed": "", "background": "gpu"})
 	if p.Device(KindEmbed) != CPU {
 		t.Errorf("embed override to cpu failed: %v", p.Device(KindEmbed))
 	}
@@ -52,6 +53,9 @@ func TestOverrides(t *testing.T) {
 	}
 	if p.Device(KindCodeEmbed) != GPU {
 		t.Errorf("empty code-embed override should be ignored: %v", p.Device(KindCodeEmbed))
+	}
+	if p.Device(KindBackground) != GPU {
+		t.Errorf("background override to gpu failed: %v", p.Device(KindBackground))
 	}
 }
 
