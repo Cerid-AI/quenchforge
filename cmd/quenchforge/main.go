@@ -3,11 +3,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -183,17 +186,46 @@ func cmdDoctor(args []string, stdout, stderr io.Writer) error {
 	// Order mirrors gateway.SlotKind. Each "(opt-in)" annotation reflects
 	// whether the slot starts unconditionally (chat) or only when its
 	// model env var is set.
+	//
+	// Prefer the running gateway's own report of its slot config over this
+	// process's environment: a LaunchAgent can set a model env var (e.g.
+	// QUENCHFORGE_BACKGROUND_MODEL) for the live service that this `doctor`
+	// invocation's own shell never sees. Fall back to the process env (the
+	// previous behaviour) when the gateway can't be reached.
+	chatModel, chatPort := cfg.DefaultModel, cfg.ChatPort
+	embedModel, embedPort := cfg.EmbedModel, cfg.EmbedPort
+	codeEmbedModel, codeEmbedPort := cfg.CodeEmbedModel, cfg.CodeEmbedPort
+	backgroundModel, backgroundPort := cfg.BackgroundModel, cfg.BackgroundPort
+	rerankModel, rerankPort := cfg.RerankModel, cfg.RerankPort
+	whisperModel, whisperPort := cfg.WhisperModel, cfg.WhisperPort
+	sdModel, sdPort := cfg.SDModel, cfg.SDPort
+	barkModel, barkPort := cfg.BarkModel, cfg.BarkPort
+
 	fmt.Fprintln(stdout, "slots:")
-	fmt.Fprintf(stdout, "  chat:         model=%s port=%d\n", cfg.DefaultModel, cfg.ChatPort)
-	fmt.Fprintf(stdout, "  embed:        %s\n", slotLine(cfg.EmbedModel, cfg.EmbedPort))
+	live, liveErr := fetchGatewaySlots(cfg.ListenAddr)
+	if liveErr != nil {
+		fmt.Fprintf(stdout, "  (gateway unreachable at %s — showing this process's own environment: %v)\n",
+			cfg.ListenAddr, liveErr)
+	} else {
+		chatModel, chatPort = mergeLiveSlot(live["chat"], chatModel, chatPort)
+		embedModel, embedPort = mergeLiveSlot(live["embed"], embedModel, embedPort)
+		codeEmbedModel, codeEmbedPort = mergeLiveSlot(live["code-embed"], codeEmbedModel, codeEmbedPort)
+		backgroundModel, backgroundPort = mergeLiveSlot(live["background"], backgroundModel, backgroundPort)
+		rerankModel, rerankPort = mergeLiveSlot(live["rerank"], rerankModel, rerankPort)
+		whisperModel, whisperPort = mergeLiveSlot(live["whisper"], whisperModel, whisperPort)
+		sdModel, sdPort = mergeLiveSlot(live["imagegen"], sdModel, sdPort)
+		barkModel, barkPort = mergeLiveSlot(live["tts"], barkModel, barkPort)
+	}
+	fmt.Fprintf(stdout, "  chat:         model=%s port=%d\n", chatModel, chatPort)
+	fmt.Fprintf(stdout, "  embed:        %s\n", slotLine(embedModel, embedPort))
 	fmt.Fprintf(stdout, "  code-embed:   %s   (routed by request model == cfg.CodeEmbedModel)\n",
-		slotLine(cfg.CodeEmbedModel, cfg.CodeEmbedPort))
+		slotLine(codeEmbedModel, codeEmbedPort))
 	fmt.Fprintf(stdout, "  background:   %s   (routed by request model == cfg.BackgroundModel)\n",
-		slotLine(cfg.BackgroundModel, cfg.BackgroundPort))
-	fmt.Fprintf(stdout, "  rerank:       %s\n", slotLine(cfg.RerankModel, cfg.RerankPort))
-	fmt.Fprintf(stdout, "  whisper:      %s\n", slotLine(cfg.WhisperModel, cfg.WhisperPort))
-	fmt.Fprintf(stdout, "  imagegen (sd):%s\n", slotLine(cfg.SDModel, cfg.SDPort))
-	fmt.Fprintf(stdout, "  tts (bark):   %s\n", slotLine(cfg.BarkModel, cfg.BarkPort))
+		slotLine(backgroundModel, backgroundPort))
+	fmt.Fprintf(stdout, "  rerank:       %s\n", slotLine(rerankModel, rerankPort))
+	fmt.Fprintf(stdout, "  whisper:      %s\n", slotLine(whisperModel, whisperPort))
+	fmt.Fprintf(stdout, "  imagegen (sd):%s\n", slotLine(sdModel, sdPort))
+	fmt.Fprintf(stdout, "  tts (bark):   %s\n", slotLine(barkModel, barkPort))
 	fmt.Fprintln(stdout)
 
 	// llama-server binary check
@@ -1447,6 +1479,60 @@ func slotLine(model string, port int) string {
 		return fmt.Sprintf("(opt-in; port=%d)", port)
 	}
 	return fmt.Sprintf("model=%s port=%d", model, port)
+}
+
+// gatewaySlotInfo mirrors one entry of the gateway root payload's "slots"
+// map (gateway.handleRoot): {"configured", "model", "url"}.
+type gatewaySlotInfo struct {
+	Configured bool   `json:"configured"`
+	Model      string `json:"model"`
+	URL        string `json:"url"`
+}
+
+// fetchGatewaySlots asks a locally running gateway for its own view of slot
+// configuration (GET / -> {"slots": {...}}) so doctor can report what the
+// service actually loaded instead of this process's own environment, which
+// can disagree — e.g. a LaunchAgent sets QUENCHFORGE_BACKGROUND_MODEL for
+// the running service but not for a `doctor` invocation from a shell.
+func fetchGatewaySlots(listenAddr string) (map[string]gatewaySlotInfo, error) {
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://" + listenAddr + "/")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("status %d", resp.StatusCode)
+	}
+	var payload struct {
+		Slots map[string]gatewaySlotInfo `json:"slots"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+		return nil, err
+	}
+	return payload.Slots, nil
+}
+
+// mergeLiveSlot resolves one slot's displayed model+port from the running
+// gateway's report, falling back to this process's own config value for
+// any field the service didn't report (or when the slot isn't configured
+// there — the zero-value gatewaySlotInfo for a kind absent from the map
+// already has Configured == false).
+func mergeLiveSlot(live gatewaySlotInfo, fallbackModel string, fallbackPort int) (model string, port int) {
+	if !live.Configured {
+		return "", fallbackPort
+	}
+	model = live.Model
+	if model == "" {
+		model = fallbackModel
+	}
+	port = fallbackPort
+	if u, err := url.Parse(live.URL); err == nil {
+		if p, err := portFromListenAddr(u.Host); err == nil {
+			port = p
+		}
+	}
+	return model, port
 }
 
 // redactPath replaces the user's home dir with "~" when --redacted is set.

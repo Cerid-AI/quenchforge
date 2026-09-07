@@ -15,6 +15,13 @@ patch bumps fix bugs or polish without behaviour change.
   a configured slot whose upstream is registered, false for a cached
   `.gguf` with no slot serving it. Uses the same slot/model normalisation
   as `GET /`'s `slots.<kind>.model` so the two routes can't disagree.
+- **`doctor` describes the running service, not its own environment.**
+  The `slots:` section now queries the local gateway's `GET /` (2s
+  timeout) and reports the values it returns, falling back to this
+  process's own config only when the gateway can't be reached — a
+  LaunchAgent-set model env var (e.g. `QUENCHFORGE_BACKGROUND_MODEL`) no
+  longer looks unset just because a `doctor` invocation's own shell never
+  saw it.
 - **Root payload reports each configured slot's model.** `GET /`'s
   `slots.<kind>` entries now include `model` (the GGUF name, `.gguf`
   suffix trimmed) for every configured kind, so a caller can confirm

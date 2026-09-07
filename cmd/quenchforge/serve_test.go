@@ -5,6 +5,10 @@ package main
 
 import (
 	"bytes"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"regexp"
 	"runtime"
 	"strings"
@@ -564,6 +568,77 @@ func TestDoctor_ExplainModeAddsRemediation(t *testing.T) {
 	out := stdout.String()
 	if !strings.Contains(out, "Common remediations") {
 		t.Errorf("--explain output missing 'Common remediations' section.\nGot:\n%s", out)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// doctor — prefers the running gateway's own slot configuration over this
+// process's environment. A LaunchAgent can set a model env var (e.g.
+// QUENCHFORGE_BACKGROUND_MODEL) for the running service that a `doctor`
+// invocation from an interactive shell never sees, so doctor asks the
+// gateway itself before falling back to its own env.
+// ---------------------------------------------------------------------------
+
+func TestDoctor_PrefersRunningGatewaySlotConfig(t *testing.T) {
+	skipIfNotDarwin(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"slots":{
+			"chat":{"configured":true,"model":"served-chat-model","url":"http://127.0.0.1:11500"},
+			"background":{"configured":true,"model":"served-bg-model","url":"http://127.0.0.1:19507"},
+			"embed":{"configured":false}
+		}}`)
+	}))
+	defer srv.Close()
+
+	// This process's own env never sets QUENCHFORGE_BACKGROUND_MODEL —
+	// doctor's own config.Load() would report background as opt-in were it
+	// not for the live query above taking precedence.
+	t.Setenv("QUENCHFORGE_LISTEN_ADDR", srv.Listener.Addr().String())
+
+	var stdout, stderr bytes.Buffer
+	if err := cmdDoctor(nil, &stdout, &stderr); err != nil {
+		t.Fatalf("cmdDoctor: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "chat:         model=served-chat-model port=11500") {
+		t.Errorf("doctor output should show the running service's chat model+port, got:\n%s", out)
+	}
+	if !strings.Contains(out, "background:   model=served-bg-model port=19507") {
+		t.Errorf("doctor output should show the running service's background model+port, got:\n%s", out)
+	}
+}
+
+func TestDoctor_FallsBackToOwnEnvWhenGatewayUnreachable(t *testing.T) {
+	skipIfNotDarwin(t)
+	// Grab a free port, then close it immediately so the gateway query
+	// fails fast against a closed connection.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := ln.Addr().String()
+	if err := ln.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("QUENCHFORGE_LISTEN_ADDR", addr)
+	t.Setenv("QUENCHFORGE_DEFAULT_MODEL", "process-env-model")
+
+	var stdout, stderr bytes.Buffer
+	if err := cmdDoctor(nil, &stdout, &stderr); err != nil {
+		t.Fatalf("cmdDoctor: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "chat:         model=process-env-model") {
+		t.Errorf("doctor should fall back to its own env when the gateway is unreachable, got:\n%s", out)
+	}
+	if !strings.Contains(out, "gateway unreachable") {
+		t.Errorf("doctor should note the gateway was unreachable, got:\n%s", out)
 	}
 }
 
