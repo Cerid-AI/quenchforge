@@ -150,7 +150,7 @@ func KernelParamsForDevice(profile hardware.Profile, vramGB int, kind gateway.Sl
 // is made by the callers above.
 func gpuKernelParams(profile hardware.Profile, vramGB int, kind gateway.SlotKind, cfg config.Config) SlotTuning {
 	switch kind {
-	case gateway.KindChat:
+	case gateway.KindChat, gateway.KindBackground:
 		return chatParams(profile, vramGB)
 	case gateway.KindEmbed, gateway.KindCodeEmbed:
 		return embedParams(profile, vramGB, cfg)
@@ -166,10 +166,11 @@ func gpuKernelParams(profile hardware.Profile, vramGB int, kind gateway.SlotKind
 // policy for per-request "auto" routing decisions.
 func PolicyFor(profile hardware.Profile, cfg config.Config) placement.Policy {
 	return placement.NewPolicy(profileIsAMDDiscrete(profile), map[string]string{
-		placement.KindChat:      cfg.PlaceChat,
-		placement.KindEmbed:     cfg.PlaceEmbed,
-		placement.KindCodeEmbed: cfg.PlaceCodeEmbed,
-		placement.KindRerank:    cfg.PlaceRerank,
+		placement.KindChat:       cfg.PlaceChat,
+		placement.KindEmbed:      cfg.PlaceEmbed,
+		placement.KindCodeEmbed:  cfg.PlaceCodeEmbed,
+		placement.KindRerank:     cfg.PlaceRerank,
+		placement.KindBackground: cfg.PlaceBackground,
 	})
 }
 

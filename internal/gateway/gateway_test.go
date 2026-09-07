@@ -397,6 +397,101 @@ func TestEmbedDispatchByModelName(t *testing.T) {
 	}
 }
 
+// TestChatDispatchByModelName confirms the model-name routing rule for
+// chat: requests whose body's `model` field names Config.BackgroundModel
+// (as GGUF basename, optionally with .gguf or an Ollama-style :tag suffix)
+// land on the KindBackground upstream; anything else lands on KindChat.
+// Unlike TestEmbedDispatchByModelName's fallback-on-miss, an explicit
+// background-model request gets a 503 — not a silent redirect to chat —
+// when no background upstream is registered. Covers both the
+// Ollama-translated path (/api/chat) and the OpenAI-native passthrough
+// (/v1/chat/completions).
+func TestChatDispatchByModelName(t *testing.T) {
+	const openAIChatBody = `{"id":"x","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{}}`
+
+	var chatHits, backgroundHits int
+	chatUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		chatHits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(openAIChatBody))
+	}))
+	defer chatUpstream.Close()
+	backgroundUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		backgroundHits++
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(openAIChatBody))
+	}))
+	defer backgroundUpstream.Close()
+
+	cfg := newTestConfig(t)
+	cfg.ListenAddr = pickListenAddr(t)
+	cfg.BackgroundModel = "bg-model" // arm dispatch
+	g := newRunningGateway(t, cfg)
+	if err := g.SetUpstream(KindChat, chatUpstream.URL); err != nil {
+		t.Fatalf("set chat: %v", err)
+	}
+	if err := g.SetUpstream(KindBackground, backgroundUpstream.URL); err != nil {
+		t.Fatalf("set background: %v", err)
+	}
+
+	reqBody := func(model string) string {
+		return fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hi"}],"stream":false}`, model)
+	}
+
+	cases := []struct {
+		path                     string
+		body                     string
+		wantChat, wantBackground int
+	}{
+		{"/api/chat", reqBody("main-chat"), 1, 0},
+		{"/api/chat", reqBody("bg-model"), 0, 1},
+		// Name-normalization variants: .gguf suffix and an Ollama-style
+		// :tag suffix must both still match.
+		{"/api/chat", reqBody("bg-model.gguf"), 0, 1},
+		{"/api/chat", reqBody("bg-model:latest"), 0, 1},
+		{"/v1/chat/completions", reqBody("main-chat"), 1, 0},
+		{"/v1/chat/completions", reqBody("bg-model"), 0, 1},
+	}
+	for _, tc := range cases {
+		chatHits, backgroundHits = 0, 0
+		resp, err := http.Post("http://"+cfg.ListenAddr+tc.path,
+			"application/json", strings.NewReader(tc.body))
+		if err != nil {
+			t.Errorf("%s body=%q: %v", tc.path, tc.body, err)
+			continue
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if chatHits != tc.wantChat || backgroundHits != tc.wantBackground {
+			t.Errorf("%s body=%q: chat=%d background=%d (want chat=%d background=%d)",
+				tc.path, tc.body, chatHits, backgroundHits, tc.wantChat, tc.wantBackground)
+		}
+	}
+
+	// No background upstream registered: an explicit background-model
+	// request must 503, not silently fall back to the chat slot.
+	if err := g.SetUpstream(KindBackground, ""); err != nil {
+		t.Fatalf("clear background: %v", err)
+	}
+	chatHits, backgroundHits = 0, 0
+	for _, path := range []string{"/api/chat", "/v1/chat/completions"} {
+		resp, err := http.Post("http://"+cfg.ListenAddr+path,
+			"application/json", strings.NewReader(reqBody("bg-model")))
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Errorf("%s background w/o upstream: status = %d, want 503", path, resp.StatusCode)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+	}
+	if chatHits != 0 || backgroundHits != 0 {
+		t.Errorf("background w/o upstream should not touch either upstream: chat=%d background=%d",
+			chatHits, backgroundHits)
+	}
+}
+
 // TestPullReturns501 — Quenchforge's MVP doesn't pull from a registry.
 func TestPullReturns501(t *testing.T) {
 	cfg := newTestConfig(t)

@@ -74,6 +74,17 @@
 
         <key>QUENCHFORGE_RERANK_MODEL</key>
         <string>bge-reranker-v2-m3</string>
+
+        <!--
+          Opt-in second chat-class slot for background enrichment tasks
+          (e.g. a small model running alongside the primary chat model
+          above). The gateway routes /api/chat, /api/generate, and
+          /v1/chat/completions requests here when the request's `model`
+          field names this model. Uncomment and set a value to enable.
+
+        <key>QUENCHFORGE_BACKGROUND_MODEL</key>
+        <string>qwen2.5-3b-instruct-q4_k_m</string>
+        -->
     </dict>
 
     <key>RunAtLoad</key>

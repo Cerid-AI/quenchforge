@@ -8,6 +8,19 @@ patch bumps fix bugs or polish without behaviour change.
 
 ---
 
+## Unreleased
+
+- **Background chat slot routed by model name.** Opt-in via
+  `QUENCHFORGE_BACKGROUND_MODEL` (port `QUENCHFORGE_BACKGROUND_PORT`,
+  default 11507): a second chat-class slot for a different GGUF (e.g. a
+  small model for background enrichment alongside a larger interactive
+  chat model). The gateway routes `/api/chat`, `/api/generate`, and
+  `/v1/chat/completions` requests to it when the request's `model` names
+  it; other names keep going to the primary chat slot; a request that
+  explicitly names the background model 503s (not a silent fallback)
+  when the slot isn't up. Placement (`QUENCHFORGE_PLACE_BACKGROUND`) and
+  tuning default identically to the chat slot.
+
 ## v0.10.1 — supervisor lifecycle hardening (post-incident) (2026-07-12)
 
 Driven by the 2026-07-11 incident on the reference Mac Pro: a jetsam-class

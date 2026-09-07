@@ -64,10 +64,11 @@ const (
 // Canonical slot-kind keys (mirror gateway.SlotKind string values; kept as
 // strings here to avoid an import cycle).
 const (
-	KindChat      = "chat"
-	KindEmbed     = "embed"
-	KindCodeEmbed = "code-embed"
-	KindRerank    = "rerank"
+	KindChat       = "chat"
+	KindEmbed      = "embed"
+	KindCodeEmbed  = "code-embed"
+	KindRerank     = "rerank"
+	KindBackground = "background"
 )
 
 // Policy maps each slot kind to a placement mode.
@@ -95,11 +96,13 @@ func NewPolicy(amdDiscrete bool, overrides map[string]string) Policy {
 		m[KindEmbed] = ModeGPU
 		m[KindCodeEmbed] = ModeGPU
 		m[KindRerank] = ModeCPU
+		m[KindBackground] = ModeCPU
 	} else {
 		m[KindChat] = ModeGPU
 		m[KindEmbed] = ModeGPU
 		m[KindCodeEmbed] = ModeGPU
 		m[KindRerank] = ModeGPU
+		m[KindBackground] = ModeGPU
 	}
 	for k, v := range overrides {
 		if mode := normalizeMode(v); mode != "" {

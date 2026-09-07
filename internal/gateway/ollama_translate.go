@@ -169,17 +169,14 @@ type openAIEmbedResponse struct {
 // generateMode=true means /api/generate's `prompt` field is read instead
 // of `messages` and turned into a single user-role message. `system`
 // becomes a leading system-role message when set.
+//
+// Model-name dispatch: when the request body's `model` field matches
+// Config.BackgroundModel, the call is routed to KindBackground instead of
+// KindChat. Unlike embed's fallback-on-miss, a request that explicitly
+// names the background model gets a 503 (not a silent redirect to the
+// chat slot) when no background upstream is registered.
 func (g *Gateway) handleOllamaChat(generateMode bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		g.mu.RLock()
-		entry, ok := g.upstreams[KindChat]
-		g.mu.RUnlock()
-		if !ok || entry.proxy == nil {
-			writeJSONError(w, http.StatusServiceUnavailable,
-				"no chat slot configured. Check `quenchforge doctor` for status.")
-			return
-		}
-
 		// Buffer body — we need to read it twice (parse, then forward).
 		raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBodyBytes))
 		if err != nil {
@@ -232,6 +229,19 @@ func (g *Gateway) handleOllamaChat(generateMode bool) http.HandlerFunc {
 			format = req.Format
 		}
 
+		// Resolve the upstream before validating the rest of the body —
+		// matches the pre-dispatch behavior where an unconfigured slot
+		// 503s regardless of what else is wrong with the request.
+		kind := g.resolveChatKind(model)
+		g.mu.RLock()
+		entry, ok := g.upstreams[kind]
+		g.mu.RUnlock()
+		if !ok || entry.proxy == nil {
+			writeJSONError(w, http.StatusServiceUnavailable,
+				fmt.Sprintf("no %s slot configured. Check `quenchforge doctor` for status.", kind))
+			return
+		}
+
 		if len(messages) == 0 {
 			writeJSONError(w, http.StatusBadRequest,
 				"request has no messages")
@@ -277,46 +287,50 @@ func (g *Gateway) handleOllamaChat(generateMode bool) http.HandlerFunc {
 		}
 
 		upstreamURL := strings.TrimRight(entry.url.String(), "/") + "/v1/chat/completions"
-		req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL,
+		upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL,
 			bytes.NewReader(body))
 		if err != nil {
 			writeJSONError(w, http.StatusInternalServerError,
 				fmt.Sprintf("build upstream request: %v", err))
 			return
 		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Accept", "application/json")
+		upReq.Header.Set("Content-Type", "application/json")
+		upReq.Header.Set("Accept", "application/json")
 		// Propagate the Authorization header if a caller set one — useful
 		// when llama-server is bound to a non-loopback interface and the
 		// gateway sits in front of an auth proxy. No-op locally.
 		if auth := r.Header.Get("Authorization"); auth != "" {
-			req.Header.Set("Authorization", auth)
+			upReq.Header.Set("Authorization", auth)
 		}
 
-		resp, err := translateHTTPClient.Do(req)
-		if err != nil {
-			writeJSONError(w, http.StatusBadGateway,
-				fmt.Sprintf("chat upstream %s unreachable: %v",
-					entry.url.Host, err))
-			return
-		}
-		defer resp.Body.Close()
+		// Gated on the resolved kind so a background-slot request is
+		// admitted/prioritised independently of the primary chat slot.
+		g.gated(kind, func(w http.ResponseWriter, r *http.Request) {
+			resp, err := translateHTTPClient.Do(upReq)
+			if err != nil {
+				writeJSONError(w, http.StatusBadGateway,
+					fmt.Sprintf("chat upstream %s unreachable: %v",
+						entry.url.Host, err))
+				return
+			}
+			defer resp.Body.Close()
 
-		// Upstream non-2xx — pass the status code and best-effort message
-		// through. llama-server returns OpenAI-style { "error": { "message", "type" } };
-		// translate that into Ollama-style { "error": "..." }.
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
-			writeJSONError(w, resp.StatusCode,
-				extractOpenAIErrorMessage(body))
-			return
-		}
+			// Upstream non-2xx — pass the status code and best-effort message
+			// through. llama-server returns OpenAI-style { "error": { "message", "type" } };
+			// translate that into Ollama-style { "error": "..." }.
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+				writeJSONError(w, resp.StatusCode,
+					extractOpenAIErrorMessage(body))
+				return
+			}
 
-		if streamFlag {
-			streamOllamaChat(w, resp.Body, model)
-		} else {
-			respondOllamaChat(w, resp.Body, model)
-		}
+			if streamFlag {
+				streamOllamaChat(w, resp.Body, model)
+			} else {
+				respondOllamaChat(w, resp.Body, model)
+			}
+		})(w, r)
 	}
 }
 

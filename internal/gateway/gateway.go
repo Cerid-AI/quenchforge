@@ -67,10 +67,20 @@ const (
 	// general-text embedder (for KB / RAG) alongside a code-tuned embedder
 	// (for semantic-code-search MCPs) without forcing operators to choose.
 	KindCodeEmbed SlotKind = "code-embed"
-	KindRerank    SlotKind = "rerank"
-	KindWhisper   SlotKind = "whisper"
-	KindImageGen  SlotKind = "imagegen"
-	KindTTS       SlotKind = "tts"
+	// KindBackground is a *second* chat-class slot dedicated to a
+	// different model — e.g. a small model for background enrichment
+	// tasks running alongside a larger interactive chat model. Requests
+	// arriving at /api/chat, /api/generate, or /v1/chat/completions whose
+	// `model` names Config.BackgroundModel are dispatched here instead of
+	// KindChat. Unlike KindCodeEmbed's fallback-on-miss behavior, a
+	// request that explicitly names the background model gets a 503 (not
+	// a silent fall-through to chat) when no background upstream is
+	// registered — the caller asked for a specific model.
+	KindBackground SlotKind = "background"
+	KindRerank     SlotKind = "rerank"
+	KindWhisper    SlotKind = "whisper"
+	KindImageGen   SlotKind = "imagegen"
+	KindTTS        SlotKind = "tts"
 )
 
 // String implements fmt.Stringer.
@@ -148,7 +158,7 @@ func (g *Gateway) SetScheduler(s *scheduler.Scheduler) {
 // chat is admitted ahead of batch embed/rerank when GPU headroom is scarce.
 func priorityForKind(kind SlotKind) scheduler.Priority {
 	switch kind {
-	case KindChat:
+	case KindChat, KindBackground:
 		return scheduler.PriorityChat
 	case KindEmbed, KindCodeEmbed:
 		return scheduler.PriorityEmbed
@@ -409,11 +419,18 @@ func (g *Gateway) Start(ctx context.Context) error {
 	// chat (Ollama + OpenAI surfaces).  llama-server only speaks the
 	// OpenAI wire — /api/chat and /api/generate are translated by the
 	// handlers in ollama_translate.go so Ollama clients work end-to-end.
-	// /v1/chat/completions is OpenAI-native and goes through the simple
-	// reverse-proxy path unchanged.
-	mux.HandleFunc("/api/chat", g.gated(KindChat, g.handleOllamaChat(false)))
-	mux.HandleFunc("/api/generate", g.gated(KindChat, g.handleOllamaChat(true)))
-	mux.HandleFunc("/v1/chat/completions", g.gated(KindChat, g.proxyHandler(KindChat, "")))
+	// /v1/chat/completions is OpenAI-native and goes through a peek-and-proxy
+	// handler.
+	// Chat self-admits: the handlers resolve the chat kind (KindChat vs
+	// KindBackground) from the request's `model` field and apply GPU
+	// admission via gated() for that resolved kind — so a background-slot
+	// request is gated/prioritised independently of the primary chat slot.
+	// Wrapping the route registration in gated(KindChat, …) would apply the
+	// wrong kind's placement/priority to background traffic, so the route
+	// registration is bare.
+	mux.HandleFunc("/api/chat", g.handleOllamaChat(false))
+	mux.HandleFunc("/api/generate", g.handleOllamaChat(true))
+	mux.HandleFunc("/v1/chat/completions", g.handleOpenAIChat())
 	// embeddings (Ollama + OpenAI surfaces).  Same translation story:
 	// /api/embeddings and /api/embed are Ollama wire, translated to
 	// /v1/embeddings on the upstream embed slot; /v1/embeddings is
@@ -509,7 +526,7 @@ func (g *Gateway) handleRoot(w http.ResponseWriter, r *http.Request) {
 	}
 	// Always include known kinds in the report so consumers can see which
 	// ones aren't configured.
-	for _, k := range []SlotKind{KindChat, KindEmbed, KindCodeEmbed, KindRerank, KindWhisper, KindImageGen, KindTTS} {
+	for _, k := range []SlotKind{KindChat, KindEmbed, KindCodeEmbed, KindBackground, KindRerank, KindWhisper, KindImageGen, KindTTS} {
 		if _, ok := slots[string(k)]; !ok {
 			slots[string(k)] = map[string]any{"configured": false}
 		}
@@ -842,6 +859,87 @@ func (g *Gateway) handleOpenAIEmbeddings() http.HandlerFunc {
 // peek shares the limit.
 func readAllLimited(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 	return io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBodyBytes))
+}
+
+// normalizeModelName reduces a caller-supplied model name to the form
+// /api/tags reports (see EnumerateModels): the GGUF basename with any
+// ".gguf" extension and any Ollama-style ":tag" suffix (e.g. ":latest")
+// stripped. Used to compare a request's `model` field against
+// Config.BackgroundModel regardless of which of those forms the caller
+// sent.
+func normalizeModelName(name string) string {
+	name = strings.TrimSuffix(name, ".gguf")
+	if i := strings.LastIndex(name, ":"); i >= 0 {
+		name = name[:i]
+	}
+	return name
+}
+
+// resolveChatKind picks the chat slot kind for an inbound request by
+// matching the request's `model` field against Config.BackgroundModel.
+//
+//   - Empty BackgroundModel, or no model in the request → always KindChat
+//     (legacy single-slot behavior).
+//   - model (normalized) == BackgroundModel → KindBackground.
+//   - Anything else → KindChat.
+//
+// Unlike resolveEmbedKind, a match here does NOT check whether the
+// background upstream is registered — that check, and the resulting 503,
+// is the caller's responsibility. A caller that explicitly asked for the
+// background model must not be silently redirected to the (different)
+// chat model when the background slot isn't up.
+func (g *Gateway) resolveChatKind(model string) SlotKind {
+	if g.cfg.BackgroundModel == "" || model == "" {
+		return KindChat
+	}
+	if normalizeModelName(model) != g.cfg.BackgroundModel {
+		return KindChat
+	}
+	return KindBackground
+}
+
+// handleOpenAIChat is the OpenAI-native /v1/chat/completions entry point.
+// Peeks at the body's `model` field to dispatch between KindChat and
+// KindBackground, then reverse-proxies to the chosen upstream under GPU
+// admission for that kind. Replaces the static proxyHandler(KindChat, "")
+// registration for this route so a single quenchforge process can serve a
+// background chat-class slot alongside the primary chat slot.
+func (g *Gateway) handleOpenAIChat() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		raw, err := readAllLimited(w, r)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest,
+				fmt.Sprintf("read request body: %v", err))
+			return
+		}
+		// Minimal probe — only `model` matters for routing; everything
+		// else passes through unchanged. We re-attach the body below.
+		var probe struct {
+			Model string `json:"model"`
+		}
+		_ = json.Unmarshal(raw, &probe) // tolerate empty/invalid bodies; let upstream reject
+		kind := g.resolveChatKind(probe.Model)
+		g.mu.RLock()
+		entry, ok := g.upstreams[kind]
+		g.mu.RUnlock()
+		if !ok || entry.proxy == nil {
+			writeJSONError(w, http.StatusServiceUnavailable,
+				fmt.Sprintf("no %s slot configured. Check `quenchforge doctor` for status.", kind))
+			return
+		}
+		if g.shouldBackoff(kind) {
+			w.Header().Set("Retry-After", "2")
+			writeJSONError(w, http.StatusServiceUnavailable,
+				fmt.Sprintf("%s slot is shedding load (critical error rate) — back off (Retry-After: 2s)", kind))
+			return
+		}
+		// Re-attach the consumed body so the reverse-proxy can forward it.
+		r.Body = io.NopCloser(bytes.NewReader(raw))
+		r.ContentLength = int64(len(raw))
+		g.gated(kind, func(w http.ResponseWriter, r *http.Request) {
+			g.serveAndTrack(kind, entry.proxy, w, r)
+		})(w, r)
+	}
 }
 
 // handlePull is a deliberate stub. Ollama's /api/pull downloads a model
