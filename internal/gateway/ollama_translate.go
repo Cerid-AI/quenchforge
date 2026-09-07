@@ -177,6 +177,22 @@ type openAIEmbedResponse struct {
 // chat slot) when no background upstream is registered.
 func (g *Gateway) handleOllamaChat(generateMode bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// The primary chat slot's availability is checked FIRST, before the
+		// body is even read — matches the pre-dispatch behavior where an
+		// unconfigured chat slot 503s regardless of what else is wrong with
+		// the request (malformed JSON, an oversized body, …). Only once we
+		// know a request actually resolves to the background slot (which
+		// requires parsing the body's `model` field) do we check that
+		// slot's own availability separately, below.
+		g.mu.RLock()
+		chatEntry, chatOK := g.upstreams[KindChat]
+		g.mu.RUnlock()
+		if !chatOK || chatEntry.proxy == nil {
+			writeJSONError(w, http.StatusServiceUnavailable,
+				"no chat slot configured. Check `quenchforge doctor` for status.")
+			return
+		}
+
 		// Buffer body — we need to read it twice (parse, then forward).
 		raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBodyBytes))
 		if err != nil {
@@ -229,17 +245,21 @@ func (g *Gateway) handleOllamaChat(generateMode bool) http.HandlerFunc {
 			format = req.Format
 		}
 
-		// Resolve the upstream before validating the rest of the body —
-		// matches the pre-dispatch behavior where an unconfigured slot
-		// 503s regardless of what else is wrong with the request.
+		// The chat slot's own availability was already confirmed above;
+		// only a request that resolves to the background slot needs its
+		// own upstream check here.
 		kind := g.resolveChatKind(model)
-		g.mu.RLock()
-		entry, ok := g.upstreams[kind]
-		g.mu.RUnlock()
-		if !ok || entry.proxy == nil {
-			writeJSONError(w, http.StatusServiceUnavailable,
-				fmt.Sprintf("no %s slot configured. Check `quenchforge doctor` for status.", kind))
-			return
+		entry := chatEntry
+		if kind == KindBackground {
+			g.mu.RLock()
+			bgEntry, ok := g.upstreams[KindBackground]
+			g.mu.RUnlock()
+			if !ok || bgEntry.proxy == nil {
+				writeJSONError(w, http.StatusServiceUnavailable,
+					fmt.Sprintf("no %s slot configured. Check `quenchforge doctor` for status.", kind))
+				return
+			}
+			entry = bgEntry
 		}
 
 		if len(messages) == 0 {

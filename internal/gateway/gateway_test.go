@@ -4,6 +4,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -408,19 +409,36 @@ func TestEmbedDispatchByModelName(t *testing.T) {
 // (/v1/chat/completions).
 func TestChatDispatchByModelName(t *testing.T) {
 	const openAIChatBody = `{"id":"x","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{}}`
+	// A tiny SSE stream shaped like llama-server's streaming output. Used to
+	// confirm /v1/chat/completions forwards a streaming upstream response to
+	// the client byte-for-byte (no buffering/re-encoding).
+	const sseBody = "data: {\"id\":\"x\",\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hi\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
 
-	var chatHits, backgroundHits int
-	chatUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		chatHits++
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(openAIChatBody))
-	}))
+	var (
+		chatHits, backgroundHits         int
+		lastChatBody, lastBackgroundBody []byte
+	)
+	// Each stub records the exact bytes it received and, for a
+	// `"stream":true` request, echoes back an SSE body instead of a plain
+	// JSON completion — lets the same stub cover both the non-streaming
+	// hit-counting cases and the streaming-passthrough case below.
+	stub := func(hits *int, lastBody *[]byte) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			*hits++
+			b, _ := io.ReadAll(r.Body)
+			*lastBody = b
+			if bytes.Contains(b, []byte(`"stream":true`)) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, sseBody)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(openAIChatBody))
+		}
+	}
+	chatUpstream := httptest.NewServer(stub(&chatHits, &lastChatBody))
 	defer chatUpstream.Close()
-	backgroundUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		backgroundHits++
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(openAIChatBody))
-	}))
+	backgroundUpstream := httptest.NewServer(stub(&backgroundHits, &lastBackgroundBody))
 	defer backgroundUpstream.Close()
 
 	cfg := newTestConfig(t)
@@ -442,18 +460,23 @@ func TestChatDispatchByModelName(t *testing.T) {
 		path                     string
 		body                     string
 		wantChat, wantBackground int
+		// wantEcho, when true, additionally asserts the upstream received
+		// exactly `body` — only holds for /v1/chat/completions, which is a
+		// raw byte passthrough; /api/chat re-encodes into the OpenAI shape.
+		wantEcho bool
 	}{
-		{"/api/chat", reqBody("main-chat"), 1, 0},
-		{"/api/chat", reqBody("bg-model"), 0, 1},
+		{"/api/chat", reqBody("main-chat"), 1, 0, false},
+		{"/api/chat", reqBody("bg-model"), 0, 1, false},
 		// Name-normalization variants: .gguf suffix and an Ollama-style
 		// :tag suffix must both still match.
-		{"/api/chat", reqBody("bg-model.gguf"), 0, 1},
-		{"/api/chat", reqBody("bg-model:latest"), 0, 1},
-		{"/v1/chat/completions", reqBody("main-chat"), 1, 0},
-		{"/v1/chat/completions", reqBody("bg-model"), 0, 1},
+		{"/api/chat", reqBody("bg-model.gguf"), 0, 1, false},
+		{"/api/chat", reqBody("bg-model:latest"), 0, 1, false},
+		{"/v1/chat/completions", reqBody("main-chat"), 1, 0, true},
+		{"/v1/chat/completions", reqBody("bg-model"), 0, 1, true},
 	}
 	for _, tc := range cases {
 		chatHits, backgroundHits = 0, 0
+		lastChatBody, lastBackgroundBody = nil, nil
 		resp, err := http.Post("http://"+cfg.ListenAddr+tc.path,
 			"application/json", strings.NewReader(tc.body))
 		if err != nil {
@@ -466,6 +489,55 @@ func TestChatDispatchByModelName(t *testing.T) {
 			t.Errorf("%s body=%q: chat=%d background=%d (want chat=%d background=%d)",
 				tc.path, tc.body, chatHits, backgroundHits, tc.wantChat, tc.wantBackground)
 		}
+		if tc.wantEcho {
+			got := lastChatBody
+			if tc.wantBackground == 1 {
+				got = lastBackgroundBody
+			}
+			if string(got) != tc.body {
+				t.Errorf("%s body=%q: upstream received %q, want exact echo",
+					tc.path, tc.body, got)
+			}
+		}
+	}
+
+	// A >1 MB body on the OpenAI-native passthrough must reach the
+	// background upstream byte-for-byte — the peek-and-reattach path in
+	// handleOpenAIChat must not truncate or otherwise mutate it.
+	chatHits, backgroundHits = 0, 0
+	lastChatBody, lastBackgroundBody = nil, nil
+	bigBody := fmt.Sprintf(`{"model":"bg-model","messages":[{"role":"user","content":%q}],"stream":false}`,
+		strings.Repeat("A", 1<<20+4096)) // > 1 MB
+	resp, err := http.Post("http://"+cfg.ListenAddr+"/v1/chat/completions",
+		"application/json", strings.NewReader(bigBody))
+	if err != nil {
+		t.Fatalf("large body POST: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if backgroundHits != 1 {
+		t.Fatalf("large body: background hits = %d, want 1", backgroundHits)
+	}
+	if string(lastBackgroundBody) != bigBody {
+		t.Errorf("large body (%d bytes): upstream received %d bytes, want exact echo",
+			len(bigBody), len(lastBackgroundBody))
+	}
+
+	// A `"stream":true` request's SSE response must reach the client
+	// unchanged — no buffering, no re-encoding.
+	streamBody := `{"model":"bg-model","messages":[{"role":"user","content":"hi"}],"stream":true}`
+	resp, err = http.Post("http://"+cfg.ListenAddr+"/v1/chat/completions",
+		"application/json", strings.NewReader(streamBody))
+	if err != nil {
+		t.Fatalf("streaming POST: %v", err)
+	}
+	got, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read streaming response: %v", err)
+	}
+	if string(got) != sseBody {
+		t.Errorf("streaming response = %q, want %q (unchanged passthrough)", got, sseBody)
 	}
 
 	// No background upstream registered: an explicit background-model
@@ -489,6 +561,78 @@ func TestChatDispatchByModelName(t *testing.T) {
 	if chatHits != 0 || backgroundHits != 0 {
 		t.Errorf("background w/o upstream should not touch either upstream: chat=%d background=%d",
 			chatHits, backgroundHits)
+	}
+}
+
+// TestModelMatchesBackground exercises the model-name matching rules
+// resolveChatKind relies on (see modelMatchesBackground): exact match,
+// both sides sans a ".gguf" suffix, and a request's Ollama-style ":tag"
+// suffix stripped as a fallback — but only when the configured background
+// model itself has no colon (bg is never canonicalized/stripped).
+func TestModelMatchesBackground(t *testing.T) {
+	cases := []struct {
+		name, model, bg string
+		want            bool
+	}{
+		{"exact bare match", "qwen2.5-3b-instruct-q4_k_m", "qwen2.5-3b-instruct-q4_k_m", true},
+		{"request .gguf, bg bare", "qwen2.5-3b-instruct-q4_k_m.gguf", "qwen2.5-3b-instruct-q4_k_m", true},
+		{"request :tag, bg bare", "qwen2.5-3b-instruct-q4_k_m:latest", "qwen2.5-3b-instruct-q4_k_m", true},
+		{"request bare, bg .gguf", "qwen2.5-3b-instruct-q4_k_m", "qwen2.5-3b-instruct-q4_k_m.gguf", true},
+		{"request .gguf, bg .gguf (exact)", "qwen2.5-3b-instruct-q4_k_m.gguf", "qwen2.5-3b-instruct-q4_k_m.gguf", true},
+		{"request :tag, bg .gguf", "qwen2.5-3b-instruct-q4_k_m:latest", "qwen2.5-3b-instruct-q4_k_m.gguf", true},
+		{"colon-named bg matches exact colon request", "qwen2.5:3b", "qwen2.5:3b", true},
+		{"colon-named bg: stripped request must NOT match", "qwen2.5", "qwen2.5:3b", false},
+		{"unrelated name", "llama3", "qwen2.5-3b-instruct-q4_k_m", false},
+		{"empty model", "", "qwen2.5-3b-instruct-q4_k_m", false},
+		{"empty background", "qwen2.5-3b-instruct-q4_k_m", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := modelMatchesBackground(tc.model, tc.bg); got != tc.want {
+				t.Errorf("modelMatchesBackground(%q, %q) = %v, want %v", tc.model, tc.bg, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestChatOpenAIPassthroughUnboundedWhenBackgroundUnset confirms
+// handleOpenAIChat is a byte-for-byte, no-read passthrough to the
+// pre-dispatch behavior when QUENCHFORGE_BACKGROUND_MODEL is unset: a
+// body far larger than the 8 MB Ollama-translation cap (and larger than
+// maxChatPeekBodyBytes would even need to be) must still reach the chat
+// upstream unchanged, because this path never buffers it at all.
+func TestChatOpenAIPassthroughUnboundedWhenBackgroundUnset(t *testing.T) {
+	var received int
+	chatUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n, _ := io.Copy(io.Discard, r.Body)
+		received = int(n)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"x","model":"m","choices":[],"usage":{}}`))
+	}))
+	defer chatUpstream.Close()
+
+	cfg := newTestConfig(t)
+	cfg.ListenAddr = pickListenAddr(t)
+	// BackgroundModel intentionally left unset.
+	g := newRunningGateway(t, cfg)
+	if err := g.SetUpstream(KindChat, chatUpstream.URL); err != nil {
+		t.Fatalf("set chat: %v", err)
+	}
+
+	bigBody := fmt.Sprintf(`{"model":"chat","messages":[{"role":"user","content":%q}]}`,
+		strings.Repeat("A", 9*1024*1024)) // > 8 MB (maxRequestBodyBytes)
+	resp, err := http.Post("http://"+cfg.ListenAddr+"/v1/chat/completions",
+		"application/json", strings.NewReader(bigBody))
+	if err != nil {
+		t.Fatalf("POST: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	if received != len(bigBody) {
+		t.Errorf("chat upstream received %d bytes, want %d (unbounded passthrough)", received, len(bigBody))
 	}
 }
 

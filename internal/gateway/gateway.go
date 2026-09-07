@@ -861,26 +861,55 @@ func readAllLimited(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 	return io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBodyBytes))
 }
 
-// normalizeModelName reduces a caller-supplied model name to the form
-// /api/tags reports (see EnumerateModels): the GGUF basename with any
-// ".gguf" extension and any Ollama-style ":tag" suffix (e.g. ":latest")
-// stripped. Used to compare a request's `model` field against
-// Config.BackgroundModel regardless of which of those forms the caller
-// sent.
-func normalizeModelName(name string) string {
-	name = strings.TrimSuffix(name, ".gguf")
-	if i := strings.LastIndex(name, ":"); i >= 0 {
-		name = name[:i]
+// modelMatchesBackground reports whether a request's `model` field names
+// Config.BackgroundModel, accepting every spelling resolveModelPath (see
+// cmd/quenchforge/main.go) accepts for the *configured* value plus the
+// Ollama-style `:tag` suffix callers commonly send on the *request*:
+//
+//   - Exact match: model == bg.
+//   - Both sides sans a ".gguf" extension match — bg can be configured
+//     either as a bare name or a name+".gguf" (resolveModelPath tries
+//     both), and a request can name either form too.
+//   - The request carries an Ollama `:tag` suffix (e.g. ":latest") and
+//     stripping it produces a match under either of the rules above —
+//     but ONLY when bg itself has no colon. bg is allowed to legitimately
+//     contain a colon (e.g. a Modelfile-style tag such as "qwen2.5:3b"
+//     used as the GGUF's on-disk name); stripping the request's tag in
+//     that case would wrongly collapse a colon-qualified request onto an
+//     unrelated shorter model name, so the fallback does not apply.
+//
+// bg is compared verbatim in every branch — it is never itself stripped
+// or otherwise canonicalized, so an operator's exact configured spelling
+// is always one of the two things being compared, never a lossy derivative
+// of it.
+func modelMatchesBackground(model, bg string) bool {
+	if model == "" || bg == "" {
+		return false
 	}
-	return name
+	if model == bg {
+		return true
+	}
+	if strings.TrimSuffix(model, ".gguf") == strings.TrimSuffix(bg, ".gguf") {
+		return true
+	}
+	if strings.Contains(bg, ":") {
+		return false
+	}
+	i := strings.LastIndex(model, ":")
+	if i < 0 {
+		return false
+	}
+	stripped := model[:i]
+	return stripped == bg || strings.TrimSuffix(stripped, ".gguf") == strings.TrimSuffix(bg, ".gguf")
 }
 
 // resolveChatKind picks the chat slot kind for an inbound request by
-// matching the request's `model` field against Config.BackgroundModel.
+// matching the request's `model` field against Config.BackgroundModel
+// (see modelMatchesBackground for the accepted spellings).
 //
 //   - Empty BackgroundModel, or no model in the request → always KindChat
 //     (legacy single-slot behavior).
-//   - model (normalized) == BackgroundModel → KindBackground.
+//   - model matches BackgroundModel → KindBackground.
 //   - Anything else → KindChat.
 //
 // Unlike resolveEmbedKind, a match here does NOT check whether the
@@ -892,21 +921,37 @@ func (g *Gateway) resolveChatKind(model string) SlotKind {
 	if g.cfg.BackgroundModel == "" || model == "" {
 		return KindChat
 	}
-	if normalizeModelName(model) != g.cfg.BackgroundModel {
+	if !modelMatchesBackground(model, g.cfg.BackgroundModel) {
 		return KindChat
 	}
 	return KindBackground
 }
 
+// maxChatPeekBodyBytes bounds the /v1/chat/completions body peek used to
+// dispatch by model name once QUENCHFORGE_BACKGROUND_MODEL is set. Larger
+// than maxRequestBodyBytes (8 MB, the Ollama-translation paths' cap)
+// because OpenAI-native chat callers routinely attach long-context
+// history or inline images that easily exceed 8 MB.
+const maxChatPeekBodyBytes = 64 * 1024 * 1024 // 64 MB
+
 // handleOpenAIChat is the OpenAI-native /v1/chat/completions entry point.
-// Peeks at the body's `model` field to dispatch between KindChat and
-// KindBackground, then reverse-proxies to the chosen upstream under GPU
-// admission for that kind. Replaces the static proxyHandler(KindChat, "")
-// registration for this route so a single quenchforge process can serve a
-// background chat-class slot alongside the primary chat slot.
+//
+// When Config.BackgroundModel is unset (the common case), this is a
+// byte-for-byte passthrough to the pre-dispatch behavior — gated(KindChat,
+// proxyHandler(KindChat, "")) — with no body read at all, so unbounded
+// streaming requests are unaffected.
+//
+// When BackgroundModel is set, it peeks the body's `model` field (capped
+// at maxChatPeekBodyBytes) to dispatch between KindChat and KindBackground,
+// then reverse-proxies the exact bytes read to the chosen upstream under
+// GPU admission for that kind.
 func (g *Gateway) handleOpenAIChat() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		raw, err := readAllLimited(w, r)
+		if g.cfg.BackgroundModel == "" {
+			g.gated(KindChat, g.proxyHandler(KindChat, ""))(w, r)
+			return
+		}
+		raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxChatPeekBodyBytes))
 		if err != nil {
 			writeJSONError(w, http.StatusBadRequest,
 				fmt.Sprintf("read request body: %v", err))
@@ -933,7 +978,8 @@ func (g *Gateway) handleOpenAIChat() http.HandlerFunc {
 				fmt.Sprintf("%s slot is shedding load (critical error rate) — back off (Retry-After: 2s)", kind))
 			return
 		}
-		// Re-attach the consumed body so the reverse-proxy can forward it.
+		// Re-attach the consumed body — exact bytes, correct length — so
+		// the reverse-proxy forwards it unchanged.
 		r.Body = io.NopCloser(bytes.NewReader(raw))
 		r.ContentLength = int64(len(raw))
 		g.gated(kind, func(w http.ResponseWriter, r *http.Request) {
