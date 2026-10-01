@@ -36,8 +36,14 @@ inspect it before installing if you want to see what will land.
 
 1. boots out Ollama's launchd job (`com.ollama.ollama`) if present, so it
    can't immediately respawn its `ollama serve` child;
-2. evicts any **non-quenchforge** listener still holding port `11434`;
+2. evicts an `ollama` listener still holding port `11434` (or the port in
+   `QUENCHFORGE_LISTEN_ADDR`);
 3. `exec`s `quenchforge serve`.
+
+If any other process holds the port, the guard stops before step 1: it
+leaves that process running, logs its pid and name, and exits non-zero.
+Set `QUENCHFORGE_LISTEN_ADDR` in the plist to run quenchforge on another
+port beside it.
 
 Why: quenchforge's pre-bind check deliberately exits 0 (yields) when the
 port is already held, and `KeepAlive.SuccessfulExit=false` then leaves it
@@ -46,9 +52,9 @@ window (classically Ollama.app's auto-launched server) wins and quenchforge
 stays down. The guard makes quenchforge authoritatively reclaim the
 canonical Ollama-API port without the operator hand-evicting Ollama.
 
-The guard only kills the actual port squatter (never a running quenchforge
-or `llama-server`) and only boots out Ollama if its job exists, so it's a
-no-op on a machine without Ollama. Source:
+The guard only kills an Ollama listener (never a running quenchforge,
+`llama-server`, or anything it doesn't recognise) and only boots out Ollama
+if its job exists, so it's a no-op on a machine without Ollama. Source:
 [`cmd/quenchforge/prestart-guard.sh`](../../cmd/quenchforge/prestart-guard.sh).
 Operators who intentionally run Ollama alongside quenchforge can edit the
 plist's `ProgramArguments` back to the bare `quenchforge` + `serve`.
