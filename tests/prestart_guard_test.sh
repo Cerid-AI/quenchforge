@@ -23,7 +23,8 @@ trap cleanup EXIT
 port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
 python3 -m http.server --bind 127.0.0.1 "$port" >"${tmp}/listener.log" 2>&1 &
 listener=$!
-for _ in $(seq 200); do
+# Python's first start on a fresh CI runner can take tens of seconds.
+for _ in $(seq 600); do
 	nc -z 127.0.0.1 "$port" 2>/dev/null && break
 	sleep 0.1
 done
