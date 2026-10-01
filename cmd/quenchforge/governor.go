@@ -10,9 +10,22 @@ import (
 	"time"
 
 	"github.com/cerid-ai/quenchforge/internal/config"
+	"github.com/cerid-ai/quenchforge/internal/hardware"
 	"github.com/cerid-ai/quenchforge/internal/pressure"
 	"github.com/cerid-ai/quenchforge/internal/scheduler"
 )
+
+// governorEnabled resolves QUENCHFORGE_GOVERNOR against the hardware profile.
+// Unset, the governor runs on every profile except Apple silicon: the
+// compositor starvation it guards against was observed on AMD-discrete
+// Macs, and on Apple silicon, where every slot is GPU-placed, it would only
+// throttle inference whenever a display is on.
+func governorEnabled(cfg config.Config, profile hardware.Profile) bool {
+	if cfg.GovernorEnabled != nil {
+		return *cfg.GovernorEnabled
+	}
+	return profile != hardware.ProfileAppleSilicon
+}
 
 // startGovernor builds the GPU-admission scheduler and runs the pressure
 // governor that resizes it over time. The scheduler is returned so the caller

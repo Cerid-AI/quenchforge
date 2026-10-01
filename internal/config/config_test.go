@@ -162,3 +162,31 @@ func TestEnvBoolHelpers(t *testing.T) {
 		}
 	}
 }
+
+func TestGovernorEnvIsTriState(t *testing.T) {
+	t.Setenv("QUENCHFORGE_GOVERNOR", "")
+	os.Unsetenv("QUENCHFORGE_GOVERNOR")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.GovernorEnabled != nil {
+		t.Errorf("GovernorEnabled = %v with QUENCHFORGE_GOVERNOR unset, want nil (profile default)", *cfg.GovernorEnabled)
+	}
+
+	for val, want := range map[string]bool{"true": true, "0": false, "off": false} {
+		t.Setenv("QUENCHFORGE_GOVERNOR", val)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.GovernorEnabled == nil || *cfg.GovernorEnabled != want {
+			t.Errorf("QUENCHFORGE_GOVERNOR=%q: GovernorEnabled = %v, want %v", val, cfg.GovernorEnabled, want)
+		}
+	}
+
+	t.Setenv("QUENCHFORGE_GOVERNOR", "maybe")
+	if cfg, _ := Load(); cfg.GovernorEnabled != nil {
+		t.Errorf("QUENCHFORGE_GOVERNOR=maybe: GovernorEnabled = %v, want nil (unrecognised = unset)", *cfg.GovernorEnabled)
+	}
+}
