@@ -28,7 +28,7 @@ help:
 	@echo "  make build               — patch submodules, build llama-server + quenchforge"
 	@echo "  make build-go            — build only the Go binaries (assumes patched llama-server present)"
 	@echo "  make install             — copy binaries to $(PREFIX)/bin (sudo may be needed)"
-	@echo "  make test                — go test ./..."
+	@echo "  make test                — go test ./... + prestart guard test"
 	@echo "  make lint                — go vet + gofmt -l (CI parity)"
 	@echo "  make patches             — apply patch series to submodules"
 	@echo "  make clean               — remove build outputs"
@@ -66,6 +66,7 @@ install: build-go
 .PHONY: test
 test:
 	go test ./...
+	bash tests/prestart_guard_test.sh
 
 .PHONY: lint
 lint:

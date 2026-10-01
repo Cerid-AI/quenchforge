@@ -99,6 +99,8 @@ jobs:
           go-version: '1.23.x'
           cache: true
       - run: go test ./... -race -timeout 5m -count=1
+      - name: prestart guard leaves foreign listeners alone
+        run: bash tests/prestart_guard_test.sh
 
   # ------------------------------------------------------------------
   # Build matrix — make sure both target triples produce a binary.

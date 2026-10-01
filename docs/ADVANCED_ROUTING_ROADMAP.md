@@ -39,6 +39,21 @@ regressing the single-Mac path or the Apple-Silicon no-op behaviour.
 5. **No overbuild.** Ship the keystone (remote backends) and stop; layer the rest
    only when a concrete topology needs it.
 
+## Deferred: fleet gateway (F1, F6, F9, `studio-primary`)
+
+**Status (2026-09-30): deferred.** Consumers treat `:11434` as a single
+Ollama/OpenAI endpoint and select by model name; none of them depends on
+Quenchforge choosing among backends. One endpoint per host is therefore
+enough, and the Apple-silicon host is served by an MLX server rather than
+by Quenchforge (see the README's "Apple silicon and the Cerid fleet").
+Quenchforge stays the Intel Mac + AMD backend and only has to be *safe* on
+Apple silicon: its prestart guard no longer evicts listeners it doesn't
+recognise, and the GPU governor defaults off there.
+
+**What would reopen it:** a consumer that needs cross-host routing or
+failover behind one address (e.g. a model that must fall back to another
+host when its own is down), which per-host endpoints can't express.
+
 ---
 
 ## Feature areas
@@ -108,7 +123,9 @@ historical crash families live there) — never ship without the 7-day soak.
 R4 is cheap (bench + placement table change). The R-track runs on a
 different layer from F1–F9 and can proceed in parallel.
 
-### F1 — Remote backends (keystone)
+### F1 — Remote backends (keystone) — deferred
+
+> Deferred; see [Deferred: fleet gateway](#deferred-fleet-gateway-f1-f6-f9-studio-primary).
 
 **Motivation.** A backend should be either a *supervised local process* (today) or
 a *remote endpoint* (the CUDA box, later the Studio). Today every upstream is
@@ -216,7 +233,9 @@ latency tracker drives `QUENCHFORGE_AUTO_BACKOFF`. Extend to the fleet.
 
 **Effort/risk.** Medium. Security-sensitive — see F8.
 
-### F6 — Pluggable backend adapters (futureproofing for MLX / vLLM)
+### F6 — Pluggable backend adapters (futureproofing for MLX / vLLM) — deferred
+
+> Deferred; see [Deferred: fleet gateway](#deferred-fleet-gateway-f1-f6-f9-studio-primary).
 
 **Motivation.** Today a backend is implicitly a patched `llama-server` speaking the
 OpenAI surface (`internal/supervisor` checks for `llama-server`/`whisper-server` in
@@ -267,7 +286,9 @@ Multi-node means traffic crosses the LAN.
 **Effort/risk.** Small-medium, but **gates** any production multi-node rollout. Do
 it alongside F1, not after.
 
-### F9 — Gateway relocatability (futureproofing the Studio transition)
+### F9 — Gateway relocatability (futureproofing the Studio transition) — deferred
+
+> Deferred; see [Deferred: fleet gateway](#deferred-fleet-gateway-f1-f6-f9-studio-primary).
 
 **Motivation.** When the Mac Studio becomes primary, the **gateway role moves to
 it** while the Vega II / patched `llama-server` stays on the Mac Pro as a remote
@@ -340,8 +361,8 @@ the AMD host.
 - [ ] Each landed kernel: upstream PR referencing #19563.
 
 ### P0 — Keystone (unblocks the whole fleet)
-- [ ] F1: `Backend` descriptor; `QUENCHFORGE_<KIND>_UPSTREAM` remote registration; supervisor skips local spawn for remote kinds.
-- [ ] F1: scope `withGPUAdmission` / governor to local GPU backends only.
+- [ ] **Deferred** — F1: `Backend` descriptor; `QUENCHFORGE_<KIND>_UPSTREAM` remote registration; supervisor skips local spawn for remote kinds.
+- [ ] **Deferred** — F1: scope `withGPUAdmission` / governor to local GPU backends only.
 - [ ] F8: interface-bind + optional shared-secret token; document the trusted-VLAN assumption.
 - [ ] F4: per-remote health check + circuit breaker; surface in `/health`.
 - [ ] Tests: remote-upstream routing, governor-bypass for remote, breaker open/close. Non-regression: unset config ⇒ identical single-host behaviour.
@@ -352,13 +373,13 @@ the AMD host.
 - [ ] F4: Prometheus `/metrics`; request-ID tracing.
 
 ### P2 — Fleet ergonomics & adapters
-- [ ] F6: `BackendAdapter` interface; refactor the supervisor command-match behind it; `vllm` + `mlx` adapters (stubs until hardware).
+- [ ] **Deferred** — F6: `BackendAdapter` interface; refactor the supervisor command-match behind it; `vllm` + `mlx` adapters (stubs until hardware).
 - [ ] F5: mDNS discovery + `fleet.yaml` manifest with allowlist.
-- [ ] F9: gateway-without-local-GPU mode; remove AMD-host co-location assumptions.
+- [ ] **Deferred** — F9: gateway-without-local-GPU mode; remove AMD-host co-location assumptions.
 
 ### P3 — Optional / niche
 - [ ] F7: `rpc-server` worker role + `device: rpc` placement; document the speed tradeoff.
-- [ ] Role presets: `single-mac` (today), `fleet` (gateway + remote), `studio-primary` (Phase 2).
+- [ ] Role presets: `single-mac` (today), `fleet` (gateway + remote), `studio-primary` (Phase 2). **Deferred** (`studio-primary`; `fleet` depends on F1).
 
 ---
 

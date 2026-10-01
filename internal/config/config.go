@@ -263,10 +263,11 @@ type Config struct {
 	// GovernorEnabled turns on the GPU-pressure governor: adaptive admission
 	// concurrency that reserves GPU headroom for the macOS display compositor
 	// (WindowServer) while a screen is being driven, preventing sustained
-	// inference from starving it into a kernel-watchdog panic. Default true;
-	// it is a no-op on headless hosts (full throughput) so server users are
-	// unaffected.
-	GovernorEnabled bool
+	// inference from starving it into a kernel-watchdog panic. It is a no-op
+	// on headless hosts (full throughput) so server users are unaffected.
+	// nil (QUENCHFORGE_GOVERNOR unset) defers to the hardware profile: on
+	// everywhere except Apple silicon. An explicit value always wins.
+	GovernorEnabled *bool
 
 	// GPUConcurrencyMax is the admission ceiling when the host is headless or
 	// the display is asleep — full throughput.
@@ -360,7 +361,7 @@ func Default() (Config, error) {
 		RerankMetalNCB:     0, // 0 = inherit MetalNCB
 		AutoBackoffEnabled: false,
 
-		GovernorEnabled:             true,
+		GovernorEnabled:             nil, // profile default; see GovernorEnabled
 		GPUConcurrencyMax:           6,
 		GPUConcurrencyDisplayActive: 1,
 		GPUDutyCycleDisplayActive:   0.5,
@@ -411,7 +412,9 @@ func Load() (Config, error) {
 	cfg.RerankBatchSize = envIntOr("QUENCHFORGE_RERANK_BATCH_SIZE", cfg.RerankBatchSize)
 	cfg.RerankMetalNCB = envIntOr("QUENCHFORGE_RERANK_METAL_N_CB", cfg.RerankMetalNCB)
 	cfg.AutoBackoffEnabled = envBoolOr("QUENCHFORGE_AUTO_BACKOFF", cfg.AutoBackoffEnabled)
-	cfg.GovernorEnabled = envBoolOr("QUENCHFORGE_GOVERNOR", cfg.GovernorEnabled)
+	if b := envBool("QUENCHFORGE_GOVERNOR"); b != nil {
+		cfg.GovernorEnabled = b
+	}
 	cfg.GPUConcurrencyMax = envIntOr("QUENCHFORGE_GPU_CONCURRENCY_MAX", cfg.GPUConcurrencyMax)
 	cfg.GPUConcurrencyDisplayActive = envIntOr("QUENCHFORGE_GPU_CONCURRENCY_DISPLAY_ACTIVE", cfg.GPUConcurrencyDisplayActive)
 	cfg.GPUDutyCycleDisplayActive = envFloatOr("QUENCHFORGE_GPU_DUTY_DISPLAY_ACTIVE", cfg.GPUDutyCycleDisplayActive)
@@ -553,15 +556,27 @@ func envFloatOr(name string, fallback float64) float64 {
 }
 
 func envBoolOr(name string, fallback bool) bool {
-	v, ok := os.LookupEnv(name)
-	if !ok {
-		return fallback
-	}
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "1", "true", "yes", "on":
-		return true
-	case "0", "false", "no", "off":
-		return false
+	if b := envBool(name); b != nil {
+		return *b
 	}
 	return fallback
+}
+
+// envBool returns nil when name is unset or not a recognised boolean, so
+// callers can tell "unset" from an explicit false.
+func envBool(name string) *bool {
+	v, ok := os.LookupEnv(name)
+	if !ok {
+		return nil
+	}
+	var b bool
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		b = true
+	case "0", "false", "no", "off":
+		b = false
+	default:
+		return nil
+	}
+	return &b
 }

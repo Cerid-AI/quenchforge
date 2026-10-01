@@ -38,10 +38,12 @@
 
     <!--
       ProgramArguments[0] is the prestart guard, not quenchforge directly.
-      The guard reclaims port 11434 from a squatter (typically Ollama.app's
+      The guard reclaims port 11434 from Ollama (typically Ollama.app's
       auto-launched `ollama serve`) before exec'ing `quenchforge serve`, so
       quenchforge stays authoritative on the canonical Ollama-API port
       across restarts and logins without the operator hand-evicting Ollama.
+      Any other listener on the port is left alone and the guard exits
+      non-zero; set QUENCHFORGE_LISTEN_ADDR below to run on another port.
       `quenchforge install` writes the guard to ~/.config/quenchforge/.
       Operators who intentionally run Ollama can replace these two lines
       with the bare binary path + `serve`.
@@ -55,7 +57,7 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/usr/local/bin:/usr/bin:/bin</string>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin</string>
 
         <!--
           Replace these three values with GGUF filenames that exist

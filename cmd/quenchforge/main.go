@@ -697,8 +697,11 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 	// module uses, so placement and slot tuning never disagree.
 	pol := tuning.PolicyFor(hwInfo.Profile, cfg)
 	g.SetPlacement(pol, cfg.AutoBatchThreshold)
-	if cfg.GovernorEnabled {
+	if governorEnabled(cfg, hwInfo.Profile) {
 		g.SetScheduler(startGovernor(ctx, pressure.NewSensor(), cfg, stdout))
+	} else if cfg.GovernorEnabled == nil {
+		fmt.Fprintf(stdout, "quenchforge: GPU governor off by default on the %s profile (QUENCHFORGE_GOVERNOR=true to enable)\n",
+			hwInfo.Profile)
 	}
 	if err := g.Start(ctx); err != nil {
 		if errors.Is(err, gateway.ErrAddrInUse) {
@@ -1320,16 +1323,25 @@ func cmdMigrate(args []string, stdout, stderr io.Writer) error {
 // helpers
 // ---------------------------------------------------------------------------
 
+// homebrewBins returns name under both Homebrew bin dirs, the prefix native
+// to goarch first. An Apple-silicon Mac can also carry an Intel Homebrew
+// under /usr/local whose x86_64 build would run under Rosetta.
+func homebrewBins(name, goarch string) []string {
+	dirs := []string{"/usr/local/bin", "/opt/homebrew/bin"}
+	if goarch == "arm64" {
+		dirs[0], dirs[1] = dirs[1], dirs[0]
+	}
+	return []string{filepath.Join(dirs[0], name), filepath.Join(dirs[1], name)}
+}
+
 // resolveSDBin finds sd-server (stable-diffusion.cpp HTTP example).
 func resolveSDBin() (string, error) {
-	for _, p := range []string{
+	for _, p := range append([]string{
 		"./sd.cpp/build-arm64/bin/sd-server",
 		"./sd.cpp/build-x86_64/bin/sd-server",
 		"./sd.cpp/build-universal/bin/sd-server",
 		"./sd.cpp/build/bin/sd-server",
-		"/usr/local/bin/sd-server",
-		"/opt/homebrew/bin/sd-server",
-	} {
+	}, homebrewBins("sd-server", runtime.GOARCH)...) {
 		if st, err := os.Stat(p); err == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
 			return p, nil
 		}
@@ -1344,14 +1356,12 @@ func resolveSDBin() (string, error) {
 // upstream binary doesn't carry a distinctive name — it lives at
 // examples/server/server. We accept both names for flexibility.
 func resolveBarkBin() (string, error) {
-	for _, p := range []string{
+	for _, p := range append([]string{
 		"./bark.cpp/build-arm64/examples/server/server",
 		"./bark.cpp/build-x86_64/examples/server/server",
 		"./bark.cpp/build-universal/examples/server/server",
 		"./bark.cpp/build/examples/server/server",
-		"/usr/local/bin/bark-server",
-		"/opt/homebrew/bin/bark-server",
-	} {
+	}, homebrewBins("bark-server", runtime.GOARCH)...) {
 		if st, err := os.Stat(p); err == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
 			return p, nil
 		}
@@ -1373,14 +1383,12 @@ func resolveWhisperBin() (string, error) {
 		}
 		return "", false
 	}
-	for _, p := range []string{
+	for _, p := range append([]string{
 		"./whisper.cpp/build-arm64/bin/whisper-server",
 		"./whisper.cpp/build-x86_64/bin/whisper-server",
 		"./whisper.cpp/build-universal/bin/whisper-server",
 		"./whisper.cpp/build/bin/whisper-server",
-		"/usr/local/bin/whisper-server",
-		"/opt/homebrew/bin/whisper-server",
-	} {
+	}, homebrewBins("whisper-server", runtime.GOARCH)...) {
 		if r, ok := check(p); ok {
 			return r, nil
 		}
@@ -1396,9 +1404,8 @@ func resolveWhisperBin() (string, error) {
 //
 //  1. explicit path passed in (cfg.LlamaBin)
 //  2. ./llama.cpp/build-*/bin/llama-server (post-build artifact)
-//  3. /usr/local/bin/llama-server (Homebrew prefix on Intel Mac)
-//  4. /opt/homebrew/bin/llama-server (Homebrew prefix on Apple Silicon)
-//  5. PATH lookup
+//  3. the Homebrew bin dirs, native prefix first (see homebrewBins)
+//  4. PATH lookup
 //
 // Returns an error message that lists what was tried.
 func resolveLlamaBin(hint string) (string, error) {
@@ -1415,14 +1422,12 @@ func resolveLlamaBin(hint string) (string, error) {
 			return p, nil
 		}
 	}
-	for _, p := range []string{
+	for _, p := range append([]string{
 		"./llama.cpp/build-arm64/bin/llama-server",
 		"./llama.cpp/build-x86_64/bin/llama-server",
 		"./llama.cpp/build-universal/bin/llama-server",
 		"./llama.cpp/build/bin/llama-server",
-		"/usr/local/bin/llama-server",
-		"/opt/homebrew/bin/llama-server",
-	} {
+	}, homebrewBins("llama-server", runtime.GOARCH)...) {
 		if r, ok := check(p); ok {
 			return r, nil
 		}
