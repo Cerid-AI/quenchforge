@@ -160,17 +160,42 @@ at every login.
 **This is handled automatically (v0.8.1+).** `quenchforge install`
 writes a LaunchAgent whose `ProgramArguments[0]` is a prestart guard
 (`~/.config/quenchforge/prestart-guard.sh`): on every start and at login
-it boots out `com.ollama.ollama` and evicts any non-quenchforge listener
-on `:11434` before starting the server. So quenchforge reliably owns the
+it boots out `com.ollama.ollama` and evicts an `ollama` listener on
+`:11434` before starting the server. So quenchforge reliably owns the
 canonical Ollama-API port with no manual eviction. Ollama.app stays
 installed for its GUI — `open -a Ollama` still works; it just won't
-auto-serve on `:11434`.
+auto-serve on `:11434`. The guard evicts only Ollama: if any other
+process holds the port, it leaves that process running, logs which one
+it is, and exits non-zero without starting quenchforge.
 
 **Prefer them on separate ports instead?** Set `QUENCHFORGE_LISTEN_ADDR`
 in the LaunchAgent's `<EnvironmentVariables>` (e.g. `:11435`), restart,
 and point quenchforge clients at the new port; Ollama keeps `11434`.
 
 Run `quenchforge doctor` to verify.
+
+## Apple silicon and the Cerid fleet
+
+Quenchforge runs on Apple silicon standalone: the Metal patches are
+runtime-gated to non-Apple GPUs, every slot is GPU-placed, and the GPU
+governor is off by default there (`QUENCHFORGE_GOVERNOR=true` turns it
+on).
+
+In the Cerid fleet, Quenchforge is the Intel Mac + AMD backend; the
+Apple-silicon host serves `:11434` with an MLX server instead. Clients
+pick a model by name against one Ollama/OpenAI endpoint per host, so
+neither server needs to know about the other. The MLX server covers
+`/api/tags`, `/api/chat`, `/api/generate`, `/api/embed`,
+`/api/embeddings`, `/api/version`, `/api/show`, `/api/ps`,
+`/v1/chat/completions` and `/v1/embeddings`. It does not serve
+`/v1/rerank`, speech-to-text, text-to-speech, image generation, or a
+separate code-embedding slot.
+
+To run Quenchforge next to it on the same host (for those routes), give
+Quenchforge its own port: set `QUENCHFORGE_LISTEN_ADDR` (e.g.
+`127.0.0.1:11435`) in the LaunchAgent's `<EnvironmentVariables>` and
+restart. The prestart guard reads the same variable, and never stops a
+listener it does not recognise.
 
 ## First-launch prompts to expect
 
@@ -203,6 +228,7 @@ All settings have sensible defaults. Selected env vars:
 | `QUENCHFORGE_RERANK_METAL_N_CB` | `0` (inherit `METAL_N_CB`) | Per-slot `GGML_METAL_N_CB` for the rerank slot. |
 | `QUENCHFORGE_AUTO_BACKOFF` | `false` | Opt-in: gateway returns `HTTP 503` + `Retry-After: 2` on `/v1/embeddings` etc. when the slot's rolling p99 latency is `critical` (5× p50 or error rate > 5%). Default off — observability via `/health` works without this flag. |
 | `QUENCHFORGE_ADVERTISE_MDNS` | `false` | Bonjour advertisement (`_quenchforge._tcp.local.`) |
+| `QUENCHFORGE_GOVERNOR` | on; off on Apple silicon | GPU-pressure governor: throttles GPU admission while a display is driven so inference can't starve the compositor. An explicit value overrides the per-profile default. |
 
 **Operator overrides** (escape hatches over the AMD-Mac-safe defaults the patches + tuning apply automatically):
 | Env var | Default | What |

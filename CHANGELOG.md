@@ -10,6 +10,25 @@ patch bumps fix bugs or polish without behaviour change.
 
 ## Unreleased
 
+- **Prestart guard evicts only Ollama.** The LaunchAgent's prestart guard
+  used to kill any non-quenchforge listener on the gateway port. It now
+  evicts only `ollama`; for any other listener it leaves the process
+  running, logs its pid and name with a pointer to
+  `QUENCHFORGE_LISTEN_ADDR`, and exits non-zero without starting the
+  server. The guard reads the port from `QUENCHFORGE_LISTEN_ADDR` (still
+  overridable with `QUENCHFORGE_GUARD_PORT`) and defaults
+  `QUENCHFORGE_BIN` to the Homebrew prefix native to the host
+  (`/opt/homebrew/bin` on Apple silicon, `/usr/local/bin` on Intel). The
+  plist template's `PATH` adds `/opt/homebrew/bin` and `/usr/sbin`.
+- **Native Homebrew prefix first.** `llama-server`, `whisper-server`,
+  `sd-server` and `bark-server` lookups try `/opt/homebrew/bin` before
+  `/usr/local/bin` on arm64 (Intel order unchanged), so an Apple-silicon
+  host with a leftover Intel Homebrew no longer picks the Rosetta build.
+- **GPU governor off by default on Apple silicon.** With
+  `QUENCHFORGE_GOVERNOR` unset the governor now runs on every profile
+  except `apple-silicon`; an explicit `true`/`false` still wins on any
+  profile. AMD and Intel defaults are unchanged.
+
 - **`/api/tags` reports whether each cached model is loaded.** Every entry
   now includes `loaded` (bool): true when the model's trimmed name matches
   a configured slot whose upstream is registered, false for a cached
