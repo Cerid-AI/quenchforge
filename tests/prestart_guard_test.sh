@@ -21,13 +21,19 @@ cleanup() {
 trap cleanup EXIT
 
 port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
-python3 -m http.server --bind 127.0.0.1 "$port" >/dev/null 2>&1 &
+python3 -m http.server --bind 127.0.0.1 "$port" >"${tmp}/listener.log" 2>&1 &
 listener=$!
-for _ in $(seq 50); do
-	/usr/sbin/lsof -ti "tcp:${port}" -sTCP:LISTEN >/dev/null 2>&1 && break
+for _ in $(seq 200); do
+	nc -z 127.0.0.1 "$port" 2>/dev/null && break
 	sleep 0.1
 done
-/usr/sbin/lsof -ti "tcp:${port}" -sTCP:LISTEN >/dev/null || { echo "FAIL: listener never came up on :${port}"; exit 1; }
+if ! /usr/sbin/lsof -ti "tcp:${port}" -sTCP:LISTEN >/dev/null; then
+	echo "FAIL: lsof does not see a listener on :${port}"
+	if kill -0 "$listener" 2>/dev/null; then echo "listener pid ${listener} is running"; else echo "listener pid ${listener} exited"; fi
+	cat "${tmp}/listener.log"
+	/usr/sbin/lsof -nP -a -p "$listener" -i || true
+	exit 1
+fi
 
 stub="${tmp}/quenchforge"
 printf '#!/bin/sh\ntouch "%s/handed-off"\n' "$tmp" >"$stub"
