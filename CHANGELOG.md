@@ -10,6 +10,26 @@ patch bumps fix bugs or polish without behaviour change.
 
 ## Unreleased
 
+- **Supervisor, gateway and installer hardening.** The gateway refuses a
+  chat request pinned to a model its slot is not serving (400 naming the
+  served model), refuses a code-embed request when the code slot is down
+  instead of answering from the text embedder, reports per-slot readiness
+  at `/health` (`unconfigured`, `unreachable`, `disabled`), deregisters an
+  upstream that refuses connections and retries it after a cool-off, and
+  ends a truncated chat stream with `done_reason: "error"`. `serve` refuses
+  to start a slot whose model is absent and registers a slot only once it
+  reports the model it was started with; the background slot gets both
+  checks too. The reaper matches a child's recorded identity before killing
+  it (old bare-PID pidfiles fall back to the executable path until
+  v0.12.0). The governor probes `ioreg` and `sysctl` by absolute path and
+  holds the display-active plan when a probe cannot run. An unrecognised
+  Metal GPU is classified `metal-unknown` with upstream defaults instead of
+  Vega II tuning. The prestart guard waits for the port to be released,
+  escalates to SIGKILL after two seconds and exits non-zero at five. The
+  registry refuses a GGUF Hugging Face did not checksum, `doctor` marks a
+  configured slot whose model is missing, the LaunchAgent template names
+  only the model `install.sh` pulls, and releases notarize the universal
+  binaries.
 - **Prestart guard evicts only Ollama.** The LaunchAgent's prestart guard
   used to kill any non-quenchforge listener on the gateway port. It now
   evicts only `ollama`; for any other listener it leaves the process
@@ -30,10 +50,11 @@ patch bumps fix bugs or polish without behaviour change.
   profile. AMD and Intel defaults are unchanged.
 
 - **`/api/tags` reports whether each cached model is loaded.** Every entry
-  now includes `loaded` (bool): true when the model's trimmed name matches
-  a configured slot whose upstream is registered, false for a cached
-  `.gguf` with no slot serving it. Uses the same slot/model normalisation
-  as `GET /`'s `slots.<kind>.model` so the two routes can't disagree.
+  now includes `loaded` (bool): true when a registered slot reports serving
+  that model over `/v1/models` (or, when the slot cannot be asked, when it
+  is the slot's configured model), false for a cached `.gguf` with no slot
+  serving it. Spellings of one model (Ollama tag, GGUF filename, shorthand)
+  match each other.
 - **`doctor` describes the running service, not its own environment.**
   The `slots:` section now queries the local gateway's `GET /` (2s
   timeout) and reports the values it returns, falling back to this

@@ -918,7 +918,7 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 	// same as embed/rerank below. The gateway dispatches /api/chat,
 	// /api/generate, and /v1/chat/completions requests here when the
 	// body's `model` field names cfg.BackgroundModel.
-	if cfg.BackgroundModel != "" {
+	if cfg.BackgroundModel != "" && unavailable[gateway.KindBackground] == nil {
 		s, err := startSlot(ctx, cfg, hwInfo, slotSpec{
 			Kind:      gateway.KindBackground,
 			Name:      "background",
@@ -934,8 +934,8 @@ func cmdServe(args []string, stdout, stderr io.Writer) error {
 			slots[gateway.KindBackground] = s
 			fmt.Fprintf(stdout, "quenchforge: background slot pid=%d model=%s port=%d\n",
 				s.PID(), cfg.BackgroundModel, cfg.BackgroundPort)
-			_ = g.SetUpstream(gateway.KindBackground,
-				fmt.Sprintf("http://127.0.0.1:%d", cfg.BackgroundPort))
+			registerWhenReady(ctx, "background", cfg.BackgroundPort, cfg.BackgroundModel,
+				upstreamSetter(g, gateway.KindBackground), stderr)
 		}
 	}
 

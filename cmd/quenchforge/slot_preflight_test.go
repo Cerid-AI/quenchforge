@@ -43,6 +43,28 @@ func TestPreflightSlotModels_MissingRerankIsAnError(t *testing.T) {
 	}
 }
 
+func TestPreflightSlotModels_MissingBackgroundIsAnError(t *testing.T) {
+	tmp := t.TempDir()
+	cfg := config.Config{
+		ModelsDir:       tmp,
+		DefaultModel:    "chat-model",
+		BackgroundModel: "qwen2.5-3b-instruct-q4_k_m",
+	}
+	makeFakeGGUF(t, tmp, "chat-model", 1<<20)
+
+	var buf bytes.Buffer
+	unavailable := preflightSlotModels(cfg, cfg.DefaultModel, true, &buf)
+
+	if unavailable[gateway.KindBackground] == nil {
+		t.Fatalf("background model is absent from %s but the pre-flight reported it available", tmp)
+	}
+	for _, want := range []string{"background", "QUENCHFORGE_BACKGROUND_MODEL", "qwen2.5-3b-instruct-q4_k_m"} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("report is missing %q; got:\n%s", want, buf.String())
+		}
+	}
+}
+
 func TestPreflightSlotModels_AllPresentIsSilent(t *testing.T) {
 	tmp := t.TempDir()
 	cfg := config.Config{
