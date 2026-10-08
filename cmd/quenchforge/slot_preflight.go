@@ -51,6 +51,7 @@ func configuredSlotModels(cfg config.Config, chatModel string, chatEnabled bool)
 		{gateway.KindChat, "chat", "QUENCHFORGE_DEFAULT_MODEL", "/api/chat + /v1/chat/completions", chatModel},
 		{gateway.KindEmbed, "embed", "QUENCHFORGE_EMBED_MODEL", "/api/embeddings + /v1/embeddings", cfg.EmbedModel},
 		{gateway.KindCodeEmbed, "code-embed", "QUENCHFORGE_CODE_EMBED_MODEL", "/v1/embeddings (model=" + cfg.CodeEmbedModel + ")", cfg.CodeEmbedModel},
+		{gateway.KindBackground, "background", "QUENCHFORGE_BACKGROUND_MODEL", "/api/chat + /v1/chat/completions (model=" + cfg.BackgroundModel + ")", cfg.BackgroundModel},
 		{gateway.KindRerank, "rerank", "QUENCHFORGE_RERANK_MODEL", "/v1/rerank", cfg.RerankModel},
 	}
 	out := make([]slotModel, 0, len(all))
