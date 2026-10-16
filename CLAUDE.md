@@ -1,5 +1,7 @@
 # CLAUDE.md — Quenchforge
 
+Estate direction: `~/dotfiles/docs/estate-direction.md`. This repo is the public claim for Intel Macs with AMD GPUs, and the Mac Pro side of the `:11434` contract. It is not a second product.
+
 > **Extends:** `sunrunnerfire/dotfiles` — global workflow orchestration, core
 > principles, commit policy, and task-management rules apply here. This file
 > adds Quenchforge-specific agent directives.
